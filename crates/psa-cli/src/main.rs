@@ -34,7 +34,7 @@ fn main() {
             }
         }
         "version" | "--version" | "-V" => {
-            println!("psa 0.1.0 (sapy v0.1 subset)");
+            println!("psa 0.3.0 (sapy v0.3 subset)");
         }
         "help" | "--help" | "-h" => usage(),
         other => {

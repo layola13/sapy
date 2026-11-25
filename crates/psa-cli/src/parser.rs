@@ -460,7 +460,7 @@ impl Parser {
                         _ => {
                             return Err(perr(
                                 self.line(),
-                                "method calls are only supported on plain variables in v0.2",
+                                "method calls are only supported on plain variables in v0.3",
                             ))
                         }
                     };

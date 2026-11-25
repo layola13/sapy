@@ -1,4 +1,4 @@
-# psa — the SA-Py compiler (v0.2)
+# psa — the SA-Py compiler (v0.3)
 
 `psa` compiles `.psa` source (a Python-syntax subset) to native
 executables: `.psa` → psa frontend (lexer / parser / type inference) →
@@ -47,22 +47,45 @@ Everything else is a **loud compile error**, never a silent fallback.
   out of is **consumed** (emitted as SLA `Vec<i64>`). Borrowed
   parameters can be re-borrowed onward but never moved, returned, or
   stored — those are loud errors (spec s7).
+- `list[bool]` (v0.3): the v0.2 list machinery is element-type
+  generic for scalar elements — literals, `append`, index read/write,
+  `len`, and the same move/borrow inference (emitted as `Vec<bool>`,
+  borrows as `&Vec<bool>`). Element types must agree within one
+  literal; mixed literals are a loud error. Elements are still
+  scalars only: string elements are heap values and stay a loud
+  error, as does the empty list literal (its element type cannot be
+  inferred). `list[float]` is implemented in the emitter but
+  **blocked** by upstream defect (xxiv) below: it is a loud error
+  until the `Vec<f64>` miscompilation is fixed.
 
-## Known upstream defect (found 2026-11-25, blocks one feature)
+## Known upstream defects (found 2026-11-25, each blocks one feature)
 
-The Rust `sla` **build-exe** route prints f64 values through
-`println("{}", x)` with the fraction truncated: `7.0 / 2.0` prints
-`3.0000000000`. The value itself is correct — comparisons in the same
-executable confirm `z == 3.5` — and the Zig route prints `3.5`
-correctly; only f64 display on this route is wrong. Until that is
-fixed upstream, **psa refuses to print a float** (loud error) rather
-than emit a program that displays a wrong value. Float computation
-and comparison are unaffected and supported.
+**(xxiii) f64 display.** The Rust `sla` **build-exe** route prints
+f64 values through `println("{}", x)` with the fraction truncated:
+`7.0 / 2.0` prints `3.0000000000`. The value itself is correct —
+comparisons in the same executable confirm `z == 3.5` — and the Zig
+route prints `3.5` correctly; only f64 display on this route is
+wrong. Until that is fixed upstream, **psa refuses to print a
+float** (loud error) rather than emit a program that displays a
+wrong value. Scalar float computation and comparison are unaffected
+and supported.
+
+**(xxiv) `Vec<f64>` element access.** Hand-written SLA probes
+independent of psa (push / index-write / index-read / equality over
+`Vec<f64>`, with a `Vec<i64>` control passing) fail on **both**
+routes: literal and variable pushes read back wrong on the Rust
+route and the Zig route alike; index assignment `ys[0] = 2.25`
+reads back correctly on the Rust route only. The SA-level `Vec`
+storage is byte-typed, so both frontends' `Vec<f64>` element
+lowerings are implicated. Until this is fixed upstream, **psa
+refuses `list[float]`** (loud error) rather than emit silently
+wrong programs. `list[int]` and `list[bool]` are unaffected.
 
 ## Explicitly not in v0.1 (all loud errors)
 
-Classes, attribute access, dicts/sets, lists of non-int elements,
-string operations and comparisons, `**`, chained comparisons,
+Classes, attribute access, dicts/sets, lists of non-scalar elements
+(strings, nested lists), string operations and comparisons, `**`,
+chained comparisons,
 keyword arguments, defaults, annotations, imports, exceptions,
 generators, first-class functions, type-changing re-binding,
 `continue` in `for`, non-`range` iteration, float `//` / `%`,

@@ -15,6 +15,8 @@ pub enum Ty {
     Bool,
     Str,
     ListInt,
+    ListFloat,
+    ListBool,
     Void,
 }
 
@@ -26,6 +28,8 @@ impl Ty {
             Ty::Bool => "bool",
             Ty::Str => "&str",
             Ty::ListInt => "Vec<i64>",
+            Ty::ListFloat => "Vec<f64>",
+            Ty::ListBool => "Vec<bool>",
             Ty::Void => "i32",
         }
     }
@@ -35,8 +39,38 @@ impl Ty {
             Ty::Float => "0.0",
             Ty::Bool => "false",
             Ty::Str => "\"\"",
-            Ty::ListInt => "Vec::new()",
+            Ty::ListInt | Ty::ListFloat | Ty::ListBool => "Vec::new()",
             Ty::Void => "0",
+        }
+    }
+    fn is_list(&self) -> bool {
+        matches!(self, Ty::ListInt | Ty::ListFloat | Ty::ListBool)
+    }
+    /// Element type of a list type (scalar elements only in v0.3).
+    fn elem(&self) -> Option<Ty> {
+        match self {
+            Ty::ListInt => Some(Ty::Int),
+            Ty::ListFloat => Some(Ty::Float),
+            Ty::ListBool => Some(Ty::Bool),
+            _ => None,
+        }
+    }
+    /// List type for a scalar element type; None for non-scalars.
+    fn list_of(elem: Ty) -> Option<Ty> {
+        match elem {
+            Ty::Int => Some(Ty::ListInt),
+            Ty::Float => Some(Ty::ListFloat),
+            Ty::Bool => Some(Ty::ListBool),
+            _ => None,
+        }
+    }
+    /// Python-style spelling for diagnostics, e.g. `list[int]`.
+    fn py_name(&self) -> String {
+        match self {
+            Ty::ListInt => "list[int]".to_string(),
+            Ty::ListFloat => "list[float]".to_string(),
+            Ty::ListBool => "list[bool]".to_string(),
+            other => format!("{:?}", other),
         }
     }
 }
@@ -45,7 +79,7 @@ impl Ty {
 struct Sig {
     params: Vec<Ty>,
     /// Per-parameter: true when a list parameter is borrowed
-    /// (SLA `&Vec<i64>`) rather than consumed (SLA `Vec<i64>`).
+    /// (SLA `&Vec<T>`) rather than consumed (SLA `Vec<T>`).
     param_borrow: Vec<bool>,
     ret: Option<Ty>,
 }
@@ -224,14 +258,14 @@ impl Emitter {
         }
         // Ownership per parameter, from the callee body alone (spec
         // s4): a list parameter the body only reads or writes through
-        // is borrowed (SLA &Vec<i64>); one it moves out of is consumed
-        // (SLA Vec<i64>). Scalars are Copy and never borrow.
+        // is borrowed (SLA &Vec<T>); one it moves out of is consumed
+        // (SLA Vec<T>). Scalars are Copy and never borrow.
         let borrows: Vec<bool> = def
             .params
             .iter()
             .zip(arg_tys.iter())
             .map(|(p, t)| {
-                if *t != Ty::ListInt {
+                if !t.is_list() {
                     return false;
                 }
                 let mut visiting = Vec::new();
@@ -309,8 +343,8 @@ impl Emitter {
             if i > 0 {
                 txt.push_str(", ");
             }
-            if *t == Ty::ListInt && borrows.get(i).copied().unwrap_or(false) {
-                txt.push_str(&format!("{}: &Vec<i64>", p));
+            if t.is_list() && borrows.get(i).copied().unwrap_or(false) {
+                txt.push_str(&format!("{}: &{}", p, t.sla()));
             } else {
                 txt.push_str(&format!("{}: {}", p, t.sla()));
             }
@@ -327,30 +361,81 @@ impl Emitter {
         Ok(self.sigs.get(name).unwrap().clone())
     }
 
-    /// Emit `let <name>: Vec<i64> = Vec::new();` (or a plain assignment
-    /// when `declare` is false) followed by one push per element.
+    /// Type-check a list literal's elements and emit their codes.
+    /// Returns the list type and one code string per element. Element
+    /// types must agree on one scalar type (int/float/bool in v0.3;
+    /// string elements are heap values and stay out of scope).
+    fn emit_list_literal(
+        &mut self,
+        ctx: &mut Ctx,
+        elems: &[Expr],
+        line: u32,
+    ) -> Result<(Ty, Vec<String>), String> {
+        if elems.is_empty() {
+            return Err(eerr(
+                line,
+                "cannot infer the element type of an empty list literal in v0.3; bind a non-empty list first",
+            ));
+        }
+        let mut codes = Vec::new();
+        let mut elem_ty: Option<Ty> = None;
+        for e in elems {
+            let (code, ty) = self.emit_expr(ctx, e, line)?;
+            match elem_ty {
+                None => {
+                    if ty == Ty::Float {
+                        return Err(eerr(
+                            line,
+                            "list[float] is blocked in v0.3: Vec<f64> element access is miscompiled on both sla routes (hand-written SLA probes independent of psa read pushed f64 elements back wrong on the Rust route and the Zig route alike) — psa refuses to emit silently wrong programs (upstream defect (xxiv), see README)",
+                        ));
+                    }
+                    if Ty::list_of(ty).is_none() {
+                        return Err(eerr(
+                            line,
+                            &format!(
+                                "list elements of type {:?} are not supported in v0.3 (scalar int/float/bool elements only)",
+                                ty
+                            ),
+                        ));
+                    }
+                    elem_ty = Some(ty);
+                }
+                Some(want) => {
+                    if ty != want {
+                        return Err(eerr(
+                            line,
+                            &format!(
+                                "list literal mixes element types {:?} and {:?} (one element type per list)",
+                                want, ty
+                            ),
+                        ));
+                    }
+                }
+            }
+            codes.push(code);
+        }
+        Ok((Ty::list_of(elem_ty.unwrap()).unwrap(), codes))
+    }
+
+    /// Emit `let <name>: Vec<T> = Vec::new();` (or a plain assignment
+    /// when `declare` is false) followed by one push per element code.
     fn emit_list_construct(
         &mut self,
         ctx: &mut Ctx,
         name: &str,
-        elems: &[Expr],
-        line: u32,
+        list_ty: Ty,
+        codes: &[String],
         declare: bool,
-    ) -> Result<(), String> {
+    ) {
         self.used_vec = true;
         if declare {
-            ctx.line(&format!("let {}: Vec<i64> = Vec::new();", name));
+            ctx.line(&format!("let {}: {} = Vec::new();", name, list_ty.sla()));
         } else {
             ctx.line(&format!("{} = Vec::new();", name));
         }
-        for e in elems {
-            let (code, ty) = self.emit_expr(ctx, e, line)?;
-            if ty != Ty::Int {
-                return Err(eerr(line, "list literals hold int elements only in v0.2 (list[int])"));
-            }
+        for code in codes {
             ctx.line(&format!("{}.push({});", name, code));
         }
-        Ok(())
     }
 
     fn emit_list_assign(
@@ -360,19 +445,26 @@ impl Emitter {
         elems: &[Expr],
         line: u32,
     ) -> Result<(), String> {
+        let (list_ty, codes) = self.emit_list_literal(ctx, elems, line)?;
         match ctx.lookup(name) {
             None => {
-                ctx.declare(name, Ty::ListInt).map_err(|m| eerr(line, &m))?;
-                self.emit_list_construct(ctx, name, elems, line, true)
+                ctx.declare(name, list_ty).map_err(|m| eerr(line, &m))?;
+                self.emit_list_construct(ctx, name, list_ty, &codes, true);
+                Ok(())
             }
-            Some(Ty::ListInt) => {
-                self.emit_list_construct(ctx, name, elems, line, false)?;
+            Some(existing) if existing == list_ty => {
+                self.emit_list_construct(ctx, name, list_ty, &codes, false);
                 ctx.revive(name);
                 Ok(())
             }
             Some(other) => Err(eerr(
                 line,
-                &format!("variable `{}` changes type from {:?} to list[int]", name, other),
+                &format!(
+                    "variable `{}` changes type from {} to {}",
+                    name,
+                    other.py_name(),
+                    list_ty.py_name()
+                ),
             )),
         }
     }
@@ -410,10 +502,11 @@ impl Emitter {
                     }
                     Some(Expr::ListLit(elems)) => {
                         // Build the list in a temp, then return it (move).
+                        let (list_ty, codes) = self.emit_list_literal(ctx, elems, *line)?;
                         ctx.tmp += 1;
                         let tmp = format!("__psa_ret_{}", ctx.tmp);
-                        self.emit_list_construct(ctx, &tmp, elems, *line, true)?;
-                        unify_ret(ctx, Ty::ListInt, *line)?;
+                        self.emit_list_construct(ctx, &tmp, list_ty, &codes, true);
+                        unify_ret(ctx, list_ty, *line)?;
                         ctx.line(&format!("return {};", tmp));
                     }
                     Some(e) => {
@@ -453,7 +546,7 @@ impl Emitter {
                 }
                 // Container assignment moves the source binding (spec s3).
                 let src_name = match value {
-                    Expr::Name(n) if ty == Ty::ListInt => Some(n.clone()),
+                    Expr::Name(n) if ty.is_list() => Some(n.clone()),
                     _ => None,
                 };
                 if let Some(src) = &src_name {
@@ -501,23 +594,32 @@ impl Emitter {
                 let ty = ctx
                     .lookup(name)
                     .ok_or_else(|| eerr(*line, &format!("index assignment to undefined variable `{}`", name)))?;
-                if ty != Ty::ListInt {
-                    return Err(eerr(*line, "index assignment is only supported on list[int] in v0.2"));
-                }
+                let elem = match ty.elem() {
+                    Some(e) => e,
+                    None => {
+                        return Err(eerr(
+                            *line,
+                            &format!("index assignment is only supported on lists, not on {}", ty.py_name()),
+                        ))
+                    }
+                };
                 ctx.check_alive(name, *line)?;
                 let (icode, ity) = self.emit_expr(ctx, index, *line)?;
                 if ity != Ty::Int {
                     return Err(eerr(*line, "list index must be int"));
                 }
                 let (vcode, vty) = self.emit_expr(ctx, value, *line)?;
-                if vty != Ty::Int {
-                    return Err(eerr(*line, "list[int] elements must be int"));
+                if vty != elem {
+                    return Err(eerr(
+                        *line,
+                        &format!("{} elements must be {:?}, assigned {:?}", ty.py_name(), elem, vty),
+                    ));
                 }
                 match op {
                     None => ctx.line(&format!("{}[{}] = {};", name, icode, vcode)),
                     Some(bop) => {
                         let place = format!("{}[{}]", name, icode);
-                        let (code, _) = self.emit_binop(place.clone(), Ty::Int, *bop, vcode, Ty::Int, *line)?;
+                        let (code, _) = self.emit_binop(place.clone(), elem, *bop, vcode, elem, *line)?;
                         ctx.line(&format!("{} = {};", place, code));
                     }
                 }
@@ -650,8 +752,8 @@ impl Emitter {
                     "printing a float is blocked in v0.1: the Rust sla build-exe route truncates f64 in println (3.5 prints as 3.0000000000) while the value itself computes correctly; psa refuses to print a wrong value (upstream defect, see README)",
                 ));
             }
-            if ty == Ty::ListInt {
-                return Err(eerr(line, "printing a whole list is not supported in v0.2 (print its elements or len)"));
+            if ty.is_list() {
+                return Err(eerr(line, "printing a whole list is not supported in v0.3 (print its elements or len)"));
             }
             if ty == Ty::Bool {
                 ctx.line(&format!("if {} {{ println(\"True\"); }} else {{ println(\"False\"); }};", code));
@@ -681,8 +783,8 @@ impl Emitter {
                     "printing a float is blocked in v0.1: the Rust sla build-exe route truncates f64 in println (upstream defect, see README)",
                 ));
             }
-            if ty == Ty::ListInt {
-                return Err(eerr(line, "printing a whole list is not supported in v0.2 (print its elements or len)"));
+            if ty.is_list() {
+                return Err(eerr(line, "printing a whole list is not supported in v0.3 (print its elements or len)"));
             }
             if let Expr::Str(s) = a {
                 if s.contains('{') || s.contains('}') {
@@ -723,7 +825,7 @@ impl Emitter {
             },
             Expr::ListLit(_) => Err(eerr(
                 line,
-                "list literals are only supported as an assignment value or a return value in v0.2",
+                "list literals are only supported as an assignment value or a return value in v0.3",
             )),
             Expr::Index(base, idx) => {
                 let obj = match &**base {
@@ -731,44 +833,56 @@ impl Emitter {
                     _ => {
                         return Err(eerr(
                             line,
-                            "indexing is only supported on plain variables in v0.2",
+                            "indexing is only supported on plain variables in v0.3",
                         ))
                     }
                 };
                 let ty = ctx
                     .lookup(&obj)
                     .ok_or_else(|| eerr(line, &format!("undefined variable `{}`", obj)))?;
-                if ty != Ty::ListInt {
-                    return Err(eerr(line, "indexing is only supported on list[int] in v0.2"));
-                }
+                let elem = match ty.elem() {
+                    Some(e) => e,
+                    None => {
+                        return Err(eerr(
+                            line,
+                            &format!("indexing is only supported on lists, not on {}", ty.py_name()),
+                        ))
+                    }
+                };
                 ctx.check_alive(&obj, line)?;
                 let (icode, ity) = self.emit_expr(ctx, idx, line)?;
                 if ity != Ty::Int {
                     return Err(eerr(line, "list index must be int"));
                 }
                 // Scalar element: copied out of the borrow (spec s5).
-                Ok((format!("{}[{}]", obj, icode), Ty::Int))
+                Ok((format!("{}[{}]", obj, icode), elem))
             }
             Expr::MethodCall { obj, method, args } => {
                 let ty = ctx
                     .lookup(obj)
                     .ok_or_else(|| eerr(line, &format!("undefined variable `{}`", obj)))?;
-                if ty != Ty::ListInt || method != "append" {
-                    return Err(eerr(
-                        line,
-                        &format!(
-                            "method `{}` is not supported in v0.2 (only list.append)",
-                            method
-                        ),
-                    ));
-                }
+                let elem = match ty.elem() {
+                    Some(e) if method == "append" => e,
+                    _ => {
+                        return Err(eerr(
+                            line,
+                            &format!(
+                                "method `{}` is not supported in v0.3 (only list.append)",
+                                method
+                            ),
+                        ))
+                    }
+                };
                 ctx.check_alive(obj, line)?;
                 if args.len() != 1 {
                     return Err(eerr(line, "append takes exactly one argument"));
                 }
                 let (acode, aty) = self.emit_expr(ctx, &args[0], line)?;
-                if aty != Ty::Int {
-                    return Err(eerr(line, "list[int] elements must be int"));
+                if aty != elem {
+                    return Err(eerr(
+                        line,
+                        &format!("{} elements must be {:?}, appended {:?}", ty.py_name(), elem, aty),
+                    ));
                 }
                 self.used_vec = true;
                 Ok((format!("{}.push({})", obj, acode), Ty::Void))
@@ -813,8 +927,8 @@ impl Emitter {
                         return Err(eerr(line, "len() takes exactly one argument"));
                     }
                     let (c, t) = self.emit_expr(ctx, &args[0], line)?;
-                    if t != Ty::ListInt {
-                        return Err(eerr(line, "len() is only supported on list[int] in v0.2"));
+                    if !t.is_list() {
+                        return Err(eerr(line, "len() is only supported on lists in v0.3"));
                     }
                     return Ok((format!("(len({}) as i64)", c), Ty::Int));
                 }
@@ -832,7 +946,7 @@ impl Emitter {
                 // the argument binding. A borrowed parameter of the
                 // caller can be re-borrowed onward but never moved.
                 for (i, a) in args.iter().enumerate() {
-                    if arg_tys.get(i) != Some(&Ty::ListInt) {
+                    if !arg_tys.get(i).map(|t| t.is_list()).unwrap_or(false) {
                         continue;
                     }
                     let borrow = sig.param_borrow.get(i).copied().unwrap_or(false);
@@ -860,7 +974,7 @@ impl Emitter {
                             if borrow {
                                 return Err(eerr(
                                     line,
-                                    "passing a temporary list to a borrowing parameter is not supported in v0.2; bind it to a variable first",
+                                    "passing a temporary list to a borrowing parameter is not supported in v0.3; bind it to a variable first",
                                 ));
                             }
                         }
