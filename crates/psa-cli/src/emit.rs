@@ -136,6 +136,11 @@ struct Ctx {
     /// True when a prescan of the function body showed its returns
     /// unify to Dyn: every return value is boxed at emission time.
     dyn_ret: bool,
+    /// Names removed by `del` (with the del line). Function-scoped,
+    /// like Python's own name binding; re-binding clears the entry.
+    /// The emitted SLA variable still exists and drops at scope end;
+    /// psa refuses later references, mirroring Python's NameError.
+    deleted: Vec<(String, u32)>,
 }
 
 impl Ctx {
@@ -177,6 +182,21 @@ impl Ctx {
             ));
         }
         Ok(())
+    }
+    fn check_not_deleted(&self, name: &str, line: u32) -> Result<(), String> {
+        if let Some((_, at)) = self.deleted.iter().rev().find(|(n, _)| n == name) {
+            return Err(eerr(
+                line,
+                &format!(
+                    "use of `{}` after `del` at line {} (Python raises NameError; re-bind the name first)",
+                    name, at
+                ),
+            ));
+        }
+        Ok(())
+    }
+    fn clear_deleted(&mut self, name: &str) {
+        self.deleted.retain(|(n, _)| n != name);
     }
     fn declare(&mut self, name: &str, ty: Ty) -> Result<(), String> {
         // Redeclaring in the *same* scope is an error; shadowing an outer
@@ -257,6 +277,7 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
         borrowed: Vec::new(),
         in_while_cond: false,
         dyn_ret: false,
+                deleted: Vec::new(),
     };
     for s in &prog.top {
         em.emit_stmt(&mut main_ctx, s)?;
@@ -405,6 +426,7 @@ impl Emitter {
                 borrowed: borrowed_params.clone(),
                 in_while_cond: false,
                 dyn_ret: false,
+                deleted: Vec::new(),
             };
             let r = (|| {
                 for s in &def.body {
@@ -432,6 +454,7 @@ impl Emitter {
             borrowed: borrowed_params,
             in_while_cond: false,
             dyn_ret: prescan_ret == Some(Ty::Dyn),
+            deleted: Vec::new(),
         };
         let body_res = (|| {
             for s in &def.body {
@@ -799,6 +822,7 @@ impl Emitter {
                 Ok(())
             }
             Stmt::Assign { name, value, line } => {
+                ctx.clear_deleted(name);
                 // List literals are constructed statement-wise.
                 if let Expr::ListLit(elems) = value {
                     return self.emit_list_assign(ctx, name, elems, *line);
@@ -865,7 +889,29 @@ impl Emitter {
                         } else {
                             ctx.declare(name, ty)
                                 .map_err(|m| eerr(*line, &m))?;
-                            ctx.line(&format!("let {}: {} = {};", name, ty.sla(), code));
+                            if matches!(value, Expr::Name(_))
+                                && matches!(ty, Ty::Int | Ty::Float | Ty::Bool)
+                            {
+                                // A fresh `let q = p;` MOVES p on the
+                                // SAB route even for scalars ((xxvii)(a)
+                                // family: let-from-name consumes).
+                                // Declare with the default, then assign:
+                                // the assignment form reads p by copy.
+                                ctx.line(&format!(
+                                    "let {}: {} = {};",
+                                    name,
+                                    ty.sla(),
+                                    ty.default_lit()
+                                ));
+                                ctx.line(&format!("{} = {};", name, code));
+                            } else {
+                                ctx.line(&format!(
+                                    "let {}: {} = {};",
+                                    name,
+                                    ty.sla(),
+                                    code
+                                ));
+                            }
                         }
                     }
                     Some(existing) => {
@@ -906,6 +952,101 @@ impl Emitter {
                     if src != *name {
                         ctx.mark_moved(&src, *line);
                     }
+                }
+                Ok(())
+            }
+            Stmt::Assert { cond, line } => {
+                let (code, ty) = self.emit_expr(ctx, cond, *line)?;
+                let code = match ty {
+                    Ty::Bool => code,
+                    Ty::Dyn => self.unbox_code(code, Ty::Bool, *line)?,
+                    _ => {
+                        return Err(eerr(
+                            *line,
+                            "assert condition must be a bool (or a dynamic value)",
+                        ))
+                    }
+                };
+                ctx.line(&format!("if !({}) {{ panic(77040); }};", code));
+                Ok(())
+            }
+            Stmt::Del { targets, line } => {
+                for (name, index) in targets {
+                    if index.is_some() {
+                        return Err(eerr(
+                            *line,
+                            "del name[index] is not supported yet: the SLA source level has no Vec shrink shape (sa_vec_truncate exists at SA level only); del name and (with D3) del dict[key] are the supported forms",
+                        ));
+                    }
+                    if ctx.lookup(name).is_none() {
+                        return Err(eerr(
+                            *line,
+                            &format!("del of undefined variable `{}` (Python raises NameError)", name),
+                        ));
+                    }
+                    ctx.check_alive(name, *line)?;
+                    if !ctx.deleted.iter().any(|(n, _)| n == name) {
+                        ctx.deleted.push((name.clone(), *line));
+                    }
+                }
+                Ok(())
+            }
+            Stmt::MultiAssign { names, values, line } => {
+                // Evaluate every RHS value into its own temp first
+                // (Python evaluates the whole RHS before binding, so
+                // `a, b = b, a` swaps correctly).
+                let mut temps: Vec<String> = Vec::new();
+                for v in values {
+                    ctx.tmp += 1;
+                    let tname = format!("__psa_ma_{}", ctx.tmp);
+                    self.emit_stmt(
+                        ctx,
+                        &Stmt::Assign { name: tname.clone(), value: v.clone(), line: *line },
+                    )?;
+                    temps.push(tname);
+                }
+                if values.len() == 1 && names.len() > 1 {
+                    // Chained: every target binds the same value. For a
+                    // list that would alias in Python; psa ownership
+                    // cannot alias, so refuse loudly.
+                    if let Some(t) = ctx.lookup(&temps[0]) {
+                        if t.is_list() {
+                            return Err(eerr(
+                                *line,
+                                "chained assignment of a list would alias it in Python; psa ownership cannot alias a container -- bind the targets separately",
+                            ));
+                        }
+                    }
+                    for n in names {
+                        self.emit_stmt(
+                            ctx,
+                            &Stmt::Assign {
+                                name: n.clone(),
+                                value: Expr::Name(temps[0].clone()),
+                                line: *line,
+                            },
+                        )?;
+                    }
+                } else if values.len() == names.len() {
+                    for (n, t) in names.iter().zip(temps.iter()) {
+                        self.emit_stmt(
+                            ctx,
+                            &Stmt::Assign {
+                                name: n.clone(),
+                                value: Expr::Name(t.clone()),
+                                line: *line,
+                            },
+                        )?;
+                    }
+                } else {
+                    return Err(eerr(
+                        *line,
+                        &format!(
+                            "cannot assign {} value(s) to {} name(s)",
+                            values.len(),
+                            names.len()
+                        ),
+                    ));
                 }
                 Ok(())
             }
@@ -1277,13 +1418,16 @@ impl Emitter {
             Expr::Float(v) => Ok((fmt_f64(*v), Ty::Float)),
             Expr::Str(s) => Ok((format!("\"{}\"", escape_sla_str(s)), Ty::Str)),
             Expr::Bool(b) => Ok((b.to_string(), Ty::Bool)),
-            Expr::Name(n) => match ctx.lookup(n) {
-                Some(t) => {
-                    ctx.check_alive(n, line)?;
-                    Ok((n.clone(), t))
+            Expr::Name(n) => {
+                ctx.check_not_deleted(n, line)?;
+                match ctx.lookup(n) {
+                    Some(t) => {
+                        ctx.check_alive(n, line)?;
+                        Ok((n.clone(), t))
+                    }
+                    None => Err(eerr(line, &format!("undefined variable `{}`", n))),
                 }
-                None => Err(eerr(line, &format!("undefined variable `{}`", n))),
-            },
+            }
             Expr::ListLit(_) => Err(eerr(
                 line,
                 "list literals are only supported as an assignment value or a return value in v0.3",

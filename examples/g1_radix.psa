@@ -1,0 +1,5 @@
+print(0xFF)
+print(0o17)
+print(0b1010)
+print(0xDEAD_BEEF)
+print(1_000_000)

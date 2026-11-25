@@ -67,6 +67,15 @@ pub enum Stmt {
     While { cond: Expr, body: Vec<Stmt>, line: u32 },
     ForRange { var: String, start: Option<Expr>, stop: Expr, body: Vec<Stmt>, line: u32 },
     Return { value: Option<Expr>, line: u32 },
+    /// `assert cond` / `assert cond, "msg"` (msg is a literal; it is a
+    /// diagnostic label only -- psa panics with a code, no traceback).
+    Assert { cond: Expr, line: u32 },
+    /// `del name` / `del name[idx]` (index form is refused at emit:
+    /// no SLA-source Vec shrink shape yet).
+    Del { targets: Vec<(String, Option<Expr>)>, line: u32 },
+    /// `a, b = v1, v2` (values.len() == names.len()) or chained
+    /// `a = b = v` (values.len() == 1 < names.len()).
+    MultiAssign { names: Vec<String>, values: Vec<Expr>, line: u32 },
     Break { line: u32 },
     Continue { line: u32 },
     Pass { line: u32 },

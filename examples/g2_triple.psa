@@ -1,0 +1,4 @@
+print("""line1
+line2 "quoted"
+line3""")
+print('''a'b''')

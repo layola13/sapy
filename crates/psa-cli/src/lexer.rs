@@ -171,6 +171,33 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             match c {
                 b'0'..=b'9' => {
                     let start = pos;
+                    // Radix literals: 0x../0o../0b.. (underscores allowed).
+                    if bytes[pos] == b'0'
+                        && pos + 1 < n
+                        && matches!(bytes[pos + 1], b'x' | b'X' | b'o' | b'O' | b'b' | b'B')
+                    {
+                        let radix = match bytes[pos + 1] {
+                            b'x' | b'X' => 16,
+                            b'o' | b'O' => 8,
+                            _ => 2,
+                        };
+                        pos += 2;
+                        let dstart = pos;
+                        while pos < n
+                            && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_')
+                        {
+                            pos += 1;
+                        }
+                        let digits: String =
+                            src[dstart..pos].chars().filter(|&ch| ch != '_').collect();
+                        if digits.is_empty() {
+                            return Err(err(tok_line, "radix literal with no digits"));
+                        }
+                        let v = i64::from_str_radix(&digits, radix)
+                            .map_err(|_| err(tok_line, "bad radix literal or out of i64 range"))?;
+                        out.push(Token { tok: Tok::Int(v), line: tok_line });
+                        continue;
+                    }
                     let mut is_float = false;
                     while pos < n && (bytes[pos].is_ascii_digit() || bytes[pos] == b'_') {
                         pos += 1;
@@ -193,6 +220,58 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 }
                 b'"' | b'\'' => {
                     let quote = c;
+                    // Triple-quoted string: may span lines, ends at the
+                    // matching triple quote.
+                    if pos + 2 < n && bytes[pos + 1] == quote && bytes[pos + 2] == quote {
+                        pos += 3;
+                        let mut s = String::new();
+                        loop {
+                            if pos >= n {
+                                return Err(err(tok_line, "unterminated triple-quoted string"));
+                            }
+                            if bytes[pos] == quote
+                                && pos + 2 < n
+                                && bytes[pos + 1] == quote
+                                && bytes[pos + 2] == quote
+                            {
+                                pos += 3;
+                                break;
+                            }
+                            let ch = bytes[pos];
+                            if ch == b'\\' {
+                                pos += 1;
+                                if pos >= n {
+                                    return Err(err(tok_line, "unterminated escape"));
+                                }
+                                match bytes[pos] {
+                                    b'n' => s.push('\n'),
+                                    b't' => s.push('\t'),
+                                    b'\\' => s.push('\\'),
+                                    b'"' => s.push('"'),
+                                    b'\'' => s.push('\''),
+                                    other => {
+                                        return Err(err(
+                                            tok_line,
+                                            &format!(
+                                                "unsupported escape \\{} in string",
+                                                other as char
+                                            ),
+                                        ))
+                                    }
+                                }
+                                pos += 1;
+                                continue;
+                            }
+                            if ch == b'\n' {
+                                line += 1;
+                            }
+                            let ch_len = utf8_len(bytes[pos]);
+                            s.push_str(&src[pos..pos + ch_len]);
+                            pos += ch_len;
+                        }
+                        out.push(Token { tok: Tok::Str(s), line: tok_line });
+                        continue;
+                    }
                     pos += 1;
                     let mut s = String::new();
                     loop {

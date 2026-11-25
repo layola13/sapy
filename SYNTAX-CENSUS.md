@@ -10,10 +10,10 @@ Value 动态面（DYNAMIC-DESIGN.md）；【排除】= v1 明确不做、响亮�
 | 项 | 状态 | 备注 |
 |---|---|---|
 | int/float/bool/None 字面量 | 部分 | D1 后 None 是真实动态值（标签 3）：混合返回/三元可产出、可比较、可打印；`x = None` 字面量直接绑定随 D2 |
-| str 字面量（单/双引号） | 支持 | 转义有限；三引号字符串 缺口-前端；str 值绑定变量被上游 (xxv) 堵（响亮拒绝） |
+| str 字面量（单/双引号） | 支持 | 转义有限；三引号字符串已支持（2026-11-25 晚间段，词法）；str 值绑定变量被上游 (xxv) 堵（响亮拒绝） |
 | f-string | 部分 | D0 已支持：仅 print() 唯一参数位置；插值限 int/str 字面量 + 至多一个 bool；格式规格/转换响亮拒绝；作一般值待 D2 字符串运行时 |
 | 字节串 b""、原始串 r"" | 缺口-前端 | 低频 |
-| 数字进制 0x/0o/0b、下划线分隔 | 缺口-前端 | 词法小改 |
+| 数字进制 0x/0o/0b、下划线分隔 | 支持 | 2026-11-25 晚间段词法落地（from_str_radix，含下划线） |
 | 注释、缩进块、续行 | 支持 | 制表符响亮拒绝（与 Python 允许不同，低频） |
 
 ## 2. 表达式
@@ -41,7 +41,7 @@ Value 动态面（DYNAMIC-DESIGN.md）；【排除】= v1 明确不做、响亮�
 ## 3. 语句
 | 项 | 状态 | 备注 |
 |---|---|---|
-| 赋值、增广赋值 | 支持 | 多重赋值 a=b=1、序列拆包 a,b=b,a 缺口-动态 |
+| 赋值、增广赋值 | 支持 | 多重赋值 a=b=1、序列拆包 a,b=b,a 已支持（2026-11-25 晚间段：RHS 先求值入临时量再绑定；链式绑定的 list 别名响亮拒绝——所有权不可别名）。附带修复：`q = p` 标量新绑定在 SAB 路会 MOVE 源（(xxvii)(a) 族），psa 改先声明后赋值绕行 |
 | 下标赋值 xs[i]=v | 部分 | 仅 list；dict 下标赋值 缺口-动态 |
 | if/elif/else、while、break/continue | 支持 | while/else、for/else 缺口-前端（低频） |
 | for x in range(...) | 部分 | 仅 range 一/二参；for 遍历 list/str/dict 缺口-动态（最高频缺口之一） |
@@ -52,7 +52,7 @@ Value 动态面（DYNAMIC-DESIGN.md）；【排除】= v1 明确不做、响亮�
 | try/except/finally、raise | 缺口-动态 | 异常运行时是最硬项，Tier 1 内最后做 |
 | with | 缺口-动态 | 依赖异常与协议，先做文件类最小形 |
 | global/nonlocal | 缺口-动态 | 随闭包项 |
-| del、assert | 缺口-前端 | assert 脱糖为 if+raise 形；del 随容器语义 |
+| del、assert | 支持 | 2026-11-25 晚间段：assert 脱糖为 if+panic(77040)（消息限字面量、仅作标签）；del name 已支持（删后引用响亮报错、重绑定复活）；del name[idx] 响亮拒绝（SLA 源级无 Vec 收缩形，SA 层有 sa_vec_truncate）；del dict[k] 随 D3 |
 | async def/await | 缺口-动态 | 分期后段 |
 | match | 缺口-动态 | 3.10+，Tier 3 |
 

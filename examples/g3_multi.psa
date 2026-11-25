@@ -1,0 +1,9 @@
+a = 1
+b = 2
+a, b = b, a
+print(a)
+print(b)
+x, y, z = 10, 20, 30
+print(x + y + z)
+p = q = 7
+print(p * q)

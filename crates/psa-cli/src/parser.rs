@@ -247,7 +247,110 @@ impl Parser {
                 self.bump();
                 Ok(Stmt::Pass { line })
             }
+            Tok::Ident(name) if name == "assert" => {
+                self.bump();
+                let cond = self.parse_expr()?;
+                if matches!(self.peek(), Tok::Comma) {
+                    self.bump();
+                    let msg = self.parse_expr()?;
+                    if !matches!(msg, Expr::Str(_)) {
+                        return Err(perr(
+                            line,
+                            "assert message must be a string literal in v1 (it is a diagnostic label; psa panics with a code)",
+                        ));
+                    }
+                }
+                Ok(Stmt::Assert { cond, line })
+            }
+            Tok::Ident(name) if name == "del" => {
+                self.bump();
+                let mut targets = Vec::new();
+                loop {
+                    let tname = match self.bump() {
+                        Tok::Ident(n) => n,
+                        t => {
+                            return Err(perr(
+                                line,
+                                &format!("del expects a name, found {:?}", t),
+                            ))
+                        }
+                    };
+                    let index = if matches!(self.peek(), Tok::LBracket) {
+                        self.bump();
+                        let ix = self.parse_expr()?;
+                        self.expect(&Tok::RBracket)?;
+                        Some(ix)
+                    } else {
+                        None
+                    };
+                    targets.push((tname, index));
+                    if matches!(self.peek(), Tok::Comma) {
+                        self.bump();
+                        continue;
+                    }
+                    break;
+                }
+                Ok(Stmt::Del { targets, line })
+            }
             Tok::Ident(name) => {
+                // Multiple assignment: `a, b = v1, v2` (comma after the
+                // first name) or chained `a = b = v` (name = name = ...).
+                {
+                    let t1 = self.toks.get(self.pos + 1).map(|t| &t.tok);
+                    let t2 = self.toks.get(self.pos + 2).map(|t| &t.tok);
+                    let t3 = self.toks.get(self.pos + 3).map(|t| &t.tok);
+                    let multi = matches!(t1, Some(Tok::Comma));
+                    let chained = matches!(t1, Some(Tok::Assign))
+                        && matches!(t2, Some(Tok::Ident(_)))
+                        && matches!(t3, Some(Tok::Assign));
+                    if multi || chained {
+                        let mut names = vec![name.clone()];
+                        self.bump(); // first name
+                        if multi {
+                            while matches!(self.peek(), Tok::Comma) {
+                                self.bump();
+                                match self.bump() {
+                                    Tok::Ident(n) => names.push(n),
+                                    t => {
+                                        return Err(perr(
+                                            line,
+                                            &format!(
+                                                "expected a name in assignment targets, found {:?}",
+                                                t
+                                            ),
+                                        ))
+                                    }
+                                }
+                            }
+                            self.expect(&Tok::Assign)?;
+                        } else {
+                            // chained: name (= name)* = value
+                            while matches!(self.peek(), Tok::Assign)
+                                && matches!(
+                                    self.toks.get(self.pos + 1).map(|t| &t.tok),
+                                    Some(Tok::Ident(_))
+                                )
+                                && matches!(
+                                    self.toks.get(self.pos + 2).map(|t| &t.tok),
+                                    Some(Tok::Assign)
+                                )
+                            {
+                                self.bump(); // =
+                                match self.bump() {
+                                    Tok::Ident(n) => names.push(n),
+                                    _ => unreachable!(),
+                                }
+                            }
+                            self.expect(&Tok::Assign)?;
+                        }
+                        let mut values = vec![self.parse_expr()?];
+                        while matches!(self.peek(), Tok::Comma) {
+                            self.bump();
+                            values.push(self.parse_expr()?);
+                        }
+                        return Ok(Stmt::MultiAssign { names, values, line });
+                    }
+                }
                 // Index assignment: name[expr] (=|+=|-=|*=) expr — try it
                 // with backtracking; a bare name[expr] expression
                 // statement falls through to expression parsing.
