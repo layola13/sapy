@@ -1,0 +1,20 @@
+with open("with1_out.txt", "w") as f:
+    n = f.write("hello\nworld\n")
+    print("wrote", n)
+
+with open("with1_out.txt", "r") as f:
+    data = f.read()
+    print(repr(data))
+
+with open("with1_out.txt") as f:
+    print(repr(f.readline()))
+    print(repr(f.readline()))
+    print(repr(f.read()))
+
+with open("with1_out.txt", "a") as f:
+    f.write("third\n")
+
+with open("with1_out.txt") as f:
+    print(repr(f.read()))
+
+print("done")

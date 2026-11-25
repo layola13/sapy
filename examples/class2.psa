@@ -1,0 +1,25 @@
+class Flag:
+    def __init__(self, v):
+        self.v = v
+
+    def __repr__(self):
+        return "Flag"
+
+    def __bool__(self):
+        return self.v != 0
+
+
+f = Flag(0)
+print(f)
+if f:
+    print("yes")
+else:
+    print("no")
+g = Flag(3)
+print(g)
+if g:
+    print("yes")
+else:
+    print("no")
+fg = [f, g]
+print(fg)

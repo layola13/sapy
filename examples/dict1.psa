@@ -1,0 +1,22 @@
+d = {"b": 2, "a": 1}
+d["c"] = 3
+print(d)
+print(len(d))
+for k in d:
+    print(k)
+print(d["a"])
+d["a"] = 10
+print(d)
+print("b" in d)
+print("z" in d)
+del d["b"]
+print(d)
+print(len(d))
+e = {1: "x", True: "y"}
+print(len(e))
+print(e[1])
+print(e)
+f = {"a": 1}
+g = {"a": 1}
+print(f == g)
+print(f == d)

@@ -1,0 +1,43 @@
+class Point:
+    kind = "point"
+
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+    def dist2(self):
+        return self.x * self.x + self.y * self.y
+
+    def move(self, dx, dy):
+        self.x = self.x + dx
+        self.y = self.y + dy
+
+
+class ColoredPoint(Point):
+    def __init__(self, x, y, color):
+        Point.__init__(self, x, y)
+        self.color = color
+
+    def dist2(self):
+        return Point.dist2(self) + 100
+
+
+p = Point(3, 4)
+print(p.dist2())
+print(p.x)
+print(p.kind)
+print(Point.kind)
+p.move(1, 1)
+print(p.dist2())
+p.z = 9
+print(p.z)
+del p.z
+print(p.x + p.y)
+c = ColoredPoint(1, 2, "red")
+print(c.dist2())
+print(c.color)
+print(c.kind)
+q = c
+print(q.dist2())
+print(p == p)
+print(p == c)

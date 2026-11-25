@@ -70,7 +70,12 @@ fn run(cmd: &str, file: &Path, out_path: Option<&Path>) -> Result<(), String> {
         .map_err(|e| format!("psa: cannot read {}: {}", file.display(), e))?;
     let toks = lexer::lex(&src)?;
     let mut p = parser::Parser::new(toks);
-    let prog = p.parse_program()?;
+    let mut prog = p.parse_program()?;
+    let base_dir = file
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    merge_imports(&mut prog, &base_dir)?;
     let sla_src = emit::emit_program(&prog)?;
     if cmd == "emit" {
         print!("{}", sla_src);
@@ -150,6 +155,552 @@ fn find_sa_std(start: &Path) -> Option<PathBuf> {
         cur = d.parent().map(|p| p.to_path_buf());
     }
     None
+}
+
+/// D6 import resolution: merge imported module files into the
+/// program before emission. A module file lives next to the
+/// importing file (dotted names map to subdirectories). Only
+/// defs, classes and literal assignments may appear at a
+/// module's top level; anything else is refused loudly.
+/// Module defs are renamed to dotted keys (`foo.bar`), module
+/// classes join the shared class registry under their plain
+/// names, and module literal attributes are recorded under
+/// dotted keys for read-site evaluation. Circular imports are
+/// refused. From-import bindings are program-wide in v1 (a
+/// documented simplification of CPython's module-local
+/// bindings).
+fn merge_imports(prog: &mut ast::Program, base_dir: &Path) -> Result<(), String> {
+    use std::collections::HashSet;
+    let imports = std::mem::take(&mut prog.imports);
+    if imports.is_empty() {
+        return Ok(());
+    }
+    let mut visiting: HashSet<String> = HashSet::new();
+    let mut done: HashSet<String> = HashSet::new();
+    for imp in &imports {
+        load_module(prog, base_dir, &imp.module, &mut visiting, &mut done, imp.line)?;
+        if let Some(names) = &imp.names {
+            bind_from_import(prog, &imp.module, names, imp.line)?;
+        }
+    }
+    Ok(())
+}
+
+fn load_module(
+    prog: &mut ast::Program,
+    base_dir: &Path,
+    key: &str,
+    visiting: &mut std::collections::HashSet<String>,
+    done: &mut std::collections::HashSet<String>,
+    line: u32,
+) -> Result<(), String> {
+    use ast::Stmt;
+    if done.contains(key) {
+        return Ok(());
+    }
+    if !visiting.insert(key.to_string()) {
+        return Err(format!(
+            "psa: circular import of module `{}` (line {})",
+            key, line
+        ));
+    }
+    let rel = key.replace('.', "/") + ".psa";
+    let path = base_dir.join(&rel);
+    let src = std::fs::read_to_string(&path).map_err(|e| {
+        format!("psa: cannot import module `{}` ({}): {}", key, path.display(), e)
+    })?;
+    let toks = lexer::lex(&src)?;
+    let mut p = parser::Parser::new(toks);
+    let mut sub = p
+        .parse_program()
+        .map_err(|e| format!("psa: in module `{}`: {}", key, e))?;
+    // The module's own imports resolve relative to its own file.
+    let sub_dir = path
+        .parent()
+        .map(|x| x.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let sub_imports = std::mem::take(&mut sub.imports);
+    for imp in &sub_imports {
+        load_module(prog, &sub_dir, &imp.module, visiting, done, imp.line)?;
+        if let Some(names) = &imp.names {
+            bind_from_import(prog, &imp.module, names, imp.line)?;
+        }
+    }
+    // Validate the module top level: statements may only be
+    // literal assignments (the module attributes).
+    let mut attrs: Vec<(String, ast::Expr)> = Vec::new();
+    for st in &sub.top {
+        match st {
+            Stmt::Assign { name, value, .. } if is_literal(value) => {
+                attrs.push((name.clone(), value.clone()));
+            }
+            _ => {
+                return Err(format!(
+                    "psa: module `{}` top level may only contain defs, classes and literal assignments (line {})",
+                    key, line
+                ));
+            }
+        }
+    }
+    // Class name collisions in the shared registry are loud.
+    for c in &sub.classes {
+        if prog.classes.iter().any(|x| x.name == c.name) {
+            return Err(format!(
+                "psa: class `{}` of module `{}` collides with another class of the same name (the class registry is program-wide in v1)",
+                c.name, key
+            ));
+        }
+    }
+    let def_names: Vec<String> = sub.funcs.iter().map(|f| f.name.clone()).collect();
+    for mut f in sub.funcs {
+        rename_module_refs(&mut f, key, &def_names, &attrs);
+        f.name = format!("{}.{}", key, f.name);
+        prog.funcs.push(f);
+    }
+    for c in &mut sub.classes {
+        for m in &mut c.methods {
+            rename_module_refs(m, key, &def_names, &attrs);
+        }
+    }
+    prog.classes.extend(sub.classes);
+    for (n, lit) in &attrs {
+        prog.mod_attrs.push((format!("{}.{}", key, n), lit.clone()));
+    }
+    prog.modules.push(key.to_string());
+    visiting.remove(key);
+    done.insert(key.to_string());
+    Ok(())
+}
+
+fn bind_from_import(
+    prog: &mut ast::Program,
+    key: &str,
+    names: &[(String, Option<String>)],
+    line: u32,
+) -> Result<(), String> {
+    for (name, alias) in names {
+        let target = alias.clone().unwrap_or_else(|| name.clone());
+        let dotted = format!("{}.{}", key, name);
+        if let Some(f) = prog.funcs.iter().find(|f| f.name == dotted).cloned() {
+            if let Some(existing) = prog.funcs.iter().find(|x| x.name == target) {
+                // Re-importing the same def under the same name
+                // is a no-op; anything else is a collision.
+                if format!("{:?}", existing.body) == format!("{:?}", f.body)
+                    && existing.params.len() == f.params.len()
+                {
+                    continue;
+                }
+                return Err(format!(
+                    "psa: from-import of `{}` as `{}` collides with an existing definition (line {})",
+                    dotted, target, line
+                ));
+            }
+            let mut f2 = f;
+            f2.name = target.clone();
+            prog.funcs.push(f2);
+            continue;
+        }
+        if prog.classes.iter().any(|c| &c.name == name) {
+            if target != *name {
+                return Err(format!(
+                    "psa: cannot alias class `{}` as `{}` in v1 (line {})",
+                    name, target, line
+                ));
+            }
+            continue;
+        }
+        if let Some((_, lit)) = prog.mod_attrs.iter().find(|(k, _)| k == &dotted) {
+            let lit = lit.clone();
+            if prog.const_names.iter().any(|(n, _)| n == &target) {
+                return Err(format!(
+                    "psa: from-import of `{}` as `{}` collides with an existing imported name (line {})",
+                    dotted, target, line
+                ));
+            }
+            prog.const_names.push((target, lit));
+            continue;
+        }
+        return Err(format!(
+            "psa: cannot import name `{}` from module `{}` (line {})",
+            name, key, line
+        ));
+    }
+    Ok(())
+}
+
+fn is_literal(e: &ast::Expr) -> bool {
+    use ast::Expr;
+    matches!(
+        e,
+        Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::NoneLit
+    )
+}
+
+/// Rewrite a merged module's function body: references to
+/// sibling defs take their dotted keys, and reads of the
+/// module's literal attributes are replaced by the literal
+/// itself (the read-site evaluation shape). Names shadowed by
+/// parameters or local assignments are left alone.
+fn rename_module_refs(
+    f: &mut ast::Func,
+    key: &str,
+    def_names: &[String],
+    attrs: &[(String, ast::Expr)],
+) {
+    use std::collections::HashSet;
+    let mut shadow: HashSet<String> = HashSet::new();
+    for n in f.param_names() {
+        shadow.insert(n);
+    }
+    collect_assigned(&f.body, &mut shadow);
+    rename_stmts(&mut f.body, key, def_names, attrs, &shadow);
+}
+
+fn collect_assigned(stmts: &[ast::Stmt], out: &mut std::collections::HashSet<String>) {
+    use ast::Stmt;
+    for st in stmts {
+        match st {
+            Stmt::Assign { name, .. }
+            | Stmt::AugAssign { name, .. }
+            | Stmt::IndexAssign { name, .. } => {
+                out.insert(name.clone());
+            }
+            Stmt::MultiAssign { names, .. } | Stmt::Unpack { names, .. } => {
+                for n in names {
+                    out.insert(n.clone());
+                }
+            }
+            Stmt::ForRange { var, body, .. } => {
+                out.insert(var.clone());
+                collect_assigned(body, out);
+            }
+            Stmt::ForEach { vars, body, .. } => {
+                for n in vars {
+                    out.insert(n.clone());
+                }
+                collect_assigned(body, out);
+            }
+            Stmt::If { arms, els, .. } => {
+                for (_, b) in arms {
+                    collect_assigned(b, out);
+                }
+                if let Some(b) = els {
+                    collect_assigned(b, out);
+                }
+            }
+            Stmt::While { body, .. } => collect_assigned(body, out),
+            Stmt::With { items, body, .. } => {
+                for (_, bind) in items {
+                    if let Some(n) = bind {
+                        out.insert(n.clone());
+                    }
+                }
+                collect_assigned(body, out);
+            }
+            Stmt::Try {
+                body,
+                handlers,
+                els,
+                finally,
+                ..
+            } => {
+                collect_assigned(body, out);
+                for h in handlers {
+                    if let Some(n) = &h.bind {
+                        out.insert(n.clone());
+                    }
+                    collect_assigned(&h.body, out);
+                }
+                if let Some(b) = els {
+                    collect_assigned(b, out);
+                }
+                if let Some(b) = finally {
+                    collect_assigned(b, out);
+                }
+            }
+            Stmt::Del { targets, .. } => {
+                for (n, _) in targets {
+                    out.insert(n.clone());
+                }
+            }
+            Stmt::Match { cases, .. } => {
+                for c in cases {
+                    collect_pattern_names(&c.pattern, out);
+                    collect_assigned(&c.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_pattern_names(
+    p: &ast::Pattern,
+    out: &mut std::collections::HashSet<String>,
+) {
+    match p {
+        ast::Pattern::Capture(n) => {
+            out.insert(n.clone());
+        }
+        ast::Pattern::Seq(pats) | ast::Pattern::Or(pats) => {
+            for x in pats {
+                collect_pattern_names(x, out);
+            }
+        }
+        ast::Pattern::Lit(_) | ast::Pattern::Wildcard => {}
+    }
+}
+
+fn rename_stmts(
+    stmts: &mut [ast::Stmt],
+    key: &str,
+    def_names: &[String],
+    attrs: &[(String, ast::Expr)],
+    shadow: &std::collections::HashSet<String>,
+) {
+    use ast::Stmt;
+    for st in stmts.iter_mut() {
+        match st {
+            Stmt::Assign { value, .. }
+            | Stmt::AugAssign { value, .. }
+            | Stmt::ExprStmt { value, .. } => {
+                rename_expr(value, key, def_names, attrs, shadow)
+            }
+            Stmt::IndexAssign {
+                index, value, ..
+            } => {
+                rename_expr(index, key, def_names, attrs, shadow);
+                rename_expr(value, key, def_names, attrs, shadow);
+            }
+            Stmt::AttrAssign { base, value, .. } => {
+                rename_expr(base, key, def_names, attrs, shadow);
+                rename_expr(value, key, def_names, attrs, shadow);
+            }
+            Stmt::AttrDel { base, .. } => rename_expr(base, key, def_names, attrs, shadow),
+            Stmt::If { arms, els, .. } => {
+                for (c, b) in arms.iter_mut() {
+                    rename_expr(c, key, def_names, attrs, shadow);
+                    rename_stmts(b, key, def_names, attrs, shadow);
+                }
+                if let Some(b) = els {
+                    rename_stmts(b, key, def_names, attrs, shadow);
+                }
+            }
+            Stmt::While { cond, body, .. } => {
+                rename_expr(cond, key, def_names, attrs, shadow);
+                rename_stmts(body, key, def_names, attrs, shadow);
+            }
+            Stmt::ForRange {
+                start, stop, body, ..
+            } => {
+                if let Some(s) = start {
+                    rename_expr(s, key, def_names, attrs, shadow);
+                }
+                rename_expr(stop, key, def_names, attrs, shadow);
+                rename_stmts(body, key, def_names, attrs, shadow);
+            }
+            Stmt::ForEach { iter, body, .. } => {
+                rename_expr(iter, key, def_names, attrs, shadow);
+                rename_stmts(body, key, def_names, attrs, shadow);
+            }
+            Stmt::Unpack { value, .. } => rename_expr(value, key, def_names, attrs, shadow),
+            Stmt::Return { value, .. } => {
+                if let Some(v) = value {
+                    rename_expr(v, key, def_names, attrs, shadow);
+                }
+            }
+            Stmt::Assert { cond, .. } => rename_expr(cond, key, def_names, attrs, shadow),
+            Stmt::Del { targets, .. } => {
+                for (_, idx) in targets.iter_mut() {
+                    if let Some(e) = idx {
+                        rename_expr(e, key, def_names, attrs, shadow);
+                    }
+                }
+            }
+            Stmt::MultiAssign { values, .. } => {
+                for v in values.iter_mut() {
+                    rename_expr(v, key, def_names, attrs, shadow);
+                }
+            }
+            Stmt::Try {
+                body,
+                handlers,
+                els,
+                finally,
+                ..
+            } => {
+                rename_stmts(body, key, def_names, attrs, shadow);
+                for h in handlers.iter_mut() {
+                    rename_stmts(&mut h.body, key, def_names, attrs, shadow);
+                }
+                if let Some(b) = els {
+                    rename_stmts(b, key, def_names, attrs, shadow);
+                }
+                if let Some(b) = finally {
+                    rename_stmts(b, key, def_names, attrs, shadow);
+                }
+            }
+            Stmt::Raise { value, .. } => {
+                if let Some(v) = value {
+                    rename_expr(v, key, def_names, attrs, shadow);
+                }
+            }
+            Stmt::With { items, body, .. } => {
+                for (e, _) in items.iter_mut() {
+                    rename_expr(e, key, def_names, attrs, shadow);
+                }
+                rename_stmts(body, key, def_names, attrs, shadow);
+            }
+            Stmt::Yield { value, .. } => {
+                if let Some(v) = value {
+                    rename_expr(v, key, def_names, attrs, shadow);
+                }
+            }
+            Stmt::Match { subject, cases, .. } => {
+                rename_expr(subject, key, def_names, attrs, shadow);
+                for c in cases.iter_mut() {
+                    rename_pattern(&mut c.pattern, key, def_names, attrs, shadow);
+                    if let Some(g) = &mut c.guard {
+                        rename_expr(g, key, def_names, attrs, shadow);
+                    }
+                    rename_stmts(&mut c.body, key, def_names, attrs, shadow);
+                }
+            }
+            Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Pass { .. } => {}
+        }
+    }
+}
+
+fn rename_expr(
+    e: &mut ast::Expr,
+    key: &str,
+    def_names: &[String],
+    attrs: &[(String, ast::Expr)],
+    shadow: &std::collections::HashSet<String>,
+) {
+    use ast::Expr;
+    match e {
+        Expr::Name(n) => {
+            if shadow.contains(n) {
+                return;
+            }
+            if def_names.iter().any(|d| d == n) {
+                *e = Expr::Name(format!("{}.{}", key, n));
+            } else if let Some((_, lit)) = attrs.iter().find(|(a, _)| a == n) {
+                *e = lit.clone();
+            }
+        }
+        Expr::Bin(a, _, b) => {
+            rename_expr(a, key, def_names, attrs, shadow);
+            rename_expr(b, key, def_names, attrs, shadow);
+        }
+        Expr::Unary(_, a) => rename_expr(a, key, def_names, attrs, shadow),
+        Expr::Call(f, args, kwargs) => {
+            rename_expr(f, key, def_names, attrs, shadow);
+            for a in args.iter_mut() {
+                rename_expr(a, key, def_names, attrs, shadow);
+            }
+            for (_, v) in kwargs.iter_mut() {
+                rename_expr(v, key, def_names, attrs, shadow);
+            }
+        }
+        Expr::ListLit(xs) | Expr::TupleLit(xs) | Expr::SetLit(xs) => {
+            for x in xs.iter_mut() {
+                rename_expr(x, key, def_names, attrs, shadow);
+            }
+        }
+        Expr::DictLit(pairs) => {
+            for (k, v) in pairs.iter_mut() {
+                rename_expr(k, key, def_names, attrs, shadow);
+                rename_expr(v, key, def_names, attrs, shadow);
+            }
+        }
+        Expr::Comp {
+            key: k,
+            value,
+            clauses,
+            ..
+        } => {
+            let mut inner = shadow.clone();
+            for cl in clauses.iter() {
+                if let ast::CompClause::For { var, .. } = cl {
+                    inner.insert(var.clone());
+                }
+            }
+            for cl in clauses.iter_mut() {
+                match cl {
+                    ast::CompClause::For { iter, .. } => {
+                        rename_expr(iter, key, def_names, attrs, shadow)
+                    }
+                    ast::CompClause::If(c) => {
+                        rename_expr(c, key, def_names, attrs, &inner)
+                    }
+                }
+            }
+            rename_expr(k, key, def_names, attrs, &inner);
+            if let Some(v) = value {
+                rename_expr(v, key, def_names, attrs, &inner);
+            }
+        }
+        Expr::Index(a, b) => {
+            rename_expr(a, key, def_names, attrs, shadow);
+            rename_expr(b, key, def_names, attrs, shadow);
+        }
+        Expr::Attr(a, _) => rename_expr(a, key, def_names, attrs, shadow),
+        Expr::Slice(a, lo, hi, step) => {
+            rename_expr(a, key, def_names, attrs, shadow);
+            for part in [lo, hi, step] {
+                if let Some(x) = part {
+                    rename_expr(x, key, def_names, attrs, shadow);
+                }
+            }
+        }
+        Expr::MethodCall { args, .. } => {
+            for a in args.iter_mut() {
+                rename_expr(a, key, def_names, attrs, shadow);
+            }
+        }
+        Expr::IfExp { cond, then, els } => {
+            rename_expr(cond, key, def_names, attrs, shadow);
+            rename_expr(then, key, def_names, attrs, shadow);
+            rename_expr(els, key, def_names, attrs, shadow);
+        }
+        Expr::FStr(parts) => {
+            for p in parts.iter_mut() {
+                if let ast::FStrPart::Expr(x) = p {
+                    rename_expr(x, key, def_names, attrs, shadow);
+                }
+            }
+        }
+        Expr::Lambda { params, body, .. } => {
+            let mut inner = shadow.clone();
+            for p in params.iter() {
+                inner.insert(p.clone());
+            }
+            rename_expr(body, key, def_names, attrs, &inner);
+        }
+        Expr::Await(a) => rename_expr(a, key, def_names, attrs, shadow),
+        Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::NoneLit
+        | Expr::FnVal(_) => {}
+    }
+}
+
+fn rename_pattern(
+    p: &mut ast::Pattern,
+    key: &str,
+    def_names: &[String],
+    attrs: &[(String, ast::Expr)],
+    shadow: &std::collections::HashSet<String>,
+) {
+    match p {
+        ast::Pattern::Lit(e) => rename_expr(e, key, def_names, attrs, shadow),
+        ast::Pattern::Seq(pats) | ast::Pattern::Or(pats) => {
+            for x in pats.iter_mut() {
+                rename_pattern(x, key, def_names, attrs, shadow);
+            }
+        }
+        ast::Pattern::Capture(_) | ast::Pattern::Wildcard => {}
+    }
 }
 
 fn newest_output_bin(root: &Path) -> Option<PathBuf> {

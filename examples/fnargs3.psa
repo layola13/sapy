@@ -1,0 +1,15 @@
+def show(**kw):
+    print(len(kw))
+    for k in kw:
+        print(k)
+    return kw
+
+def mix(a, *rest, **kw):
+    print(a)
+    print(len(rest))
+    print(len(kw))
+
+r = show(a=1, b=2)
+print(r)
+print(show())
+mix(1, 2, 3, x=9)

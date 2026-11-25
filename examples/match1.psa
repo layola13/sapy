@@ -1,0 +1,40 @@
+def describe(v):
+    match v:
+        case 0:
+            return "zero"
+        case "hi":
+            return "greeting"
+        case [x, y] if x < y:
+            return "ascending pair"
+        case [x, y]:
+            return "pair"
+        case (1 | 2):
+            return "small"
+        case _:
+            return "other"
+
+print(describe("hi"))
+print(describe(0))
+p1 = []
+p1.append(3)
+p1.append(9)
+print(describe(p1))
+p2 = []
+p2.append(9)
+p2.append(3)
+print(describe(p2))
+print(describe(2))
+print(describe(42))
+p3 = []
+p3.append(1)
+p3.append(2)
+p3.append(3)
+print(describe(p3))
+pt = []
+pt.append(7)
+pt.append(8)
+match pt:
+    case [a, b]:
+        print(a + b)
+    case _:
+        print("no")

@@ -1,0 +1,30 @@
+def fib(n):
+    a = 0
+    b = 1
+    i = 0
+    while i < n:
+        yield a
+        t = a + b
+        a = b
+        b = t
+        i = i + 1
+
+def traced():
+    print("start")
+    yield 10
+    yield 20
+
+g = fib(7)
+print(next(g))
+print(next(g))
+print(next(g))
+g2 = fib(6)
+total = next(g2)
+for x in g2:
+    total = total + x
+print(total)
+print(list(fib(5)))
+t = traced()
+print("made")
+print(next(t))
+print(next(t))

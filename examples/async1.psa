@@ -1,0 +1,11 @@
+async def fetch(n):
+    return n * 3
+
+async def chain(n):
+    a = await fetch(n)
+    b = await fetch(a)
+    return b
+
+c = fetch(5)
+print(await chain(2))
+print(await c)

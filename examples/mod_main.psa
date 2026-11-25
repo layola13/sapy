@@ -1,0 +1,11 @@
+import mod_a
+from mod_a import scale, LIMIT
+
+print(mod_a.FACTOR)
+print(scale(5))
+print(mod_a.scale(2))
+print(LIMIT)
+c = mod_a.Counter(10)
+print(c.bump())
+print(c.bump())
+print(mod_a.greet("bob"))

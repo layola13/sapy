@@ -1,0 +1,12 @@
+def apply(f, x):
+    return f(x)
+
+def double(x):
+    return x * 2
+
+inc = lambda a: a + 1
+print(apply(inc, 41))
+print(apply(lambda a: a * 2, 21))
+g = double
+print(g(21))
+print(apply(double, 10))

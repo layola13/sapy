@@ -1,0 +1,52 @@
+def div(a, b):
+    if b == 0:
+        raise ValueError("div by zero")
+    return a // b
+
+try:
+    x = div(10, 0)
+    print("no")
+except ValueError as e:
+    print("caught:", e)
+else:
+    print("else")
+finally:
+    print("fin")
+
+try:
+    y = div(10, 2)
+    print("y =", y)
+except ValueError:
+    print("bad")
+else:
+    print("else2")
+
+try:
+    raise KeyError("k1")
+except ValueError:
+    print("wrong")
+except Exception:
+    print("exc caught")
+
+def inner():
+    raise IndexError("deep")
+
+def outer():
+    try:
+        inner()
+    except ValueError:
+        print("wrong2")
+    print("unreached")
+
+try:
+    outer()
+except IndexError as e:
+    print("outer caught:", e)
+
+try:
+    raise RuntimeError("boom")
+except RuntimeError as e:
+    print(repr(e))
+    print(str(e))
+
+print("done")

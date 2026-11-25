@@ -1,0 +1,9 @@
+# Negative example: an uncaught exception aborts the program
+# (psa panics 77100; CPython prints a traceback and exits 1).
+# Not part of the stdout-matched example set -- the debug batch
+# runs it expecting a nonzero exit.
+def boom():
+    raise ValueError("unhandled")
+
+boom()
+print("unreached")

@@ -1,0 +1,13 @@
+def get():
+    return 42
+
+def insert(x):
+    return x + 1
+
+xs = [1, 2, 3]
+d = {1: 10, 2: 20}
+print(get())
+print(insert(d[1]))
+xs.append(4)
+print(len(xs))
+print(d[2])

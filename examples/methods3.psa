@@ -1,0 +1,27 @@
+st = {1, 2, 3}
+print(st)
+st.add(4)
+st.add(2)
+print(st)
+print(len(st))
+print(3 in st)
+st.discard(9)
+st.remove(1)
+print(st)
+a = {1, 2, 3}
+b = {3, 4}
+print(a.union(b))
+print(a.intersection(b))
+print(a.difference(b))
+print(a == {3, 2, 1})
+cp = a.copy()
+cp.add(9)
+print(cp)
+print(a)
+a.clear()
+print(a)
+print(len(a))
+names = {"x", "y"}
+print("x" in names)
+print("z" in names)
+print(len(names))

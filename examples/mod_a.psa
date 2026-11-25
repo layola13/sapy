@@ -1,0 +1,15 @@
+LIMIT = 3
+FACTOR = 10
+
+def scale(x):
+    return x * FACTOR
+
+def greet(name):
+    return "hi " + name
+
+class Counter:
+    def __init__(self, start):
+        self.n = start
+    def bump(self):
+        self.n = self.n + 1
+        return self.n

@@ -1,0 +1,6 @@
+xs = [1, 2, 3, 4, 5]
+g = (x * x for x in xs if x % 2 == 1)
+print(next(g))
+print(list(g))
+pairs = ((a, b) for a in [1, 2] for b in [10, 20])
+print(list(pairs))
