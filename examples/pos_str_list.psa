@@ -1,2 +1,4 @@
 xs = ["a", "b"]
 print(len(xs))
+print(xs)
+print(xs[0])

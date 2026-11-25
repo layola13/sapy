@@ -1,4 +1,0 @@
-# Negative example: must FAIL to compile in v0.2 (only list[int] exists;
-# mixed/non-int elements are rejected loudly).
-xs = [1, "two", 3]
-print(xs[0])

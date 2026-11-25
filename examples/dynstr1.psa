@@ -1,0 +1,58 @@
+s = "hello"
+print(s)
+print(len(s))
+t = s + " world"
+print(t)
+s += "!"
+print(s)
+a = "abc"
+b = "abd"
+print(a == b)
+print(a == "abc")
+print(a != b)
+print(a < b)
+print(b > a)
+print(a <= "abc")
+print(s[0])
+print(s[-1])
+print(s[1])
+u = "héllo"
+print(len(u))
+print(u[1])
+print(u[-1])
+r = "ab"
+r = r * 3
+print(r)
+print(len(r))
+print("ell" in s)
+print("z" in s)
+print("z" not in s)
+print("" in s)
+e = ""
+print(len(e))
+if e:
+    print(1)
+else:
+    print(0)
+if s:
+    print(1)
+else:
+    print(0)
+words = ["one", "two"]
+print(words)
+words.append("three")
+print(words)
+print(words[1])
+print(len(words))
+mix = [1, "x", None]
+print(mix)
+d = {1: "one", 2: "two"}
+print(d[2])
+w = "abc"
+for ch in w:
+    print(ch)
+def shout(x):
+    return x + "!"
+msg = shout("hey")
+print(msg)
+print(msg == "hey!")

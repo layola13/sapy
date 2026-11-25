@@ -571,7 +571,7 @@ impl Emitter {
             }
             Ty::Str => Err(eerr(
                 line,
-                "string values cannot become dynamic values in D1 (the string runtime is D2; string bindings are also blocked by upstream defect (xxv))",
+                "a string expression cannot become a dynamic value here; only plain string literals become dynamic strings (D2 slice C)",
             )),
             t if t.is_list() => Err(eerr(
                 line,
@@ -579,6 +579,22 @@ impl Emitter {
             )),
             _ => Err(eerr(line, "a void value cannot become a dynamic value")),
         }
+    }
+
+    /// Construct a dynamic string (tag 6) from a compile-time-known
+    /// literal, byte by byte, in a fresh temp. Dynamic strings are
+    /// how psa binds Python str values: there is no static Str
+    /// variable on the text route.
+    fn emit_str_temp(&mut self, ctx: &mut Ctx, s: &str, line: u32) -> Result<String, String> {
+        self.used_dyn = true;
+        ctx.tmp += 1;
+        let tmp = format!("__psa_str_{}", ctx.tmp);
+        ctx.declare(&tmp, Ty::Dyn).map_err(|m| eerr(line, &m))?;
+        ctx.line(&format!("let {} = __psa_str_new();", tmp));
+        for b in s.bytes() {
+            ctx.line(&format!("{} = __psa_str_push({}, {});", tmp, tmp, b));
+        }
+        Ok(tmp)
     }
 
     /// Extract a static value from a dynamic one at a boundary; the
@@ -684,6 +700,12 @@ impl Emitter {
         let mut codes = Vec::new();
         let mut tys = Vec::new();
         for e in elems {
+            // String literal elements become dynamic strings.
+            if let Expr::Str(s) = e {
+                codes.push(self.emit_str_temp(ctx, s, line)?);
+                tys.push(Ty::Dyn);
+                continue;
+            }
             let (code, ty) = self.emit_expr(ctx, e, line)?;
             codes.push(code);
             tys.push(ty);
@@ -695,7 +717,7 @@ impl Emitter {
             if tys.iter().any(|t| !matches!(t, Ty::Int | Ty::Float | Ty::Bool | Ty::Dyn)) {
                 return Err(eerr(
                     line,
-                    "list elements that are strings or containers cannot become dynamic values yet (the string/container dynamic kinds land later in D2)",
+                    "list elements that are containers cannot become dynamic values yet (nested containers land later in D2)",
                 ));
             }
             self.used_dyn = true;
@@ -823,7 +845,7 @@ impl Emitter {
     /// runtime normalises bool keys onto int keys and None onto a
     /// sentinel, matching Python key identity for those kinds).
     /// Float keys stay loud (Python float key identity needs
-    /// value-based hashing) and string keys land with the dynamic
+    /// value-based hashing) and string keys land with the ordered-dict
     /// string runtime. Values are any D1 scalar or dynamic value,
     /// boxed on the way in.
     fn emit_dict_literal(
@@ -848,7 +870,7 @@ impl Emitter {
                 Ty::Str => {
                     return Err(eerr(
                         line,
-                        "string dict keys land with the dynamic string runtime later in D2",
+                        "string dict keys land with the ordered-dict rework in D3 (dict storage is keyed by normalised i64 in this slice)",
                     ))
                 }
                 _ => {
@@ -858,7 +880,11 @@ impl Emitter {
                     ))
                 }
             };
-            let (mut vcode, vty) = self.emit_expr(ctx, ve, line)?;
+            let (mut vcode, vty) = if let Expr::Str(s) = ve {
+                (self.emit_str_temp(ctx, s, line)?, Ty::Dyn)
+            } else {
+                self.emit_expr(ctx, ve, line)?
+            };
             if vty != Ty::Dyn {
                 vcode = self.box_code(vcode, vty, line)?;
             }
@@ -983,6 +1009,14 @@ impl Emitter {
                         unify_ret(ctx, Ty::Dyn, *line)?;
                         ctx.line(&format!("return {};", tmp));
                     }
+                    Some(Expr::Str(s)) => {
+                        if ctx.fname == "main" {
+                            return Err(eerr(*line, "main must return an int"));
+                        }
+                        let tmp = self.emit_str_temp(ctx, s, *line)?;
+                        unify_ret(ctx, Ty::Dyn, *line)?;
+                        ctx.line(&format!("return {};", tmp));
+                    }
                     Some(e) => {
                         if let Expr::Name(n) = e {
                             if ctx.borrowed.contains(n) {
@@ -999,7 +1033,7 @@ impl Emitter {
                         if ty == Ty::Str {
                             return Err(eerr(
                                 *line,
-                                "returning a string value is blocked by upstream defect (xxv): string bindings cannot be lowered on the Rust sla build-exe route (see README)",
+                                "returning a string expression is not supported yet: only plain string literals return (as dynamic strings); f-string results do not in this slice",
                             ));
                         }
                         if ctx.fname == "main" {
@@ -1028,14 +1062,21 @@ impl Emitter {
                 if let Expr::DictLit(pairs) = value {
                     return self.emit_dict_assign(ctx, name, pairs, *line);
                 }
-                let (mut code, mut ty) = self.emit_expr(ctx, value, *line)?;
+                // A plain string literal binds as a dynamic string
+                // (tag 6, D2 slice C); other string expressions
+                // (f-string results) do not bind yet.
+                let (mut code, mut ty) = if let Expr::Str(s) = value {
+                    (self.emit_str_temp(ctx, s, *line)?, Ty::Dyn)
+                } else {
+                    self.emit_expr(ctx, value, *line)?
+                };
                 if ty == Ty::Void {
                     return Err(eerr(*line, "cannot assign a void value"));
                 }
                 if ty == Ty::Str {
                     return Err(eerr(
                         *line,
-                        "binding a string value to a variable is blocked by upstream defect (xxv): string bindings cannot be lowered on the Rust sla build-exe route (see README); string literals in print() work",
+                        "binding a string expression is not supported yet: only plain string literals bind (as dynamic strings); f-string results do not bind in this slice",
                     ));
                 }
                 code = self.dyn_clone_wrap(code, ty);
@@ -1265,11 +1306,15 @@ impl Emitter {
                         _ => {
                             return Err(eerr(
                                 *line,
-                                "a dynamic subscript key must be an int, bool, None or dynamic value in this slice (string keys land with the dynamic string runtime)",
+                                "a dynamic subscript key must be an int, bool, None or dynamic value in this slice (string keys land with the ordered-dict rework in D3)",
                             ))
                         }
                     };
-                    let (mut vcode, vty) = self.emit_expr(ctx, value, *line)?;
+                    let (mut vcode, vty) = if let Expr::Str(s) = value {
+                        (self.emit_str_temp(ctx, s, *line)?, Ty::Dyn)
+                    } else {
+                        self.emit_expr(ctx, value, *line)?
+                    };
                     if vty != Ty::Dyn {
                         vcode = self.box_code(vcode, vty, *line)?;
                     }
@@ -1466,9 +1511,9 @@ impl Emitter {
                 let (len_code, elem_ty, get_code) = if ty == Ty::Dyn {
                     self.used_dyn = true;
                     (
-                        format!("__psa_list_len({})", obj),
+                        format!("__psa_dyn_len({})", obj),
                         Ty::Dyn,
-                        format!("__psa_list_get({}, {{}})", obj),
+                        format!("__psa_iter_get({}, {{}})", obj),
                     )
                 } else if let Some(e) = ty.elem() {
                     (
@@ -1789,7 +1834,7 @@ impl Emitter {
                         _ => {
                             return Err(eerr(
                                 line,
-                                "a dynamic subscript key must be an int, bool, None or dynamic value in this slice (string keys land with the dynamic string runtime)",
+                                "a dynamic subscript key must be an int, bool, None or dynamic value in this slice (string keys land with the ordered-dict rework in D3)",
                             ))
                         }
                     };
@@ -1831,7 +1876,11 @@ impl Emitter {
                     return Err(eerr(line, "append takes exactly one argument"));
                 }
                 if ty == Ty::Dyn {
-                    let (mut acode, aty) = self.emit_expr(ctx, &args[0], line)?;
+                    let (mut acode, aty) = if let Expr::Str(s) = &args[0] {
+                        (self.emit_str_temp(ctx, s, line)?, Ty::Dyn)
+                    } else {
+                        self.emit_expr(ctx, &args[0], line)?
+                    };
                     if aty != Ty::Dyn {
                         acode = self.box_code(acode, aty, line)?;
                     }
@@ -1918,6 +1967,10 @@ impl Emitter {
                     if args.len() != 1 {
                         return Err(eerr(line, "len() takes exactly one argument"));
                     }
+                    if let Expr::Str(s) = &args[0] {
+                        let tmp = self.emit_str_temp(ctx, s, line)?;
+                        return Ok((format!("__psa_dyn_len({})", tmp), Ty::Int));
+                    }
                     let (c, t) = self.emit_expr(ctx, &args[0], line)?;
                     if t == Ty::Dyn {
                         self.used_dyn = true;
@@ -1931,6 +1984,14 @@ impl Emitter {
                 let mut arg_codes = Vec::new();
                 let mut arg_tys = Vec::new();
                 for a in args {
+                    // A string literal argument becomes a dynamic
+                    // string: the parameter is pinned Dyn, never Str.
+                    if let Expr::Str(s) = a {
+                        let tmp = self.emit_str_temp(ctx, s, line)?;
+                        arg_codes.push(tmp);
+                        arg_tys.push(Ty::Dyn);
+                        continue;
+                    }
                     let (c, t) = self.emit_expr(ctx, a, line)?;
                     arg_codes.push(c);
                     arg_tys.push(t);
@@ -2007,19 +2068,51 @@ impl Emitter {
                     // static, its lines are spliced back in order;
                     // if either side is dynamic, they land inside
                     // the branch that actually evaluates it.
-                    let (lc, lt) = self.emit_expr(ctx, l, line)?;
+                    let (lc, mut lt) = self.emit_expr(ctx, l, line)?;
                     let saved_out = std::mem::take(&mut ctx.out);
                     let r_res = self.emit_expr(ctx, r, line);
-                    let r_lines = std::mem::replace(&mut ctx.out, saved_out);
-                    let (rc, rt) = r_res?;
+                    let mut r_lines = std::mem::replace(&mut ctx.out, saved_out);
+                    let (mut rc, mut rt) = r_res?;
                     if lt != Ty::Dyn && rt != Ty::Dyn {
                         ctx.out.push_str(&r_lines);
                         return self.emit_binop(lc, lt, *op, rc, rt, line);
                     }
+                    // A string literal beside a dynamic operand
+                    // becomes a dynamic string temp; the right one
+                    // is built inside the deferred branch lines.
+                    if lt == Ty::Str {
+                        if let Expr::Str(s) = &**l {
+                            let tmp = self.emit_str_temp(ctx, s, line)?;
+                            return self.emit_dyn_logic(ctx, tmp, Ty::Dyn, *op, rc, rt, r_lines, line);
+                        }
+                    }
+                    if rt == Ty::Str {
+                        if let Expr::Str(s) = &**r {
+                            std::mem::swap(&mut ctx.out, &mut r_lines);
+                            let tmp_res = self.emit_str_temp(ctx, s, line);
+                            std::mem::swap(&mut ctx.out, &mut r_lines);
+                            rc = tmp_res?;
+                            rt = Ty::Dyn;
+                        }
+                    }
                     return self.emit_dyn_logic(ctx, lc, lt, *op, rc, rt, r_lines, line);
                 }
-                let (lc, lt) = self.emit_expr(ctx, l, line)?;
-                let (rc, rt) = self.emit_expr(ctx, r, line)?;
+                let (mut lc, mut lt) = self.emit_expr(ctx, l, line)?;
+                let (mut rc, mut rt) = self.emit_expr(ctx, r, line)?;
+                // A string literal beside a dynamic operand becomes
+                // a dynamic string temp (D2 slice C).
+                if lt == Ty::Str && rt == Ty::Dyn {
+                    if let Expr::Str(s) = &**l {
+                        lc = self.emit_str_temp(ctx, s, line)?;
+                        lt = Ty::Dyn;
+                    }
+                }
+                if rt == Ty::Str && lt == Ty::Dyn {
+                    if let Expr::Str(s) = &**r {
+                        rc = self.emit_str_temp(ctx, s, line)?;
+                        rt = Ty::Dyn;
+                    }
+                }
                 self.emit_binop(lc, lt, *op, rc, rt, line)
             }
             Expr::IfExp { cond, then, els } => {
@@ -2814,6 +2907,7 @@ fn __psa_dyn_floor_f(x: f64) -> f64 {
 fn __psa_dyn_add(a: PsaVal, b: PsaVal) -> PsaVal {
     if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) { return __psa_box_int(a.ipay + b.ipay); };
     if a.tag <= 2 && b.tag <= 2 { return __psa_box_float(__psa_as_float(a) + __psa_as_float(b)); };
+    if a.tag == 6 && b.tag == 6 { return __psa_str_concat(a, b); };
     panic(77011);
 }
 
@@ -2826,6 +2920,8 @@ fn __psa_dyn_sub(a: PsaVal, b: PsaVal) -> PsaVal {
 fn __psa_dyn_mul(a: PsaVal, b: PsaVal) -> PsaVal {
     if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) { return __psa_box_int(a.ipay * b.ipay); };
     if a.tag <= 2 && b.tag <= 2 { return __psa_box_float(__psa_as_float(a) * __psa_as_float(b)); };
+    if a.tag == 6 && (b.tag == 0 || b.tag == 2) { return __psa_str_repeat(a, b.ipay); };
+    if b.tag == 6 && (a.tag == 0 || a.tag == 2) { return __psa_str_repeat(b, a.ipay); };
     panic(77011);
 }
 
@@ -2859,6 +2955,7 @@ fn __psa_dyn_eq(a: PsaVal, b: PsaVal) -> bool {
     if a.tag == 5 && b.tag == 5 { panic(77056); };
     if a.tag == 5 || b.tag == 5 { return false; };
     if a.tag == 4 && b.tag == 4 { return __psa_list_eq(a, b); };
+    if a.tag == 6 && b.tag == 6 { return __psa_str_eq(a, b); };
     if a.tag == 3 && b.tag == 3 { return true; };
     if a.tag <= 2 && b.tag <= 2 {
         if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) == __psa_as_float(b); };
@@ -2876,6 +2973,7 @@ fn __psa_dyn_lt(a: PsaVal, b: PsaVal) -> bool {
         if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) < __psa_as_float(b); };
         return a.ipay < b.ipay;
     };
+    if a.tag == 6 && b.tag == 6 { return __psa_str_cmp(a, b) < 0; };
     panic(77012);
 }
 
@@ -2884,6 +2982,7 @@ fn __psa_dyn_le(a: PsaVal, b: PsaVal) -> bool {
         if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) <= __psa_as_float(b); };
         return a.ipay <= b.ipay;
     };
+    if a.tag == 6 && b.tag == 6 { return __psa_str_cmp(a, b) <= 0; };
     panic(77012);
 }
 
@@ -2892,6 +2991,7 @@ fn __psa_dyn_gt(a: PsaVal, b: PsaVal) -> bool {
         if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) > __psa_as_float(b); };
         return a.ipay > b.ipay;
     };
+    if a.tag == 6 && b.tag == 6 { return __psa_str_cmp(a, b) > 0; };
     panic(77012);
 }
 
@@ -2900,6 +3000,7 @@ fn __psa_dyn_ge(a: PsaVal, b: PsaVal) -> bool {
         if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) >= __psa_as_float(b); };
         return a.ipay >= b.ipay;
     };
+    if a.tag == 6 && b.tag == 6 { return __psa_str_cmp(a, b) >= 0; };
     panic(77012);
 }
 
@@ -2910,6 +3011,7 @@ fn __psa_dyn_truthy(v: PsaVal) -> bool {
     if v.tag == 3 { return false; };
     if v.tag == 4 { return __psa_list_len(v) != 0; };
     if v.tag == 5 { return __psa_dict_len(v) != 0; };
+    if v.tag == 6 { return __psa_str_bytes_len(v) != 0; };
     panic(77010);
 }
 
@@ -2987,6 +3089,7 @@ fn __psa_print_repr(v: PsaVal) {
     };
     if v.tag == 3 { sla_print_bytes(STR_PTR("None"), STR_LEN("None")); return; };
     if v.tag == 4 { __psa_print_list_repr(v); return; };
+    if v.tag == 6 { __psa_print_str(__psa_str_repr(v)); return; };
     if v.tag == 5 { panic(77057); };
     panic(77058);
 }
@@ -3005,6 +3108,7 @@ fn __psa_print_list_repr(v: PsaVal) {
 
 fn __psa_print_dyn(v: PsaVal) -> i32 {
     if v.tag == 4 { __psa_print_list_repr(v); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
+    if v.tag == 6 { __psa_print_str(v); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
     if v.tag == 5 { panic(77057); };
     if v.tag == 0 { println("{}", v.ipay); return 0; };
     if v.tag == 2 {
@@ -3090,6 +3194,7 @@ fn __psa_list_eq(a: PsaVal, b: PsaVal) -> bool {
 fn __psa_dyn_len(v: PsaVal) -> i64 {
     if v.tag == 4 { return __psa_list_len(v); };
     if v.tag == 5 { return __psa_dict_len(v); };
+    if v.tag == 6 { return __psa_str_len(v); };
     panic(77052);
 }
 
@@ -3173,19 +3278,248 @@ fn __psa_key_int(k: PsaVal) -> i64 {
 fn __psa_dyn_get(v: PsaVal, k: PsaVal) -> PsaVal {
     if v.tag == 4 { return __psa_list_get(v, __psa_key_int(k)); };
     if v.tag == 5 { return __psa_dict_get(v, k); };
+    if v.tag == 6 { return __psa_str_get_cp(v, __psa_key_int(k)); };
     panic(77052);
 }
 
 fn __psa_dyn_set(v: PsaVal, k: PsaVal, x: PsaVal) {
     if v.tag == 4 { __psa_list_set(v, __psa_key_int(k), x); return; };
     if v.tag == 5 { __psa_dict_set(v, k, x); return; };
+    if v.tag == 6 { panic(77063); };
     panic(77052);
 }
 
 fn __psa_dyn_contains(v: PsaVal, x: PsaVal) -> bool {
     if v.tag == 4 { return __psa_list_contains(v, x); };
     if v.tag == 5 { return __psa_dict_contains(v, x); };
+    if v.tag == 6 {
+        if x.tag != 6 { panic(77062); };
+        return __psa_str_contains(v, x);
+    };
     panic(77052);
+}
+
+fn __psa_iter_get(v: PsaVal, i: i64) -> PsaVal {
+    if v.tag == 4 { return __psa_list_get(v, i); };
+    if v.tag == 6 { return __psa_str_get_cp(v, i); };
+    if v.tag == 5 { panic(77061); };
+    panic(77052);
+}
+
+fn __psa_bytes_push_h(p: ptr, x: u8) {
+    let b = unsafe { Box::from_raw(p as *Vec<u8>) };
+    (*b).push(x);
+    let rp: i64 = Box::into_raw(b) as i64;
+}
+
+fn __psa_bytes_get_h(p: ptr, i: i64) -> u8 {
+    let b = unsafe { Box::from_raw(p as *Vec<u8>) };
+    let v = (*b)[i];
+    let rp: i64 = Box::into_raw(b) as i64;
+    return v;
+}
+
+fn __psa_bytes_len_h(p: ptr) -> i64 {
+    let b = unsafe { Box::from_raw(p as *Vec<u8>) };
+    let n = (*b).len() as i64;
+    let rp: i64 = Box::into_raw(b) as i64;
+    return n;
+}
+
+fn __psa_str_new() -> PsaVal {
+    let xs: Vec<u8> = Vec::new();
+    return PsaVal { tag: 6, ipay: Box::into_raw(Box::new(xs)) as i64, fpay: 0.0 };
+}
+
+fn __psa_str_push(s: PsaVal, b: u8) -> PsaVal {
+    __psa_bytes_push_h(s.ipay as ptr, b);
+    return s;
+}
+
+fn __psa_str_bytes_len(v: PsaVal) -> i64 {
+    return __psa_bytes_len_h(v.ipay as ptr);
+}
+
+fn __psa_str_len(v: PsaVal) -> i64 {
+    // Python len() counts code points; in UTF-8 those are exactly
+    // the bytes that are not continuation bytes (10xxxxxx).
+    let n = __psa_str_bytes_len(v);
+    let c: i64 = 0;
+    let i: i64 = 0;
+    while i < n {
+        let b = __psa_bytes_get_h(v.ipay as ptr, i);
+        if ((b as i64) & 192) != 128 { c = c + 1; };
+        i = i + 1;
+    }
+    return c;
+}
+
+fn __psa_str_cp_start(v: PsaVal, cp: i64) -> i64 {
+    // Byte offset of code point cp, or -1 when out of range.
+    let n = __psa_str_bytes_len(v);
+    let c: i64 = 0;
+    let i: i64 = 0;
+    while i < n {
+        let b = __psa_bytes_get_h(v.ipay as ptr, i);
+        if ((b as i64) & 192) != 128 {
+            if c == cp { return i; };
+            c = c + 1;
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn __psa_str_get_cp(v: PsaVal, idx: i64) -> PsaVal {
+    let n = __psa_str_len(v);
+    let j = idx;
+    if j < 0 { j = j + n; };
+    if j < 0 || j >= n { panic(77050); };
+    let start = __psa_str_cp_start(v, j);
+    let blen = __psa_str_bytes_len(v);
+    let out = __psa_str_new();
+    let i = start;
+    while i < blen {
+        let b = __psa_bytes_get_h(v.ipay as ptr, i);
+        if i > start && ((b as i64) & 192) != 128 { return out; };
+        out = __psa_str_push(out, b);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn __psa_str_concat(a: PsaVal, b: PsaVal) -> PsaVal {
+    let out = __psa_str_new();
+    let na = __psa_str_bytes_len(a);
+    let i: i64 = 0;
+    while i < na { out = __psa_str_push(out, __psa_bytes_get_h(a.ipay as ptr, i)); i = i + 1; }
+    let nb = __psa_str_bytes_len(b);
+    let k: i64 = 0;
+    while k < nb { out = __psa_str_push(out, __psa_bytes_get_h(b.ipay as ptr, k)); k = k + 1; }
+    return out;
+}
+
+fn __psa_str_repeat(a: PsaVal, n: i64) -> PsaVal {
+    let out = __psa_str_new();
+    let r: i64 = 0;
+    while r < n {
+        let na = __psa_str_bytes_len(a);
+        let i: i64 = 0;
+        while i < na { out = __psa_str_push(out, __psa_bytes_get_h(a.ipay as ptr, i)); i = i + 1; }
+        r = r + 1;
+    }
+    return out;
+}
+
+fn __psa_str_eq(a: PsaVal, b: PsaVal) -> bool {
+    let na = __psa_str_bytes_len(a);
+    let nb = __psa_str_bytes_len(b);
+    if na != nb { return false; };
+    let i: i64 = 0;
+    while i < na {
+        if __psa_bytes_get_h(a.ipay as ptr, i) != __psa_bytes_get_h(b.ipay as ptr, i) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn __psa_str_cmp(a: PsaVal, b: PsaVal) -> i64 {
+    // Byte-wise lexicographic order equals code-point order in UTF-8.
+    let na = __psa_str_bytes_len(a);
+    let nb = __psa_str_bytes_len(b);
+    let n = na;
+    if nb < n { n = nb; };
+    let i: i64 = 0;
+    while i < n {
+        let x = __psa_bytes_get_h(a.ipay as ptr, i) as i64;
+        let y = __psa_bytes_get_h(b.ipay as ptr, i) as i64;
+        if x != y { return x - y; };
+        i = i + 1;
+    }
+    return na - nb;
+}
+
+fn __psa_str_match_at(hay: PsaVal, needle: PsaVal, s: i64) -> bool {
+    let nn = __psa_str_bytes_len(needle);
+    let k: i64 = 0;
+    while k < nn {
+        if __psa_bytes_get_h(hay.ipay as ptr, s + k) != __psa_bytes_get_h(needle.ipay as ptr, k) { return false; };
+        k = k + 1;
+    }
+    return true;
+}
+
+fn __psa_str_contains(hay: PsaVal, needle: PsaVal) -> bool {
+    let nh = __psa_str_bytes_len(hay);
+    let nn = __psa_str_bytes_len(needle);
+    if nn == 0 { return true; };
+    if nn > nh { return false; };
+    let s: i64 = 0;
+    while s + nn <= nh {
+        if __psa_str_match_at(hay, needle, s) { return true; };
+        s = s + 1;
+    }
+    return false;
+}
+
+fn __psa_print_str(v: PsaVal) {
+    let n = __psa_str_bytes_len(v);
+    let buf = [0u8; 256];
+    let base: i64 = 0;
+    while base < n {
+        let chunk = n - base;
+        if chunk > 256 { chunk = 256; };
+        let k: i64 = 0;
+        while k < chunk { buf[k] = __psa_bytes_get_h(v.ipay as ptr, base + k); k = k + 1; }
+        sla_print_bytes(PTR_BYTE_ADD(&buf, 0), chunk as u64);
+        base = base + chunk;
+    }
+}
+
+fn __psa_hex_digit(d: i64) -> u8 {
+    if d < 10 { return (48 + d) as u8; };
+    return (87 + d) as u8;
+}
+
+fn __psa_str_repr(v: PsaVal) -> PsaVal {
+    // Python repr: single quotes unless the string contains a
+    // single quote and no double quote. Backslash, the quote char,
+    // \n \t \r and other control bytes are escaped; bytes >= 0x80
+    // pass through as UTF-8 (Python additionally escapes
+    // non-printable code points -- a documented corner).
+    let n = __psa_str_bytes_len(v);
+    let has_sq = false;
+    let has_dq = false;
+    let i: i64 = 0;
+    while i < n {
+        let b = __psa_bytes_get_h(v.ipay as ptr, i);
+        if b == 39 { has_sq = true; };
+        if b == 34 { has_dq = true; };
+        i = i + 1;
+    }
+    let q: u8 = 39;
+    if has_sq && !has_dq { q = 34; };
+    let out = __psa_str_new();
+    out = __psa_str_push(out, q);
+    let k: i64 = 0;
+    while k < n {
+        let b = __psa_bytes_get_h(v.ipay as ptr, k);
+        if b == 92 { out = __psa_str_push(out, 92); out = __psa_str_push(out, 92); }
+        else if b == q { out = __psa_str_push(out, 92); out = __psa_str_push(out, q); }
+        else if b == 10 { out = __psa_str_push(out, 92); out = __psa_str_push(out, 110); }
+        else if b == 9 { out = __psa_str_push(out, 92); out = __psa_str_push(out, 116); }
+        else if b == 13 { out = __psa_str_push(out, 92); out = __psa_str_push(out, 114); }
+        else if b < 32 || b == 127 {
+            out = __psa_str_push(out, 92);
+            out = __psa_str_push(out, 120);
+            out = __psa_str_push(out, __psa_hex_digit((b >> 4) as i64));
+            out = __psa_str_push(out, __psa_hex_digit((b & 15) as i64));
+        }
+        else { out = __psa_str_push(out, b); };
+        k = k + 1;
+    }
+    out = __psa_str_push(out, q);
+    return out;
 }
 
 "#;
