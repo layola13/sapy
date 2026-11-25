@@ -21,6 +21,7 @@ members = [
     "crates/sla-plugin",
     "crates/sla-oracle",
     "crates/sla-cli",
+    "crates/psa-cli",
 ]
 
 [profile.release]
