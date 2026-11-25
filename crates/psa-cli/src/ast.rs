@@ -34,12 +34,16 @@ pub enum Expr {
     Bin(Box<Expr>, BinOp, Box<Expr>),
     Unary(UnOp, Box<Expr>),
     Call(Box<Expr>, Vec<Expr>),
+    ListLit(Vec<Expr>),
+    Index(Box<Expr>, Box<Expr>),
+    MethodCall { obj: String, method: String, args: Vec<Expr> },
 }
 
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Assign { name: String, value: Expr, line: u32 },
     AugAssign { name: String, op: BinOp, value: Expr, line: u32 },
+    IndexAssign { name: String, index: Expr, op: Option<BinOp>, value: Expr, line: u32 },
     ExprStmt { value: Expr, line: u32 },
     If { arms: Vec<(Expr, Vec<Stmt>)>, els: Option<Vec<Stmt>>, line: u32 },
     While { cond: Expr, body: Vec<Stmt>, line: u32 },

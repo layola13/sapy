@@ -1,4 +1,4 @@
-# psa — the SA-Py compiler (v0.1)
+# psa — the SA-Py compiler (v0.2)
 
 `psa` compiles `.psa` source (a Python-syntax subset) to native
 executables: `.psa` → psa frontend (lexer / parser / type inference) →
@@ -37,6 +37,16 @@ Everything else is a **loud compile error**, never a silent fallback.
   augmented assignment `+= -= *=`.
 - `print(...)`: ints, strings, bools (`True` / `False`), and
   multi-argument space-joined output (no bools in multi-arg print).
+- `list[int]` (v0.2): list literals of ints, `xs.append(v)`, index
+  read `xs[i]` (scalar elements copy out), index write `xs[i] = v`
+  and `xs[i] += v`, `len(xs)`. Ownership follows SPEC-OWNERSHIP.md:
+  assignment of a list **moves** it (use-after-move is a loud error
+  naming both sites); a function parameter the callee only reads or
+  writes through is inferred as a **borrow** (emitted as SLA
+  `&Vec<i64>`, call sites pass `&name`); a parameter the callee moves
+  out of is **consumed** (emitted as SLA `Vec<i64>`). Borrowed
+  parameters can be re-borrowed onward but never moved, returned, or
+  stored — those are loud errors (spec s7).
 
 ## Known upstream defect (found 2026-11-25, blocks one feature)
 
@@ -51,11 +61,12 @@ and comparison are unaffected and supported.
 
 ## Explicitly not in v0.1 (all loud errors)
 
-Classes, attribute access, subscripts, lists/dicts/sets, string
-operations and comparisons, `**`, chained comparisons, keyword
-arguments, defaults, annotations, imports, exceptions, generators,
-first-class functions, type-changing re-binding, `continue` in
-`for`, non-`range` iteration, float `//` / `%`.
+Classes, attribute access, dicts/sets, lists of non-int elements,
+string operations and comparisons, `**`, chained comparisons,
+keyword arguments, defaults, annotations, imports, exceptions,
+generators, first-class functions, type-changing re-binding,
+`continue` in `for`, non-`range` iteration, float `//` / `%`,
+printing a whole list.
 
 Per the SA-Py whitepaper, dynamic typing is a later phase built on a
 tagged-value runtime; v0.1 is the statically inferable subset only.

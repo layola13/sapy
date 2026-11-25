@@ -248,6 +248,38 @@ impl Parser {
                 Ok(Stmt::Pass { line })
             }
             Tok::Ident(name) => {
+                // Index assignment: name[expr] (=|+=|-=|*=) expr — try it
+                // with backtracking; a bare name[expr] expression
+                // statement falls through to expression parsing.
+                if matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::LBracket)) {
+                    let save = self.pos;
+                    self.bump(); // name
+                    self.bump(); // [
+                    if let Ok(index) = self.parse_expr() {
+                        if matches!(self.peek(), Tok::RBracket) {
+                            self.bump();
+                            let op = match self.peek() {
+                                Tok::Assign => Some(None),
+                                Tok::PlusEq => Some(Some(BinOp::Add)),
+                                Tok::MinusEq => Some(Some(BinOp::Sub)),
+                                Tok::StarEq => Some(Some(BinOp::Mul)),
+                                _ => None,
+                            };
+                            if let Some(op) = op {
+                                self.bump();
+                                let value = self.parse_expr()?;
+                                return Ok(Stmt::IndexAssign {
+                                    name,
+                                    index,
+                                    op,
+                                    value,
+                                    line,
+                                });
+                            }
+                        }
+                    }
+                    self.pos = save;
+                }
                 // Look ahead for assignment forms.
                 let next = self.toks.get(self.pos + 1).map(|t| t.tok.clone());
                 match next {
@@ -407,10 +439,45 @@ impl Parser {
                     e = Expr::Call(Box::new(e), args);
                 }
                 Tok::LBracket => {
-                    return Err(perr(self.line(), "subscripts are not supported in v0.1"));
+                    self.bump();
+                    let idx = self.parse_expr()?;
+                    self.expect(&Tok::RBracket)?;
+                    e = Expr::Index(Box::new(e), Box::new(idx));
                 }
                 Tok::Dot => {
-                    return Err(perr(self.line(), "attribute access is not supported in v0.1"));
+                    self.bump();
+                    let method = match self.bump() {
+                        Tok::Ident(n) => n,
+                        t => {
+                            return Err(perr(
+                                self.line(),
+                                &format!("expected method name after ., found {:?}", t),
+                            ))
+                        }
+                    };
+                    let obj = match e {
+                        Expr::Name(n) => n,
+                        _ => {
+                            return Err(perr(
+                                self.line(),
+                                "method calls are only supported on plain variables in v0.2",
+                            ))
+                        }
+                    };
+                    self.expect(&Tok::LParen)?;
+                    let mut args = Vec::new();
+                    if !matches!(self.peek(), Tok::RParen) {
+                        loop {
+                            args.push(self.parse_expr()?);
+                            if matches!(self.peek(), Tok::Comma) {
+                                self.bump();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect(&Tok::RParen)?;
+                    e = Expr::MethodCall { obj, method, args };
                 }
                 _ => break,
             }
@@ -431,6 +498,21 @@ impl Parser {
                 let e = self.parse_expr()?;
                 self.expect(&Tok::RParen)?;
                 Ok(e)
+            }
+            Tok::LBracket => {
+                let mut elems = Vec::new();
+                if !matches!(self.peek(), Tok::RBracket) {
+                    loop {
+                        elems.push(self.parse_expr()?);
+                        if matches!(self.peek(), Tok::Comma) {
+                            self.bump();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&Tok::RBracket)?;
+                Ok(Expr::ListLit(elems))
             }
             t => Err(perr(line, &format!("unexpected token {:?} in expression", t))),
         }

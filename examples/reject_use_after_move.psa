@@ -1,0 +1,5 @@
+# Negative example: must FAIL to compile (spec s3: container assignment
+# moves; the source binding is dead afterwards).
+xs = [1, 2, 3]
+ys = xs
+print(len(xs))
