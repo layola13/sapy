@@ -1,0 +1,7 @@
+def g(x):
+    return x + 1
+
+def f(a=g(1)):
+    return a
+
+print(f())
