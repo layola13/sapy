@@ -1,0 +1,26 @@
+xs = [10, 2.5, 30]
+n = 0
+for v in xs:
+    n = n + 1
+print(n)
+print(2.5 in xs)
+print(99 in xs)
+print(99 not in xs)
+ys = [1, 2, 3]
+s = 0
+for y in ys:
+    s = s + y
+print(s)
+found = False
+for v in xs:
+    if v == 30:
+        found = True
+print(found)
+zs = [1, 2.5]
+c = 0
+for z in zs:
+    c = c + 1
+    if z == 2.5:
+        zs.append(9)
+print(c)
+print(len(zs))

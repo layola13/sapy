@@ -1316,6 +1316,62 @@ impl Emitter {
                 ctx.line("}");
                 Ok(())
             }
+            Stmt::ForEach { var, iter, body, line } => {
+                let obj = match iter {
+                    Expr::Name(n) => n.clone(),
+                    _ => {
+                        return Err(eerr(
+                            *line,
+                            "for-each iteration is only supported over a plain list variable in v0.7",
+                        ))
+                    }
+                };
+                let ty = ctx
+                    .lookup(&obj)
+                    .ok_or_else(|| eerr(*line, &format!("undefined variable `{}`", obj)))?;
+                ctx.check_alive(&obj, *line)?;
+                let (len_code, elem_ty, get_code) = if ty == Ty::Dyn {
+                    self.used_dyn = true;
+                    (
+                        format!("__psa_list_len({})", obj),
+                        Ty::Dyn,
+                        format!("__psa_list_get({}, {{}})", obj),
+                    )
+                } else if let Some(e) = ty.elem() {
+                    (
+                        format!("(len({}) as i64)", obj),
+                        e,
+                        format!("{}[{{}}]", obj),
+                    )
+                } else {
+                    return Err(eerr(
+                        *line,
+                        &format!("for-each iteration is only supported over lists, not on {}", ty.py_name()),
+                    ));
+                };
+                let idx = format!("__psa_i_{}", line);
+                ctx.line("{");
+                ctx.indent += 1;
+                ctx.scopes.push(ctx.vars.len());
+                ctx.declare(var, elem_ty).map_err(|m| eerr(*line, &m))?;
+                ctx.line(&format!("let {}: i64 = 0;", idx));
+                // The length is re-read every iteration: CPython's
+                // list iterator observes appends made by the body.
+                ctx.line(&format!("while {} < {} {{", idx, len_code));
+                ctx.indent += 1;
+                ctx.line(&format!("let {} = {};", var, get_code.replace("{}", &idx)));
+                for s in body {
+                    self.emit_stmt(ctx, s)?;
+                }
+                ctx.line(&format!("{} = {} + 1;", idx, idx));
+                ctx.indent -= 1;
+                ctx.line("}");
+                let mark = ctx.scopes.pop().unwrap();
+                ctx.vars.truncate(mark);
+                ctx.indent -= 1;
+                ctx.line("}");
+                Ok(())
+            }
         }
     }
 
@@ -2049,6 +2105,10 @@ impl Emitter {
             BinOp::BitXor => "__psa_dyn_bitxor",
             BinOp::Shl => "__psa_dyn_shl",
             BinOp::Shr => "__psa_dyn_shr",
+            BinOp::In => return Ok((format!("__psa_list_contains({}, {})", rc, lc), Ty::Bool)),
+            BinOp::NotIn => {
+                return Ok((format!("!(__psa_list_contains({}, {}))", rc, lc), Ty::Bool))
+            }
             BinOp::Eq => return Ok((format!("__psa_dyn_eq({}, {})", lc, rc), Ty::Bool)),
             BinOp::NotEq => return Ok((format!("__psa_dyn_ne({}, {})", lc, rc), Ty::Bool)),
             BinOp::Lt => return Ok((format!("__psa_dyn_lt({}, {})", lc, rc), Ty::Bool)),
@@ -2078,6 +2138,10 @@ impl Emitter {
             return self.emit_dyn_binop(lc, lt, op, rc, rt, line);
         }
         match op {
+            BinOp::In | BinOp::NotIn => Err(eerr(
+                line,
+                "`in` is currently supported on dynamic lists only (D2); a static list operand stays refused rather than miscompiled",
+            )),
             BinOp::And | BinOp::Or => {
                 if lt != Ty::Bool || rt != Ty::Bool {
                     return Err(eerr(line, "and/or need bool operands"));
@@ -2797,6 +2861,17 @@ fn __psa_list_eq(a: PsaVal, b: PsaVal) -> bool {
 fn __psa_dyn_len(v: PsaVal) -> i64 {
     if v.tag == 4 { return __psa_list_len(v); };
     panic(77052);
+}
+
+fn __psa_list_contains(v: PsaVal, x: PsaVal) -> bool {
+    if v.tag != 4 { panic(77052); };
+    let n = __psa_list_len(v);
+    let i: i64 = 0;
+    while i < n {
+        if __psa_dyn_eq(__psa_list_get(v, i), x) { return true; };
+        i = i + 1;
+    }
+    return false;
 }
 
 "#;

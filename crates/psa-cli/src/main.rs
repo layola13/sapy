@@ -34,7 +34,7 @@ fn main() {
             }
         }
         "version" | "--version" | "-V" => {
-            println!("psa 0.7.0 (sapy v0.7, D2 slice A: dynamic lists)");
+            println!("psa 0.7.0 (sapy v0.7, D2 slices A+B: dynamic lists, for-each, in)");
         }
         "help" | "--help" | "-h" => usage(),
         other => {

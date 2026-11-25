@@ -187,13 +187,26 @@ impl Parser {
             t => return Err(perr(line, &format!("expected loop variable, found {:?}", t))),
         };
         self.expect(&Tok::In)?;
-        // v0.1: only `for x in range(...)`.
+        // `for x in <list variable>` (v0.7, D2): anything that is not
+        // the range(...) form parses as a general iteration.
+        if !matches!(self.peek(), Tok::Ident(n) if n == "range") {
+            let iter = self.parse_expr()?;
+            self.expect(&Tok::Colon)?;
+            let body = self.parse_block()?;
+            if contains_continue(&body) {
+                return Err(perr(
+                    line,
+                    "continue inside a for-each loop is not supported in v0.7 (use while)",
+                ));
+            }
+            return Ok(Stmt::ForEach { var, iter, body, line });
+        }
         match self.bump() {
             Tok::Ident(n) if n == "range" => {}
             t => {
                 return Err(perr(
                     line,
-                    &format!("v0.1 for loops iterate range(...) only, found {:?}", t),
+                    &format!("for loops iterate range(...) or a list variable, found {:?}", t),
                 ))
             }
         }
@@ -465,6 +478,8 @@ impl Parser {
         let mut operands = vec![self.parse_bitor()?];
         let mut ops: Vec<BinOp> = Vec::new();
         loop {
+            let not_in = matches!(self.peek(), Tok::Not)
+                && matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::In));
             let op = match self.peek() {
                 Tok::EqEq => BinOp::Eq,
                 Tok::NotEq => BinOp::NotEq,
@@ -472,6 +487,11 @@ impl Parser {
                 Tok::LtEq => BinOp::LtEq,
                 Tok::Gt => BinOp::Gt,
                 Tok::GtEq => BinOp::GtEq,
+                Tok::In => BinOp::In,
+                Tok::Not if not_in => {
+                    self.bump();
+                    BinOp::NotIn
+                }
                 _ => break,
             };
             ops.push(op);

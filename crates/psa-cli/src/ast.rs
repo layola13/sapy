@@ -16,6 +16,8 @@ pub enum BinOp {
     Shr,     // `>>`
     Eq,
     NotEq,
+    In,    // `in` (D2: dynamic containers)
+    NotIn, // `not in`
     Lt,
     LtEq,
     Gt,
@@ -67,6 +69,9 @@ pub enum Stmt {
     If { arms: Vec<(Expr, Vec<Stmt>)>, els: Option<Vec<Stmt>>, line: u32 },
     While { cond: Expr, body: Vec<Stmt>, line: u32 },
     ForRange { var: String, start: Option<Expr>, stop: Expr, body: Vec<Stmt>, line: u32 },
+    /// `for var in <iterable>:` — v0.7 iterates list variables
+    /// (static or dynamic); other iterables stay loud at emit.
+    ForEach { var: String, iter: Expr, body: Vec<Stmt>, line: u32 },
     Return { value: Option<Expr>, line: u32 },
     /// `assert cond` / `assert cond, "msg"` (msg is a literal; it is a
     /// diagnostic label only -- psa panics with a code, no traceback).
