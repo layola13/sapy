@@ -1,0 +1,36 @@
+//! sla-ast: AST node definitions mirrored from sa_plugin_sla/src/ast.zig.
+//!
+//! Crate wiring (this file) is coordinator-owned; module internals are
+//! owned by the lexer/ast lane. See docs/COORDINATION.md.
+
+pub mod decls;
+pub mod defer_desugar;
+pub mod exprs;
+pub mod monomorphize;
+pub mod node;
+pub mod stmts;
+pub mod types;
+
+pub use decls::{
+    CheckHookDecl, EnumDecl, EnumVariant, Field, FuncDecl, ImplDecl, ImportDecl, MacroDecl,
+    OverloadDecl, ShaderConst, ShaderDecl, ShaderField, ShaderGlobalStruct, SublanguageDecl,
+    Param, Program, StructDecl, TestDecl, TraitDecl, TraitMethod, TypeAliasComponent,
+    TypeAliasDecl, UsingDecl,
+};
+pub use exprs::{
+    ArrayLiteral, AwaitExpr, BinaryExpr, BinaryOp, BorrowExpr, CallExpr, Case, CastExpr,
+    ClosureLiteral, DerefExpr, EnumLiteral, EnumLiteralField, EnumPattern, FieldExpr,
+    GenericFuncRef, IfExpr, IfLetCond, IndexExpr, InlineAsmExpr, InlineAsmOperand, Literal,
+    MatchCase, MatchExpr, MoveExpr, RepeatArrayLiteral, SliceExpr, StructLiteral,
+    StructLiteralField, SwitchExpr, TryExpr, TupleLiteral, UnsafeExpr,
+};
+pub use monomorphize::{monomorphize_program, MonomorphizeError, Monomorphizer};
+pub use node::Node;
+pub use stmts::{
+    AssignStmt, BlockStmt, BreakStmt, ConstStmt, ContinueStmt, ForStmt, LetDestructureStmt,
+    LetElseStmt, LetStmt, ReleaseStmt, ReturnStmt, VarStmt, WhileStmt,
+};
+pub use types::{
+    extern_spelling_convertible, overload_member_symbol, overload_type_tag, ArrayType,
+    ClosureType, FnPtrType, Primitive, TupleType, Type, UserDefined,
+};

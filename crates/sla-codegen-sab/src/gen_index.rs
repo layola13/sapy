@@ -1,0 +1,725 @@
+//! S6 — `genIndex`: the IndexExpr read slice. Zig `genIndex`
+//! (sab_codegen.zig:17129) with `genIndexAddress` (11806–
+//! 11903), `genMapIndex`, and `branchReleaseIfOwned`, split
+//! out of `driver_gen.rs` for the 700-line discipline.
+//! Semantics are ported arm-by-arm from the Zig source — no
+//! local invention:
+//!
+//! - (1) ordinary address targets (fixed array / Slice):
+//!   `genIndexAddress` + a load of the element's storage
+//!   prim type. The array path itself is shared with
+//!   `gen_assign` (`gen_index_address_array`); the Slice
+//!   fat-pointer path and the `.index_address` surface path
+//!   live here.
+//! - (2) map plan (HashMap / BTreeMap): `genMapIndex` —
+//!   try-get fragment, miss panics with code 404.
+//! - (3) Zig's `genVecDirectIndex` is dead code in the
+//!   current Zig head (its first line returns null unless
+//!   the symbol table length equals `maxInt(usize)`,
+//!   issue014), so it is deliberately NOT revived here:
+//!   Vec reads take arm (5), exactly as in Zig today.
+//! - (4) VecDeque: the `VEC_DEQUE_GET` fragment.
+//! - (5) fallback: the `.index` std surface rule for the
+//!   target's base type name (Vec / GrowVec / Slice reads).
+
+use sla_ast::{IndexExpr, Literal, Node, Type};
+use sla_lowering::abi_passes_as_pointer;
+
+use crate::driver::{unsupported, Driver};
+use crate::error::{Error, Result};
+use crate::fragment::FragmentMachine;
+use crate::fragment_imports::MachineSurfaceEmitter;
+use crate::gen_assign::AddressSource;
+use crate::gen_method_call::{is_string_type, map_types};
+use crate::ir::{OpKind, Operand, PrimType};
+use crate::layout::{
+    element_load_type, element_slot_size, first_generic_arg, storage_prim_type, type_base_name,
+    type_size, user_defined_generic_inner, vec_element_type, LayoutAdapter,
+};
+use crate::state::RegState;
+use crate::surface_query::{
+    emit_std_surface_rule, find_std_surface_rule, PendingStdDeps, StdSurfaceValues,
+};
+use crate::types::{StdSurfaceRule, StdSurfaceRuleKind};
+
+/// Zig `ordinaryIndexAddressTargetType`
+/// (lowering_rules.zig:153): peel borrows/pointers; a fixed
+/// array or a one-argument `Slice` qualifies, everything
+/// else is null.
+fn ordinary_index_address_target_type(ty: &Type) -> Option<Type> {
+    let peeled = sla_lowering::peel_borrow_pointer_type(ty);
+    match peeled {
+        Type::Array(_) => Some(peeled.clone()),
+        Type::UserDefined(ud) if ud.name == "Slice" && ud.generics.len() == 1 => {
+            Some(peeled.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Zig `indexFixedArrayElementType` (lowering_rules.zig:169).
+fn index_fixed_array_element_type(ty: &Type) -> Option<Type> {
+    match sla_lowering::peel_borrow_pointer_type(ty) {
+        Type::Array(arr) => Some((*arr.elem).clone()),
+        _ => None,
+    }
+}
+
+/// Zig `MapIndexPlan` (lowering_rules.zig:4628): how a hit
+/// payload reaches the destination — HashMap yields a slot
+/// pointer (load through it), BTreeMap yields the value
+/// payload directly (cast from the u64 slot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MapIndexShape {
+    TryGetPtr,
+    TryGetValue,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MapIndexPlan {
+    macro_name: &'static str,
+    dep_symbol: &'static str,
+    import_path: &'static str,
+    shape: MapIndexShape,
+    string_key: bool,
+}
+
+/// Zig `mapIndexPlan` (lowering_rules.zig:4845): ONE shared
+/// plan serves both `genMapGetCall` and `genMapIndex`, and
+/// its HashMap arm keys the `_STR` variant for string keys
+/// (`MAP_TRY_GET_STR` / `sa_map_try_get_str` when the key
+/// type is String). An earlier note on this port claimed
+/// the index route has no `_STR` arm; that was wrong, and
+/// acting on it left every `m[k]` read on a
+/// `HashMap<String, _>` probing by pointer identity against
+/// content-hashed entries — a guaranteed miss (panic 404)
+/// for any fresh equal-content key, and for the stored
+/// handle itself whenever the probe chain differs.
+/// DEF-RUST-STRKEY: route this plan by the caller's
+/// `string_key` decision (the shared
+/// `map_key_string_content`: declared String key type, or a
+/// string-literal index), exactly as `gen_map_call`'s twin
+/// plan does for the `get` probe.
+fn map_index_plan(ty: &Type, string_key: bool) -> Option<MapIndexPlan> {
+    if let Some((key_ty, _)) = map_types(ty, "HashMap") {
+        if string_key || is_string_type(&key_ty) {
+            return Some(MapIndexPlan {
+                macro_name: "MAP_TRY_GET_STR",
+                dep_symbol: "sa_map_try_get_str",
+                import_path: "sa_std/hashmap.sa",
+                shape: MapIndexShape::TryGetPtr,
+                string_key: true,
+            });
+        }
+        return Some(MapIndexPlan {
+            macro_name: "MAP_TRY_GET",
+            dep_symbol: "sa_map_try_get",
+            import_path: "sa_std/hashmap.sa",
+            shape: MapIndexShape::TryGetPtr,
+            string_key: false,
+        });
+    }
+    if map_types(ty, "BTreeMap").is_some() {
+        return Some(MapIndexPlan {
+            macro_name: "BTREE_MAP_TRY_GET",
+            dep_symbol: "sa_btree_map_try_get",
+            import_path: "sa_std/btree_map.sa",
+            shape: MapIndexShape::TryGetValue,
+            string_key: false,
+        });
+    }
+    None
+}
+
+impl<'c> Driver<'c> {
+    /// Zig `genIndex` (sab_codegen.zig:17129), dispatched
+    /// from `gen_expr`'s IndexExpr arm.
+    pub(crate) fn gen_index(&mut self, idx: &IndexExpr) -> Result<u32> {
+        let target_ty = self.check.expr_type(&idx.target).cloned().ok_or_else(|| {
+            Error::MissingType("index target has no checker type".to_string())
+        })?;
+        // (1) ordinary address target: address + load.
+        if let Some(ordinary) = ordinary_index_address_target_type(&target_ty) {
+            let elem_ty = match &ordinary {
+                Type::Array(arr) => (*arr.elem).clone(),
+                _ => first_generic_arg(&ordinary).ok_or_else(|| {
+                    unsupported(
+                        "ordinary index target without an element type",
+                        "G gen_index",
+                        "17129",
+                    )
+                })?,
+            };
+            let source = self.gen_index_address(idx, 32)?;
+            let dst = self.b().new_tmp();
+            self.b().record_reg(dst);
+            self.emit_load(dst, source.reg, 0, storage_prim_type(&elem_ty)?);
+            self.release_address_source(&source)?;
+            return Ok(dst);
+        }
+        // (2) map plan.
+        if let Some(plan) = map_index_plan(
+            &target_ty,
+            self.map_key_string_content(&target_ty, &idx.index),
+        ) {
+            let container = match plan.shape {
+                MapIndexShape::TryGetPtr => "HashMap",
+                MapIndexShape::TryGetValue => "BTreeMap",
+            };
+            let (_, value_ty) = map_types(&target_ty, container).ok_or_else(|| {
+                unsupported(
+                    "map index target without key/value types",
+                    "G gen_index",
+                    "17129",
+                )
+            })?;
+            return self.gen_map_index(idx, &plan, &value_ty);
+        }
+        // (4) VecDeque fragment arm.
+        if let Some(elem_ty) = user_defined_generic_inner(&target_ty, "VecDeque") {
+            return self.gen_vec_deque_index(idx, &elem_ty);
+        }
+        // (4b) CLASSB segment 3: inline-POD vec-like elements
+        // are read by loading the packed word out of the slot
+        // and materializing a record (the `.index` surface
+        // rule would load the word as a pointer).
+        if let Some(elem_ty) = vec_element_type(&target_ty)
+            .or_else(|| user_defined_generic_inner(&target_ty, "GrowVec"))
+        {
+            if self.inline_pod_element(&elem_ty) {
+                return self.gen_vec_pod_index_read(idx, &target_ty, &elem_ty);
+            }
+        }
+        // (5) `.index` surface rule.
+        self.gen_surface_index(idx, &target_ty)
+    }
+
+    /// Zig `genVecOwnerReceiver` (sab_codegen.zig:14386):
+    /// a field-projection target yields the field's stored
+    /// handle (marked non-owning, and a field handle view
+    /// when the field type passes as a pointer); any other
+    /// target is a plain `gen_expr`.
+    fn gen_vec_owner_receiver(&mut self, target: &Node) -> Result<AddressSource> {
+        if let Node::FieldExpr(field) = target {
+            let projection = self.gen_field_address(field)?;
+            let owner = self.b().new_tmp();
+            self.b().record_reg(owner);
+            self.emit_load(owner, projection.reg, 0, PrimType::Ptr);
+            self.mark_non_owning(owner);
+            // DEF-KB-1: register the handle-typed field view
+            // so its disposal uses a real release.
+            if let Some(base_ty) = self.check.expr_type(&field.expr).cloned() {
+                let field_ty =
+                    LayoutAdapter::new(self.check).field_type(&base_ty, &field.field_name);
+                if let Some(field_ty) = field_ty {
+                    if abi_passes_as_pointer(&field_ty) {
+                        self.state.frame.field_handle_view_regs.insert(owner);
+                    }
+                }
+            }
+            self.release_address_source(&projection)?;
+            return Ok(AddressSource {
+                reg: owner,
+                release_regs: Vec::new(),
+            });
+        }
+        let reg = self.gen_expr(target)?;
+        Ok(AddressSource {
+            reg,
+            release_regs: Vec::new(),
+        })
+    }
+
+    /// Zig `genVecPodIndexRead` (sab_codegen.zig:21704):
+    /// bounds-checked load of the packed element word plus
+    /// record materialization. The miss arm follows this
+    /// port's branch convention from `gen_map_index`
+    /// (branch-local releases; Zig's DEF-PHI disposal
+    /// snapshot has no counterpart in the ported branch
+    /// machinery).
+    fn gen_vec_pod_index_read(
+        &mut self,
+        idx: &IndexExpr,
+        target_ty: &Type,
+        elem_ty: &Type,
+    ) -> Result<u32> {
+        let is_grow = user_defined_generic_inner(target_ty, "GrowVec").is_some();
+        let (len_off, ptr_off) = if is_grow {
+            (
+                crate::release_drop::GROWVEC_ABI_LEN_OFFSET,
+                crate::release_drop::GROWVEC_ABI_PTR_OFFSET,
+            )
+        } else {
+            (
+                crate::release_drop::VEC_ABI_LEN_OFFSET,
+                crate::release_drop::VEC_ABI_PTR_OFFSET,
+            )
+        };
+        let target_source = self.gen_vec_owner_receiver(&idx.target)?;
+        let target_reg = target_source.reg;
+        let index_reg = self.gen_expr(&idx.index)?;
+        let len_reg = self.b().new_tmp();
+        let in_bounds = self.b().new_tmp();
+        self.b().record_reg(len_reg);
+        self.b().record_reg(in_bounds);
+        self.emit_load(len_reg, target_reg, len_off, PrimType::U64);
+        crate::release_prim::emit_op(
+            &mut self.state,
+            in_bounds,
+            OpKind::Ult,
+            Operand::Reg(index_reg),
+            Operand::Reg(len_reg),
+        );
+        self.emit_release(len_reg)?;
+
+        let hit_label = self.b().new_label("L_VEC_POD_INDEX_HIT");
+        let miss_label = self.b().new_label("L_VEC_POD_INDEX_MISS");
+        self.b().emit_branch(in_bounds, &hit_label, &miss_label);
+
+        self.b().emit_label(&miss_label);
+        self.branch_release_if_owned(in_bounds);
+        self.branch_release_if_owned(index_reg);
+        self.branch_release_if_owned(target_reg);
+        for reg in &target_source.release_regs {
+            self.branch_release_if_owned(*reg);
+        }
+        self.b().emit_panic_code(32);
+
+        self.b().emit_label(&hit_label);
+        self.branch_release_if_owned(in_bounds);
+        let data_ptr = self.b().new_tmp();
+        let offset = self.b().new_tmp();
+        let elem_ptr = self.b().new_tmp();
+        let word = self.b().new_tmp();
+        self.b().record_reg(data_ptr);
+        self.b().record_reg(offset);
+        self.b().record_reg(elem_ptr);
+        self.b().record_reg(word);
+        self.emit_load(data_ptr, target_reg, ptr_off, PrimType::Ptr);
+        crate::release_prim::emit_op(
+            &mut self.state,
+            offset,
+            OpKind::Mul,
+            Operand::Reg(index_reg),
+            Operand::ImmI64(8),
+        );
+        crate::release_prim::emit_ptr_add(
+            &mut self.state,
+            elem_ptr,
+            data_ptr,
+            Operand::Reg(offset),
+        );
+        self.emit_release(data_ptr)?;
+        self.emit_load(word, elem_ptr, 0, PrimType::U64);
+        self.emit_release(elem_ptr)?;
+        self.emit_release(offset)?;
+        let rec = self.materialize_inline_pod_record(word, elem_ty)?;
+        self.emit_release(word)?;
+        if !self.is_local_reg(index_reg) {
+            self.emit_release(index_reg)?;
+        }
+        self.release_address_source(&target_source)?;
+        Ok(rec)
+    }
+
+    /// Zig `genIndexAddress` (sab_codegen.zig:11806–11903):
+    /// ordinary targets take the array / Slice paths, any
+    /// other generic target takes the `.index_address`
+    /// surface rule.
+    pub(crate) fn gen_index_address(&mut self, idx: &IndexExpr, panic_code: i64) -> Result<AddressSource> {
+        let target_ty = self.check.expr_type(&idx.target).cloned().ok_or_else(|| {
+            Error::MissingType("index target has no checker type".to_string())
+        })?;
+        match ordinary_index_address_target_type(&target_ty) {
+            Some(Type::Array(arr)) => self.gen_index_address_array(idx, &arr, panic_code),
+            Some(slice_ty) => self.gen_slice_index_address(idx, &slice_ty, panic_code),
+            _ => self.gen_surface_index_address(idx, &target_ty),
+        }
+    }
+
+    /// Zig `genIndexAddress` Slice path (11811–11844): the
+    /// slice value is a {ptr, len} pair; load the base
+    /// pointer at `SliceAbi.ptr_offset` (0) and scale the
+    /// index by the element size.
+    fn gen_slice_index_address(
+        &mut self,
+        idx: &IndexExpr,
+        slice_ty: &Type,
+        panic_code: i64,
+    ) -> Result<AddressSource> {
+        let elem_ty = first_generic_arg(slice_ty).ok_or_else(|| {
+            unsupported(
+                "slice index target without a generic argument",
+                "G gen_index",
+                "11811",
+            )
+        })?;
+        let elem_size = type_size(&elem_ty);
+        let target_reg = self.gen_expr(&idx.target)?;
+        let target_is_local = self.is_local_reg(target_reg);
+        let base_ptr = self.b().new_tmp();
+        self.b().record_reg(base_ptr);
+        self.emit_load(base_ptr, target_reg, 0, PrimType::Ptr);
+        if let Node::Literal(Literal::IntVal(raw)) = &*idx.index {
+            if *raw < 0 {
+                return Err(unsupported("negative slice index", "G gen_index", "11820"));
+            }
+            let offset = elem_size * (*raw as usize);
+            let mut source = self.address_with_offset(base_ptr, offset);
+            if !target_is_local {
+                // Zig releases the loaded base when the target
+                // was a moved non-local, and the target itself
+                // when non-local; under the port's local/temp
+                // dichotomy both ride on the same condition.
+                let mut release_regs = Vec::new();
+                if offset != 0 {
+                    release_regs.push(base_ptr);
+                }
+                release_regs.push(target_reg);
+                source.release_regs = release_regs;
+            }
+            return Ok(source);
+        }
+        let index_reg = self.gen_expr(&idx.index)?;
+        // 159(a): slice bounds check (mirrors gen_vec_pod_index_read; the miss
+        // arm uses branch-local releases, per this port's branch convention).
+        let slice_len_reg = self.b().new_tmp();
+        let slice_in_bounds = self.b().new_tmp();
+        self.b().record_reg(slice_len_reg);
+        self.b().record_reg(slice_in_bounds);
+        self.emit_load(slice_len_reg, target_reg, crate::gen_method_call::SLICE_ABI_LEN_OFFSET, PrimType::U64);
+        crate::release_prim::emit_op(
+            &mut self.state,
+            slice_in_bounds,
+            OpKind::Ult,
+            Operand::Reg(index_reg),
+            Operand::Reg(slice_len_reg),
+        );
+        self.emit_release(slice_len_reg)?;
+        let slice_hit_label = self.b().new_label("L_SLICE_INDEX_HIT");
+        let slice_miss_label = self.b().new_label("L_SLICE_INDEX_MISS");
+        self.b().emit_branch(slice_in_bounds, &slice_hit_label, &slice_miss_label);
+        self.b().emit_label(&slice_miss_label);
+        self.branch_release_if_owned(slice_in_bounds);
+        self.branch_release_if_owned(index_reg);
+        self.branch_release_if_owned(base_ptr);
+        self.branch_release_if_owned(target_reg);
+        self.b().emit_panic_code(panic_code);
+        self.b().emit_label(&slice_hit_label);
+        self.branch_release_if_owned(slice_in_bounds);
+        let offset = self.b().new_tmp();
+        self.b().record_reg(offset);
+        crate::release_prim::emit_op(
+            &mut self.state,
+            offset,
+            OpKind::Mul,
+            Operand::Reg(index_reg),
+            Operand::ImmI64(elem_size as i64),
+        );
+        let elem_ptr = self.b().new_tmp();
+        self.b().record_reg(elem_ptr);
+        crate::release_prim::emit_ptr_add(
+            &mut self.state,
+            elem_ptr,
+            base_ptr,
+            Operand::Reg(offset),
+        );
+        self.emit_release(offset)?;
+        if !target_is_local {
+            self.emit_release(base_ptr)?;
+        }
+        if !self.is_local_reg(index_reg) {
+            self.emit_release(index_reg)?;
+        }
+        Ok(AddressSource {
+            reg: elem_ptr,
+            release_regs: if target_is_local {
+                Vec::new()
+            } else {
+                vec![target_reg]
+            },
+        })
+    }
+
+    /// Zig `genIndexAddress` `.index_address` path
+    /// (11846–11863): the surface rule yields the element
+    /// address directly.
+    fn gen_surface_index_address(
+        &mut self,
+        idx: &IndexExpr,
+        target_ty: &Type,
+    ) -> Result<AddressSource> {
+        if first_generic_arg(target_ty).is_none() {
+            return Err(unsupported(
+                "index_address target without a generic argument",
+                "G gen_index",
+                "11846",
+            ));
+        }
+        let base = type_base_name(target_ty).ok_or_else(|| {
+            unsupported(
+                "index_address target without a base type name",
+                "G gen_index",
+                "11846",
+            )
+        })?;
+        let rule = find_std_surface_rule(
+            &self.state.program.std_surface_rules,
+            StdSurfaceRuleKind::IndexAddress,
+            &base,
+            None,
+        )
+        .ok_or_else(|| {
+            unsupported(
+                &format!("index_address surface rule for `{base}`"),
+                "G gen_index",
+                "11850",
+            )
+        })?
+        .clone();
+        let target_reg = self.gen_expr(&idx.target)?;
+        let index_reg = self.gen_expr(&idx.index)?;
+        let dst = self.b().new_tmp();
+        self.b().record_reg(dst);
+        let values = StdSurfaceValues {
+            out: Some(dst),
+            receiver: Some(target_reg),
+            index: Some(index_reg),
+            elem_size: element_slot_size(target_ty),
+            elem_ty: Some(element_load_type(target_ty)?),
+            ..StdSurfaceValues::default()
+        };
+        self.emit_index_rule(&rule, &values)?;
+        self.release_non_local(target_reg)?;
+        self.release_non_local(index_reg)?;
+        Ok(AddressSource {
+            reg: dst,
+            release_regs: Vec::new(),
+        })
+    }
+
+    /// Zig `genMapIndex` (sab_codegen.zig, the map arm of
+    /// `genIndex`): try-get fragment; on a miss the owned
+    /// branch registers are released and the read panics
+    /// with code 404. No Option fold — the shapes follow
+    /// `gen_method_surface`'s fallible-method precedent.
+    fn gen_map_index(
+        &mut self,
+        idx: &IndexExpr,
+        plan: &MapIndexPlan,
+        value_ty: &Type,
+    ) -> Result<u32> {
+        let dst = self.b().new_tmp();
+        self.b().record_reg(dst);
+        let map_reg = self.gen_expr(&idx.target)?;
+        // DEF-RUST-STRKEY: on a string-keyed plan a literal
+        // index materializes as an owned String handle (the
+        // `_STR` probe reads the key through the handle
+        // layout); retire it after the probe like the `get`
+        // probe does, instead of the expr-result release.
+        let key_materialized_owned =
+            plan.string_key && matches!(*idx.index, Node::Literal(Literal::StringVal(_)));
+        let key_reg = self.gen_map_key_reg_mode(&idx.index, plan.string_key)?;
+        self.ensure_method_std_deps(plan.import_path, &[plan.dep_symbol])?;
+        let ok_reg = self.b().new_tmp();
+        let payload_reg = self.b().new_tmp();
+        let ok_name = self.b().symbol_name(ok_reg).to_string();
+        let payload_name = self.b().symbol_name(payload_reg).to_string();
+        let map_name = self.b().symbol_name(map_reg).to_string();
+        let key_name = self.b().symbol_name(key_reg).to_string();
+        self.emit_method_macro_fragment(
+            plan.import_path,
+            plan.macro_name,
+            &[ok_name, payload_name, map_name, key_name],
+        )?;
+        let hit_label = self.b().new_label("L_MAP_INDEX_HIT");
+        let miss_label = self.b().new_label("L_MAP_INDEX_MISS");
+        self.b().emit_branch(ok_reg, &hit_label, &miss_label);
+        self.b().emit_label(&miss_label);
+        self.branch_release_if_owned(ok_reg);
+        self.branch_release_if_owned(payload_reg);
+        self.branch_release_if_owned(map_reg);
+        self.branch_release_if_owned(key_reg);
+        self.b().emit_panic_code(404);
+        self.b().emit_label(&hit_label);
+        self.branch_release_if_owned(ok_reg);
+        // DEF-RUST-STRKEY-V2: Zig genMapIndex loads the
+        // payload with storagePrimType(value_ty); this was
+        // element_load_type(value_ty) — a container-shaped
+        // helper fed the bare value type, unreachable while
+        // the checker blocked map indices outright.
+        let load_ty = storage_prim_type(value_ty)?;
+        match plan.shape {
+            MapIndexShape::TryGetValue => {
+                self.b().emit_op(
+                    dst,
+                    crate::gen_struct::op_kind_for_cast(PrimType::U64, load_ty)?,
+                    Operand::Reg(payload_reg),
+                    Operand::Ty(load_ty as u32),
+                );
+            }
+            MapIndexShape::TryGetPtr => {
+                self.emit_load(dst, payload_reg, 0, load_ty);
+            }
+        }
+        self.branch_release_if_owned(payload_reg);
+        self.release_non_local(map_reg)?;
+        if key_materialized_owned {
+            self.retire_owned_probe_key(key_reg)?;
+        } else {
+            self.release_expr_result_if_needed(&idx.index, key_reg)?;
+        }
+        Ok(dst)
+    }
+
+    /// Zig `genIndex` VecDeque arm: the `VEC_DEQUE_GET`
+    /// fragment (`sa_std/vec_deque.sa`).
+    fn gen_vec_deque_index(&mut self, idx: &IndexExpr, _elem_ty: &Type) -> Result<u32> {
+        let target_reg = self.gen_expr(&idx.target)?;
+        let index_reg = self.gen_expr(&idx.index)?;
+        self.ensure_method_std_deps("sa_std/vec_deque.sa", &["sa_vec_deque_get"])?;
+        let dst = self.b().new_tmp();
+        self.b().record_reg(dst);
+        let dst_name = self.b().symbol_name(dst).to_string();
+        let target_name = self.b().symbol_name(target_reg).to_string();
+        let index_name = self.b().symbol_name(index_reg).to_string();
+        self.emit_method_macro_fragment(
+            "sa_std/vec_deque.sa",
+            "VEC_DEQUE_GET",
+            &[dst_name, target_name, index_name],
+        )?;
+        self.release_non_local(target_reg)?;
+        self.release_expr_result_if_needed(&idx.index, index_reg)?;
+        Ok(dst)
+    }
+
+    /// Zig `genIndex` fallback arm: the `.index` std
+    /// surface rule for the target's base type name.
+    fn gen_surface_index(&mut self, idx: &IndexExpr, target_ty: &Type) -> Result<u32> {
+        let base = type_base_name(target_ty).ok_or_else(|| {
+            unsupported(
+                "index target without a base type name",
+                "G gen_index",
+                "17129",
+            )
+        })?;
+        let rule = find_std_surface_rule(
+            &self.state.program.std_surface_rules,
+            StdSurfaceRuleKind::Index,
+            &base,
+            None,
+        )
+        .ok_or_else(|| {
+            unsupported(
+                &format!("index surface rule for `{base}`"),
+                "G gen_index",
+                "17129",
+            )
+        })?
+        .clone();
+        let target_reg = self.gen_expr(&idx.target)?;
+        let index_reg = self.gen_expr(&idx.index)?;
+        // 159(b): a non-POD Vec/GrowVec read reaches the `.index` surface rule
+        // unchecked (gen_vec_pod_index_read covers inline-POD only; the direct
+        // path is disabled, see issue014). Bounds-check here, miss -> panic 32.
+        if vec_element_type(target_ty)
+            .or_else(|| user_defined_generic_inner(target_ty, "GrowVec"))
+            .is_some()
+        {
+            let is_grow = user_defined_generic_inner(target_ty, "GrowVec").is_some();
+            let len_off = if is_grow {
+                crate::release_drop::GROWVEC_ABI_LEN_OFFSET
+            } else {
+                crate::release_drop::VEC_ABI_LEN_OFFSET
+            };
+            let vec_len_reg = self.b().new_tmp();
+            let vec_in_bounds = self.b().new_tmp();
+            self.b().record_reg(vec_len_reg);
+            self.b().record_reg(vec_in_bounds);
+            self.emit_load(vec_len_reg, target_reg, len_off, PrimType::U64);
+            crate::release_prim::emit_op(
+                &mut self.state,
+                vec_in_bounds,
+                OpKind::Ult,
+                Operand::Reg(index_reg),
+                Operand::Reg(vec_len_reg),
+            );
+            self.emit_release(vec_len_reg)?;
+            let vec_hit_label = self.b().new_label("L_VEC_INDEX_HIT");
+            let vec_miss_label = self.b().new_label("L_VEC_INDEX_MISS");
+            self.b().emit_branch(vec_in_bounds, &vec_hit_label, &vec_miss_label);
+            self.b().emit_label(&vec_miss_label);
+            self.branch_release_if_owned(vec_in_bounds);
+            self.branch_release_if_owned(index_reg);
+            self.branch_release_if_owned(target_reg);
+            self.b().emit_panic_code(32);
+            self.b().emit_label(&vec_hit_label);
+            self.branch_release_if_owned(vec_in_bounds);
+        }
+        let dst = self.b().new_tmp();
+        self.b().record_reg(dst);
+        // DEF-ZRANGE: indexing a Vec of heap-handle elements
+        // loads the element's own cell handle out of the
+        // buffer slot — a borrowed view, not an owned value.
+        // Mark the result non-owning so any later cleanup of
+        // this register (e.g. the base release at the end of
+        // a field projection, genField) degrades to a forget
+        // instead of freeing the element the Vec still owns.
+        if let Some(elem_ty) = vec_element_type(target_ty) {
+            if crate::agg_emit::is_heap_handle_type(&elem_ty) {
+                self.mark_non_owning(dst);
+            }
+        }
+        let values = StdSurfaceValues {
+            out: Some(dst),
+            receiver: Some(target_reg),
+            index: Some(index_reg),
+            elem_size: element_slot_size(target_ty),
+            elem_ty: Some(element_load_type(target_ty)?),
+            ..StdSurfaceValues::default()
+        };
+        self.emit_index_rule(&rule, &values)?;
+        self.release_non_local(target_reg)?;
+        self.release_non_local(index_reg)?;
+        Ok(dst)
+    }
+
+    /// Zig `branchReleaseIfOwned`: release a register on a
+    /// branch path unless it is a frame local, a stack
+    /// allocation, or marked non-owning.
+    pub(crate) fn branch_release_if_owned(&mut self, reg: u32) {
+        if self.is_local_reg(reg) {
+            return;
+        }
+        if self.state.frame.stack_alloc_emitted.contains(&reg) {
+            return;
+        }
+        if matches!(self.state.frame.reg_state(reg), RegState::NonOwning) {
+            return;
+        }
+        crate::release_emit::emit_branch_release(&mut self.state, reg);
+    }
+
+    /// Zig `emitStdSurfaceRule` (D4) with the production
+    /// emitter; same queue/symbol plumbing as
+    /// gen_assign's `emit_assign_rule` (per-module copy).
+    fn emit_index_rule(&mut self, rule: &StdSurfaceRule, values: &StdSurfaceValues) -> Result<()> {
+        let symbols: Vec<String> = self.b().symbols().to_vec();
+        let mut included = std::mem::take(&mut self.state.program.included_imports);
+        let mut pending = std::mem::take(&mut self.state.program.pending_std_deps);
+        let result = {
+            let mut emitter = MachineSurfaceEmitter {
+                machine: FragmentMachine::new(&mut self.state),
+                flattener: &mut *self.flattener,
+            };
+            let mut ensurer = PendingStdDeps::new(&mut included, &mut pending);
+            emit_std_surface_rule(&mut emitter, &mut ensurer, rule, values, &symbols)
+        };
+        self.state.program.included_imports = included;
+        self.state.program.pending_std_deps = pending;
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests;
