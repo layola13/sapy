@@ -1,0 +1,8 @@
+def test_value():
+    return {"a": [1, 2.0, True, None, "x\ny"], "b": {"c": []}, "d": {}}
+
+def test_text():
+    return '{"k": "A\\nB", "n": -12.0, "u": "\\u0041"}'
+
+print(test_value())
+print(test_text())

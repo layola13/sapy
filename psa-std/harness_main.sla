@@ -1,0 +1,12 @@
+fn main() -> i32 {
+    let v = __py_test_value();
+    let s = psa_json_dumps(v);
+    __psa_print_dyn(s);
+    let back = psa_json_parse(s);
+    let s2 = psa_json_dumps(back);
+    __psa_print_dyn(s2);
+    let t = __py_test_text();
+    let parsed = psa_json_parse(t);
+    __psa_print_dyn(psa_json_dumps(parsed));
+    return 0;
+}

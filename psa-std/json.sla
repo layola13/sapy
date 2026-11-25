@@ -1,0 +1,351 @@
+// psa_std json (L1): CPython-compatible JSON dump/parse over
+// PsaVal. See README.md for the module contract and the
+// registered divergences. Panic codes: 77130 structural /
+// not-serializable, 77131 trailing garbage. Bounds-guarded
+// byte reads never ride on && (eager in SLA, probe P4).
+
+fn __psa_json_hex4(s: PsaVal, v: i64) -> PsaVal {
+    // Append exactly 4 lowercase hex digits of v (0..65535).
+    let out = s;
+    let shift: i64 = 12;
+    while shift >= 0 {
+        let d = (v >> shift) & 15;
+        if d < 10 {
+            out = __psa_str_push(out, (48 + d) as u8);
+        } else {
+            out = __psa_str_push(out, (87 + d) as u8);
+        };
+        shift = shift - 4;
+    }
+    return out;
+}
+
+fn __psa_json_dump_str(v: PsaVal, out: PsaVal) -> PsaVal {
+    // v is a tag-6 string; append its quoted, escaped form.
+    let o = __psa_str_push(out, 34u8);
+    let n = __psa_bytes_len_h(v.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        let b = __psa_bytes_get_h(v.ipay as ptr, i) as i64;
+        if b == 34 { o = __psa_str_push(o, 92u8); o = __psa_str_push(o, 34u8); };
+        if b == 92 { o = __psa_str_push(o, 92u8); o = __psa_str_push(o, 92u8); };
+        if b == 10 { o = __psa_str_push(o, 92u8); o = __psa_str_push(o, 110u8); };
+        if b == 13 { o = __psa_str_push(o, 92u8); o = __psa_str_push(o, 114u8); };
+        if b == 9 { o = __psa_str_push(o, 92u8); o = __psa_str_push(o, 116u8); };
+        if b == 8 { o = __psa_str_push(o, 92u8); o = __psa_str_push(o, 98u8); };
+        if b == 12 { o = __psa_str_push(o, 92u8); o = __psa_str_push(o, 102u8); };
+        if b < 32 {
+            if !(b == 10 || b == 13 || b == 9 || b == 8 || b == 12) {
+                o = __psa_str_push(o, 92u8);
+                o = __psa_str_push(o, 117u8);
+                o = __psa_str_push(o, 48u8);
+                o = __psa_str_push(o, 48u8);
+                o = __psa_json_hex4_low2(o, b);
+            };
+        };
+        if b >= 32 && b != 34 && b != 92 {
+            o = __psa_str_push(o, b as u8);
+        };
+        i = i + 1;
+    }
+    o = __psa_str_push(o, 34u8);
+    return o;
+}
+
+fn __psa_json_hex4_low2(o: PsaVal, b: i64) -> PsaVal {
+    // Append the last two hex digits for a \u00XX escape
+    // (the two leading zeros are pushed by the caller).
+    let d1 = (b >> 4) & 15;
+    let d2 = b & 15;
+    if d1 < 10 { o = __psa_str_push(o, (48 + d1) as u8); } else { o = __psa_str_push(o, (87 + d1) as u8); };
+    if d2 < 10 { o = __psa_str_push(o, (48 + d2) as u8); } else { o = __psa_str_push(o, (87 + d2) as u8); };
+    return o;
+}
+
+fn __psa_json_dump(v: PsaVal, out: PsaVal) -> PsaVal {
+    if v.tag == 3 {
+        let o = __psa_str_append_str(out, __psa_json_lit_null());
+        return o;
+    };
+    if v.tag == 2 {
+        if v.ipay != 0 {
+            return __psa_str_append_str(out, __psa_json_lit_true());
+        };
+        return __psa_str_append_str(out, __psa_json_lit_false());
+    };
+    if v.tag == 0 {
+        return __psa_str_append_str(out, __psa_str_from_i64(v.ipay));
+    };
+    if v.tag == 1 {
+        // Integral floats print as N.0 (CPython json uses
+        // repr, whose shortest form agrees there); other
+        // floats wait for the runtime float-repr builder.
+        let f = v.fpay;
+        if f == (f as i64) as f64 {
+            if f < 9007199254740992.0 && f > -9007199254740992.0 {
+                // CPython repr of an integral float is "N.0".
+                let o = __psa_str_append_str(out, __psa_str_from_i64(f as i64));
+                o = __psa_str_push(o, 46u8);
+                return __psa_str_push(o, 48u8);
+            };
+        };
+        panic(77130);
+    };
+    if v.tag == 6 {
+        return __psa_json_dump_str(v, out);
+    };
+    if v.tag == 4 || v.tag == 10 {
+        let o = __psa_str_push(out, 91u8);
+        let n = __psa_vec_len_h(v.ipay as ptr);
+        let i: i64 = 0;
+        while i < n {
+            if i > 0 {
+                o = __psa_str_push(o, 44u8);
+                o = __psa_str_push(o, 32u8);
+            };
+            o = __psa_json_dump(__psa_vec_get_h(v.ipay as ptr, i), o);
+            i = i + 1;
+        }
+        o = __psa_str_push(o, 93u8);
+        return o;
+    };
+    if v.tag == 5 {
+        // Dict storage alternates key, value in one vec.
+        let o = __psa_str_push(out, 123u8);
+        let n = __psa_vec_len_h(v.ipay as ptr);
+        let i: i64 = 0;
+        let first = true;
+        while i < n {
+            let k = __psa_vec_get_h(v.ipay as ptr, i);
+            let val = __psa_vec_get_h(v.ipay as ptr, i + 1);
+            if k.tag != 6 { panic(77130); };
+            if !(first) {
+                o = __psa_str_push(o, 44u8);
+                o = __psa_str_push(o, 32u8);
+            };
+            first = false;
+            o = __psa_json_dump_str(k, o);
+            o = __psa_str_push(o, 58u8);
+            o = __psa_str_push(o, 32u8);
+            o = __psa_json_dump(val, o);
+            i = i + 2;
+        }
+        o = __psa_str_push(o, 125u8);
+        return o;
+    };
+    panic(77130);
+}
+
+fn __psa_json_lit_null() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 110u8); s = __psa_str_push(s, 117u8); s = __psa_str_push(s, 108u8); s = __psa_str_push(s, 108u8);
+    return s;
+}
+
+fn __psa_json_lit_true() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 116u8); s = __psa_str_push(s, 114u8); s = __psa_str_push(s, 117u8); s = __psa_str_push(s, 101u8);
+    return s;
+}
+
+fn __psa_json_lit_false() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 102u8); s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 108u8); s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 101u8);
+    return s;
+}
+
+fn psa_json_dumps(v: PsaVal) -> PsaVal {
+    return __psa_json_dump(v, __psa_str_new());
+}
+
+// ---- parse ----
+// Recursive descent over bytes; every parser takes
+// (source, pos) and returns (value, new pos). Positions are
+// byte indices; a read at pos is only made inside a plain
+// `pos < n` branch (eager-&& discipline).
+
+fn __psa_json_ws(s: PsaVal, i: i64) -> i64 {
+    let n = __psa_bytes_len_h(s.ipay as ptr);
+    let j = i;
+    while j < n {
+        let b = __psa_bytes_get_h(s.ipay as ptr, j) as i64;
+        if !(b == 32 || b == 9 || b == 10 || b == 13) { break; };
+        j = j + 1;
+    }
+    return j;
+}
+
+fn __psa_json_peek(s: PsaVal, i: i64) -> i64 {
+    let n = __psa_bytes_len_h(s.ipay as ptr);
+    if i < n {
+        return __psa_bytes_get_h(s.ipay as ptr, i) as i64;
+    };
+    return -1;
+}
+
+fn __psa_json_expect(s: PsaVal, i: i64, word: PsaVal) -> i64 {
+    // Match a literal word (true/false/null) at i; return
+    // the position just past it.
+    let wn = __psa_bytes_len_h(word.ipay as ptr);
+    let k: i64 = 0;
+    while k < wn {
+        if __psa_json_peek(s, i + k) != (__psa_bytes_get_h(word.ipay as ptr, k) as i64) { panic(77130); };
+        k = k + 1;
+    }
+    return i + wn;
+}
+
+fn __psa_json_hexval(b: i64) -> i64 {
+    if b >= 48 && b <= 57 { return b - 48; };
+    if b >= 97 && b <= 102 { return b - 87; };
+    if b >= 65 && b <= 70 { return b - 55; };
+    panic(77130);
+}
+
+fn __psa_json_parse_string(s: PsaVal, i: i64) -> (PsaVal, i64) {
+    // i points at the opening quote.
+    let out = __psa_str_new();
+    let j = i + 1;
+    let n = __psa_bytes_len_h(s.ipay as ptr);
+    while j < n {
+        let b = __psa_bytes_get_h(s.ipay as ptr, j) as i64;
+        if b == 34 {
+            return (out, j + 1);
+        };
+        if b == 92 {
+            let e = __psa_json_peek(s, j + 1);
+            if e == 34 { out = __psa_str_push(out, 34u8); j = j + 2; };
+            if e == 92 { out = __psa_str_push(out, 92u8); j = j + 2; };
+            if e == 47 { out = __psa_str_push(out, 47u8); j = j + 2; };
+            if e == 98 { out = __psa_str_push(out, 8u8); j = j + 2; };
+            if e == 102 { out = __psa_str_push(out, 12u8); j = j + 2; };
+            if e == 110 { out = __psa_str_push(out, 10u8); j = j + 2; };
+            if e == 114 { out = __psa_str_push(out, 13u8); j = j + 2; };
+            if e == 116 { out = __psa_str_push(out, 9u8); j = j + 2; };
+            if e == 117 {
+                let cp: i64 = 0;
+                let k: i64 = 0;
+                while k < 4 {
+                    cp = cp * 16 + __psa_json_hexval(__psa_json_peek(s, j + 2 + k));
+                    k = k + 1;
+                }
+                // Encode the code point as UTF-8 (no
+                // surrogate-pair combining in v1: a lone
+                // surrogate encodes as its own 3-byte form,
+                // a registered divergence).
+                if cp < 128 {
+                    out = __psa_str_push(out, cp as u8);
+                } else {
+                    if cp < 2048 {
+                        out = __psa_str_push(out, (192 + (cp >> 6)) as u8);
+                        out = __psa_str_push(out, (128 + (cp & 63)) as u8);
+                    } else {
+                        out = __psa_str_push(out, (224 + (cp >> 12)) as u8);
+                        out = __psa_str_push(out, (128 + ((cp >> 6) & 63)) as u8);
+                        out = __psa_str_push(out, (128 + (cp & 63)) as u8);
+                    };
+                };
+                j = j + 6;
+            };
+            if !(e == 34 || e == 92 || e == 47 || e == 98 || e == 102 || e == 110 || e == 114 || e == 116 || e == 117) {
+                panic(77130);
+            };
+        } else {
+            out = __psa_str_push(out, b as u8);
+            j = j + 1;
+        };
+    }
+    panic(77130);
+}
+
+fn __psa_json_parse_number(s: PsaVal, i: i64) -> (PsaVal, i64) {
+    let n = __psa_bytes_len_h(s.ipay as ptr);
+    let j = i;
+    let is_float = false;
+    while j < n {
+        let b = __psa_bytes_get_h(s.ipay as ptr, j) as i64;
+        if b == 46 || b == 101 || b == 69 { is_float = true; };
+        if !((b >= 48 && b <= 57) || b == 45 || b == 43 || b == 46 || b == 101 || b == 69) { break; };
+        j = j + 1;
+    }
+    let tok = __psa_str_sub_bytes(s, i, j);
+    if is_float {
+        return (__psa_box_float(__psa_str_to_float(tok)), j);
+    };
+    return (__psa_box_int(__psa_str_to_int(tok)), j);
+}
+
+fn __psa_json_parse_value(s: PsaVal, i: i64) -> (PsaVal, i64) {
+    let j = __psa_json_ws(s, i);
+    let b = __psa_json_peek(s, j);
+    if b == 123 { return __psa_json_parse_object(s, j); };
+    if b == 91 { return __psa_json_parse_array(s, j); };
+    if b == 34 { return __psa_json_parse_string(s, j); };
+    if b == 116 {
+        let e = __psa_json_expect(s, j, __psa_json_lit_true());
+        return (__psa_box_bool(true), e);
+    };
+    if b == 102 {
+        let e = __psa_json_expect(s, j, __psa_json_lit_false());
+        return (__psa_box_bool(false), e);
+    };
+    if b == 110 {
+        let e = __psa_json_expect(s, j, __psa_json_lit_null());
+        return (PsaVal { tag: 3, ipay: 0, fpay: 0.0 }, e);
+    };
+    if b == 45 || (b >= 48 && b <= 57) { return __psa_json_parse_number(s, j); };
+    panic(77130);
+}
+
+fn __psa_json_parse_array(s: PsaVal, i: i64) -> (PsaVal, i64) {
+    // i points at '['.
+    let out = __psa_list_new();
+    let j = __psa_json_ws(s, i + 1);
+    if __psa_json_peek(s, j) == 93 {
+        return (out, j + 1);
+    };
+    let done = false;
+    while !(done) {
+        let (v, k) = __psa_json_parse_value(s, j);
+        __psa_list_push(out, v);
+        j = __psa_json_ws(s, k);
+        let b = __psa_json_peek(s, j);
+        if b == 44 { j = j + 1; };
+        if b == 93 { j = j + 1; done = true; };
+        if !(b == 44 || b == 93) { panic(77130); };
+    }
+    return (out, j);
+}
+
+fn __psa_json_parse_object(s: PsaVal, i: i64) -> (PsaVal, i64) {
+    // i points at '{'. Dict storage alternates key, value.
+    let out = __psa_dict_new();
+    let j = __psa_json_ws(s, i + 1);
+    if __psa_json_peek(s, j) == 125 {
+        return (out, j + 1);
+    };
+    let done = false;
+    while !(done) {
+        j = __psa_json_ws(s, j);
+        if __psa_json_peek(s, j) != 34 { panic(77130); };
+        let (k, k2) = __psa_json_parse_string(s, j);
+        j = __psa_json_ws(s, k2);
+        if __psa_json_peek(s, j) != 58 { panic(77130); };
+        let (v, v2) = __psa_json_parse_value(s, j + 1);
+        __psa_dict_set(out, k, v);
+        j = __psa_json_ws(s, v2);
+        let b = __psa_json_peek(s, j);
+        if b == 44 { j = j + 1; };
+        if b == 125 { j = j + 1; done = true; };
+        if !(b == 44 || b == 125) { panic(77130); };
+    }
+    return (out, j);
+}
+
+fn psa_json_parse(s: PsaVal) -> PsaVal {
+    if s.tag != 6 { panic(77130); };
+    let (v, j) = __psa_json_parse_value(s, 0);
+    let k = __psa_json_ws(s, j);
+    if k != __psa_bytes_len_h(s.ipay as ptr) { panic(77131); };
+    return v;
+}
