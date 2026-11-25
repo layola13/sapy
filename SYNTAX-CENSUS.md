@@ -50,8 +50,8 @@ sapy main）后，D3–D7 各行已逐行转正；本节以下为批后绑定计
 | for x in range(...) | 部分 | range 一/二参；D2 切片 B：for x in <list 变量> 已支持（静态与动态 list，长度逐轮重读、与 CPython 迭代器语义一致；continue 响亮拒绝）；D2 切片 C：for 遍历动态 str 已支持（逐码点）；for 遍历 dict 响亮 panic 77061（待 D3 有序 dict） |
 | return、pass | 支持 | return 多值（元组）随元组项 |
 | def（位置参数） | 支持 | 【已写未验 D3】默认值与可变参数已实现；参数/返回注解仍未做（解析即拒绝或忽略待定，现状为未支持） |
-| class | 支持 | 【D4，批验 class1/class2】单继承（编译期展平）、方法、类属性字面量形、__init__/__repr__/__str__/__bool__；super() 与多继承响亮拒绝；类属性可变注册表已定形（sa_std globals 单元 + set_once 惰性建表，探针实证）待落地，现为字面量读点求值 |
-| import | 支持 | 【D6，批验 mod_main】自有模块：import/from-import 由驱动合并（点分 def 键、类共注册表、模块字面量属性读点求值）；循环导入/别名类/非字面量模块顶层响亮拒绝；标准库（psa_std）已开写、未接 import 解析 |
+| class | 支持 | 【D4，批验 class1/class2/class3】单继承（编译期展平）、方法、__init__/__repr__/__str__/__bool__；类属性走运行时注册表（sa_std globals 单元 psa.clsattrs + set_once 惰性建表、程序启动 seed、祖先链 dict 查找）：声明仍限标量字面量，类侧赋值/增广/删除、实例与子类继承读均按 CPython 语义；super() 与多继承响亮拒绝 |
+| import | 支持 | 【D6，批验 mod_main】自有模块：import/from-import 由驱动合并（点分 def 键、类共注册表、模块字面量属性读点求值）；循环导入/别名类/非字面量模块顶层响亮拒绝；psa_std 已接 import 解析：无同名 .psa 文件时 `import json` 绑标准库（json.sla 拼接进程序、dumps/loads 直调，批验 json1）；from-import 标准库 v1 响亮拒绝；本地同名 .psa 优先于标准库 |
 | try/except/finally、raise | 支持 | 【D6，批验 exc1/exc2_uncaught】异常机 = 进程全局 pending 槽（sa_std globals 双 u64 单元）+ TryFrame 标志 + 调用语句后尾随未决检查逐帧展开——跨函数传播已通（批 6–9 定形，原每函数槽在被调用方 raise 处误杀 77100）；内建异常类 9 个、raise 四形态；运行时 panic 不可捕（登记分歧） |
 | with | 支持 | 【D6，批验 with1】文件类最小形已落地：with 走同一异常机、finally 逆序 __psa_with_close；open() 文件对象（标签 12，r/w/a 文本模式）；通用 __enter__/__exit__ 协议未做 |
 | global/nonlocal | 缺口-动态 | 随闭包项 |

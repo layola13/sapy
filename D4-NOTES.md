@@ -202,3 +202,38 @@ base calls via the def path, class1.psa + class2.psa written
 with CPython-fixed expected outputs. Remaining D4 work is only
 the debug/fix batch itself (plus the probe deciding whether
 the class-attr fallback is replaced by the registry shape).
+
+## Addendum (2026-11-26): the runtime registry landed
+
+The fallback shape above is replaced by the runtime registry
+(the globals probe passed; R1202 probe_then_build 8/8):
+
+- The registry root is a tag-4 list (indexed by class id)
+  whose box pointer lives in the sa_std globals cell
+  "psa.clsattrs"; `__psa_clsreg()` creates it lazily through
+  `sa_global_u64_set_once` and re-reads the prevailing
+  pointer on a lost race. `__psa_class_attrs_raw(cid)`
+  grows the list with None slots and lazily creates each
+  class's tag-5 dict.
+- `__psa_class_attrs_seed()`, emitted as main's first
+  statement, writes every class's OWN literal attributes
+  into its dict (registry order: bases precede subclasses).
+  Declared attributes stay scalar-literal-only at registry
+  time; the registry governs mutation, not declaration.
+- Reads: `__psa_class_<cid>_cgetattr(name)` walks the
+  ancestor dicts in flattened order (own first), panicking
+  77069 on a miss. Both instance getattr misses and
+  `ClassName.attr` reads route through it, so attributes
+  created by runtime assignment are found the same way.
+  Method names on the class side stay an emit error.
+- `ClassName.attr = v` writes the class's OWN dict
+  (visible to subclasses and unshadowed instances, as in
+  CPython); augmented assignment reads through cgetattr,
+  applies the binop and writes back. `del ClassName.attr`
+  deletes from the own dict only and panics 77069 when the
+  name is absent there (an ancestor's attribute is not
+  deleted through the subclass).
+- Acceptance: examples/class3.psa (method-driven class
+  mutation, inherited reads, runtime-created attribute,
+  deletion) matches CPython byte-for-byte, and the unified
+  batch re-ran green with the registry in place.

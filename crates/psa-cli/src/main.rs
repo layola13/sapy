@@ -34,7 +34,7 @@ fn main() {
             }
         }
         "version" | "--version" | "-V" => {
-            println!("psa 0.9.0 (sapy v0.9, D0-D7 complete: static + dynamic faces, kwargs/defaults, ordered dict, lambdas, classes, tuples/sets/comprehensions, methods, exceptions with cross-function propagation, with/files, imports, generators/coroutines, match, overflow guards; unified batch 25/25 on the SLA->SA text route; psa_std in progress toward v1)");
+            println!("psa 1.0.0 (sapy v1: D0-D7 complete: static + dynamic faces, kwargs/defaults, ordered dict, lambdas, classes with runtime class-attribute registry, tuples/sets/comprehensions, methods, exceptions with cross-function propagation, with/files, imports incl. psa_std json via `import json`, generators/coroutines, match, overflow guards; unified batch green on the SLA->SA text route; dual-face bench beats CPython)");
         }
         "help" | "--help" | "-h" => usage(),
         other => {
@@ -178,12 +178,36 @@ fn merge_imports(prog: &mut ast::Program, base_dir: &Path) -> Result<(), String>
     let mut visiting: HashSet<String> = HashSet::new();
     let mut done: HashSet<String> = HashSet::new();
     for imp in &imports {
+        // psa_std fallback: a module with no .psa file on disk
+        // whose name is a known psa_std module binds to the
+        // standard library instead (the emitter splices its
+        // SLA text). A .psa file of the same name wins, as a
+        // local module shadows the stdlib. from-imports of
+        // std modules are refused in v1.
+        let rel = imp.module.replace('.', "/") + ".psa";
+        if !base_dir.join(&rel).exists() && is_std_module(&imp.module) {
+            if imp.names.is_some() {
+                return Err(format!(
+                    "psa: `from {} import ...` is not supported for psa_std modules in v1; use `import {}` and call its functions through the module (line {})",
+                    imp.module, imp.module, imp.line
+                ));
+            }
+            if !prog.std_imports.contains(&imp.module) {
+                prog.std_imports.push(imp.module.clone());
+            }
+            continue;
+        }
         load_module(prog, base_dir, &imp.module, &mut visiting, &mut done, imp.line)?;
         if let Some(names) = &imp.names {
             bind_from_import(prog, &imp.module, names, imp.line)?;
         }
     }
     Ok(())
+}
+
+/// The psa_std modules this psa build ships (v1: json).
+fn is_std_module(key: &str) -> bool {
+    matches!(key, "json")
 }
 
 fn load_module(

@@ -68,6 +68,7 @@ impl Parser {
             mod_attrs: Vec::new(),
             const_names: Vec::new(),
             modules: Vec::new(),
+            std_imports: Vec::new(),
         };
         self.skip_newlines();
         while !matches!(self.peek(), Tok::Eof) {

@@ -1,0 +1,25 @@
+class Counter:
+    count = 0
+    label = "ctr"
+
+    def bump(self):
+        Counter.count = Counter.count + 1
+        return Counter.count
+
+class Sub(Counter):
+    pass
+
+c1 = Counter()
+c2 = Counter()
+print(c1.bump())
+print(c2.bump())
+print(Counter.count)
+print(Sub.count)
+print(c1.count)
+Counter.label = "renamed"
+print(c1.label)
+print(Sub.label)
+Counter.temp = 9
+print(Counter.temp)
+del Counter.temp
+print(c1.count)

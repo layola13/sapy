@@ -6,9 +6,10 @@ the `__psa_*` runtime helpers a psa program emits whenever it
 uses dynamic values). A psa_std module is therefore not
 standalone-compilable: it is linked into a psa program whose
 emitted code provides the runtime. User programs will reach it
-through `import json` etc. once the import wiring lands; until
-then the batch harness compiles modules together with a probe
-program + the psa runtime.
+through `import json` etc. The `json` wiring landed with psa
+1.0.0 (`import json` binds this directory's json.sla; see
+examples/json1.psa); other modules still ride the batch harness
+until their own wiring lands.
 
 Rules for modules here:
 

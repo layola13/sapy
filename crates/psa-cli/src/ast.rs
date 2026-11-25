@@ -298,4 +298,9 @@ pub struct Program {
     pub const_names: Vec<(String, Expr)>,
     /// Names of modules merged into this program (D6).
     pub modules: Vec<String>,
+    /// psa_std modules bound by import (merge output): no
+    /// .psa file backs these; the emitter splices the
+    /// module's SLA text and resolves its entry points
+    /// directly (v1: `json`).
+    pub std_imports: Vec<String>,
 }

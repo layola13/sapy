@@ -1,0 +1,11 @@
+import json
+
+v = {"a": [1, 2.0, True, None, "x\ny"], "b": {"c": []}, "d": {}}
+s = json.dumps(v)
+print(s)
+back = json.loads(s)
+print(back["a"][4])
+print(back["b"])
+t = json.loads('{"k": "A\\nB", "n": -12.0}')
+print(json.dumps(t))
+print(t["n"] == -12.0)

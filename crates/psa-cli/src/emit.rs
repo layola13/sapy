@@ -108,6 +108,10 @@ struct ClassInfo {
     name: String,
     flat_methods: Vec<(String, String)>,
     flat_attrs: Vec<(String, Expr)>,
+    /// This class's OWN attribute literals, in body order
+    /// (the runtime-registry seed writes exactly these into
+    /// the class's own dict; reads walk the ancestor chain).
+    attrs: Vec<(String, Expr)>,
     /// This class's id plus every ancestor's id (D5, backing
     /// isinstance: an instance of a subclass carries all of
     /// them in its ancestry).
@@ -159,6 +163,12 @@ pub struct Emitter {
     used_gen: bool,
     used_coro: bool,
     genexp_counter: usize,
+    /// psa_std: `import json` was bound to the standard
+    /// library by the driver's merge pass; `used_psa_json`
+    /// is set when a json entry point is actually called,
+    /// which splices the module's SLA text at assembly.
+    std_json: bool,
+    used_psa_json: bool,
     /// D6: the program uses try/raise/with anywhere (pre-scan
     /// in emit_program). Gates the trailing pending-exception
     /// check after call-containing statements (emit_stmt),
@@ -377,6 +387,8 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
         used_gen: false,
         used_coro: false,
         genexp_counter: 0,
+        std_json: prog.std_imports.iter().any(|m| m == "json"),
+        used_psa_json: false,
         program_exc: false,
     };
     em.program_exc = prog.funcs.iter().any(|f| stmts_use_exc(&f.body))
@@ -522,6 +534,13 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
         exc_bare: None,
         gen_chan: None,
     };
+    // D4 runtime registry: seed every class's literal
+    // attributes into its registry dict before any user code
+    // runs (CPython evaluates class bodies at definition
+    // time; program start is psa's equivalent point).
+    if !em.classes.is_empty() {
+        main_ctx.line("__psa_class_attrs_seed();");
+    }
     for s in &prog.top {
         em.emit_stmt(&mut main_ctx, s)?;
     }
@@ -685,6 +704,10 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
     if em.used_coro {
         out.push_str(D7_CORO_RUNTIME);
     }
+    if em.used_psa_json {
+        out.push_str(PSA_JSON_SLA);
+        out.push('\n');
+    }
     for f in &em.emitted {
         out.push_str(f);
         out.push('\n');
@@ -706,8 +729,10 @@ fn sla_str_build(var: &str, s: &str) -> String {
 
 /// D4 generated text: one class's class-side getattr. Method
 /// names resolve to bound methods (tag 9); class attributes
-/// (literals only in v1) evaluate at the read; anything else is
-/// an AttributeError (panic 77069).
+/// resolve through the runtime registry (per-class dicts
+/// seeded at program start, walked over the ancestor chain
+/// by __psa_class_<id>_cgetattr); anything else is an
+/// AttributeError (panic 77069).
 fn gen_class_getattr(em: &Emitter, ci: &ClassInfo) -> String {
     let mut t = format!(
         "fn __psa_class_{}_getattr(inst: PsaVal, name: PsaVal) -> PsaVal {{\n",
@@ -716,12 +741,6 @@ fn gen_class_getattr(em: &Emitter, ci: &ClassInfo) -> String {
     for (i, (mname, _)) in ci.flat_methods.iter().enumerate() {
         t.push_str(&sla_str_build(&format!("nm_{}", i), mname));
     }
-    for (i, (aname, ae)) in ci.flat_attrs.iter().enumerate() {
-        t.push_str(&sla_str_build(&format!("an_{}", i), aname));
-        if let Expr::Str(s) = ae {
-            t.push_str(&sla_str_build(&format!("av_{}", i), s));
-        }
-    }
     for (i, (_, key)) in ci.flat_methods.iter().enumerate() {
         let id = em.fn_ids.get(key).copied().unwrap_or(-1);
         t.push_str(&format!(
@@ -729,20 +748,72 @@ fn gen_class_getattr(em: &Emitter, ci: &ClassInfo) -> String {
             i, id
         ));
     }
-    for (i, (_, ae)) in ci.flat_attrs.iter().enumerate() {
-        let rc = match ae {
-            Expr::Int(v) => format!("__psa_box_int({})", v),
-            Expr::Float(v) => format!("__psa_box_float({})", fmt_f64(*v)),
-            Expr::Bool(b) => format!("__psa_box_bool({})", b),
-            Expr::Str(_) => format!("av_{}", i),
-            _ => Ty::Dyn.default_lit().to_string(),
-        };
+    t.push_str(&format!(
+        "    return __psa_class_{}_cgetattr(name);\n}}\n",
+        ci.id
+    ));
+    t
+}
+
+/// D4 generated text: one class's attribute-only lookup over
+/// the runtime registry: its own dict first, then each
+/// ancestor's, in flattened order. Seeded at program start
+/// by __psa_class_attrs_seed; assignments and deletions at
+/// runtime mutate the dicts, so reads observe them.
+fn gen_class_cgetattr(ci: &ClassInfo) -> String {
+    let mut t = format!(
+        "fn __psa_class_{}_cgetattr(name: PsaVal) -> PsaVal {{\n",
+        ci.id
+    );
+    for aid in &ci.ancestors {
         t.push_str(&format!(
-            "    if __psa_str_eq(name, an_{}) {{ return {}; }};\n",
-            i, rc
+            "    let __d{} = __psa_class_attrs_raw({});\n    if __psa_dict_find(__d{}, name) >= 0 {{ return __psa_dict_get(__d{}, name); }};\n",
+            aid, aid, aid, aid
         ));
     }
     t.push_str("    panic(77069);\n}\n");
+    t
+}
+
+/// D4 generated text: the class-attribute registry root and
+/// per-class dict accessor, plus the program-start seed that
+/// writes every class's own literal attributes into its
+/// dict. The registry root is a tag-4 list (indexed by class
+/// id) whose box pointer lives in the sa_std globals cell
+/// "psa.clsattrs" (the mutable-global shape proven by
+/// probe_globals); each slot holds that class's tag-5 dict.
+fn gen_class_registry(em: &Emitter) -> String {
+    let mut t = String::new();
+    t.push_str("fn __psa_clsreg() -> PsaVal {\n    let out = [0u64; 1];\n    let rc = sa_global_u64_get(STR_PTR(\"psa.clsattrs\"), STR_LEN(\"psa.clsattrs\"), &out[0]);\n    if rc == 0 { return PsaVal { tag: 4, ipay: out[0] as i64, fpay: 0.0 }; };\n    let reg = __psa_list_new();\n    let already = [0u64; 1];\n    let rc2 = sa_global_u64_set_once(STR_PTR(\"psa.clsattrs\"), STR_LEN(\"psa.clsattrs\"), reg.ipay as u64, &already[0]);\n    if rc2 == 0 {\n        if already[0] == 0 { return reg; };\n    };\n    let out2 = [0u64; 1];\n    let rc3 = sa_global_u64_get(STR_PTR(\"psa.clsattrs\"), STR_LEN(\"psa.clsattrs\"), &out2[0]);\n    if rc3 != 0 { return reg; };\n    return PsaVal { tag: 4, ipay: out2[0] as i64, fpay: 0.0 };\n}\n");
+    t.push_str("fn __psa_class_attrs_raw(cid: i64) -> PsaVal {\n    let reg = __psa_clsreg();\n    while __psa_vec_len_h(reg.ipay as ptr) <= cid { __psa_list_push(reg, PsaVal { tag: 3, ipay: 0, fpay: 0.0 }); }\n    let slot = __psa_vec_get_h(reg.ipay as ptr, cid);\n    if slot.tag == 3 {\n        let d = __psa_dict_new();\n        __psa_vec_set_h(reg.ipay as ptr, cid, d);\n        return d;\n    };\n    return slot;\n}\n");
+    t.push_str("fn __psa_class_attrs_seed() {\n");
+    for ci in &em.classes {
+        if ci.attrs.is_empty() {
+            continue;
+        }
+        t.push_str(&format!(
+            "    let __sd{} = __psa_class_attrs_raw({});\n",
+            ci.id, ci.id
+        ));
+        for (i, (aname, ae)) in ci.attrs.iter().enumerate() {
+            t.push_str(&sla_str_build(&format!("sk_{}_{}", ci.id, i), aname));
+            if let Expr::Str(s) = ae {
+                t.push_str(&sla_str_build(&format!("sv_{}_{}", ci.id, i), s));
+            }
+            let rc = match ae {
+                Expr::Int(v) => format!("__psa_box_int({})", v),
+                Expr::Float(v) => format!("__psa_box_float({})", fmt_f64(*v)),
+                Expr::Bool(b) => format!("__psa_box_bool({})", b),
+                Expr::Str(_) => format!("sv_{}_{}", ci.id, i),
+                _ => Ty::Dyn.default_lit().to_string(),
+            };
+            t.push_str(&format!(
+                "    __psa_dict_set(__sd{}, sk_{}_{}, {});\n",
+                ci.id, ci.id, i, rc
+            ));
+        }
+    }
+    t.push_str("}\n");
     t
 }
 
@@ -765,6 +836,10 @@ fn gen_obj_machinery(em: &Emitter) -> String {
     t.push_str("    panic(77069);\n}\n");
     for ci in &em.classes {
         t.push_str(&gen_class_getattr(em, ci));
+        t.push_str(&gen_class_cgetattr(ci));
+    }
+    if !em.classes.is_empty() {
+        t.push_str(&gen_class_registry(em));
     }
     // The default object string: `<Name object>` (no address --
     // CPython's address form is non-deterministic).
@@ -1358,7 +1433,7 @@ fn build_class_registry(em: &mut Emitter, prog: &Program) -> Result<(), String> 
                     return Err(eerr(
                         c.line,
                         &format!(
-                            "class attribute `{}` of class `{}` must be a literal in D4 v1 (computed class attributes wait for the runtime-registry shape; see D4-NOTES)",
+                            "class attribute `{}` of class `{}` must be a scalar literal in v1 (the runtime registry stores literals; computed class attributes are refused)",
                             an, c.name
                         ),
                     ))
@@ -1406,7 +1481,7 @@ fn build_class_registry(em: &mut Emitter, prog: &Program) -> Result<(), String> 
             }
         }
         em.class_ids.insert(c.name.clone(), em.classes.len());
-        em.classes.push(ClassInfo { id, name: c.name.clone(), flat_methods, flat_attrs, ancestors });
+        em.classes.push(ClassInfo { id, name: c.name.clone(), flat_methods, flat_attrs, attrs: c.attrs.clone(), ancestors });
     }
     Ok(())
 }
@@ -4667,19 +4742,50 @@ impl Emitter {
                 Ok(())
             }
             Stmt::AttrAssign { base, name, op, value, line } => {
-                // Class-side attribute assignment is refused in
-                // D4 v1: the fallback class-attribute shape is
-                // read-only literals (the mutable registry waits
-                // for the global probe; see D4-NOTES).
+                // Class-side attribute assignment writes the
+                // class's own runtime-registry dict (CPython:
+                // visible to the class, its subclasses and
+                // every instance that does not shadow it).
                 if let Expr::Name(n) = base {
-                    if ctx.lookup(n).is_none() && self.class_ids.contains_key(n) {
-                        return Err(eerr(
-                            *line,
-                            &format!(
-                                "assigning class attribute `{}.{}` is not supported yet (class attributes are read-only literals in D4 v1; the mutable registry shape is pending a probe)",
-                                n, name
-                            ),
-                        ));
+                    if ctx.lookup(n).is_none() {
+                        if let Some(&cid) = self.class_ids.get(n) {
+                            self.used_dyn = true;
+                            let ntmp = self.emit_str_temp(ctx, name, *line)?;
+                            let (mut vcode, vty) = if let Expr::Str(s) = value {
+                                (self.emit_str_temp(ctx, s, *line)?, Ty::Dyn)
+                            } else if matches!(value, Expr::ListLit(_) | Expr::DictLit(_)) {
+                                (self.emit_container_temp(ctx, value, *line)?, Ty::Dyn)
+                            } else {
+                                self.emit_expr(ctx, value, *line)?
+                            };
+                            if vty != Ty::Dyn {
+                                vcode = self.box_code(vcode, vty, *line)?;
+                            }
+                            let d = format!("__psa_class_attrs_raw({})", cid);
+                            match op {
+                                None => ctx.line(&format!(
+                                    "__psa_dict_set({}, {}, {});",
+                                    d, ntmp, vcode
+                                )),
+                                Some(bop) => {
+                                    let place =
+                                        format!("__psa_class_{}_cgetattr({})", cid, ntmp);
+                                    let (code, _) = self.emit_binop(
+                                        place,
+                                        Ty::Dyn,
+                                        *bop,
+                                        vcode,
+                                        Ty::Dyn,
+                                        *line,
+                                    )?;
+                                    ctx.line(&format!(
+                                        "__psa_dict_set({}, {}, {});",
+                                        d, ntmp, code
+                                    ));
+                                }
+                            }
+                            return Ok(());
+                        }
                     }
                 }
                 let (bcode, bty) = self.emit_expr(ctx, base, *line)?;
@@ -4716,15 +4822,28 @@ impl Emitter {
                 Ok(())
             }
             Stmt::AttrDel { base, name, line } => {
+                // Class-side deletion removes the name from
+                // the class's OWN registry dict only (CPython);
+                // a name that lives on an ancestor is not
+                // deleted through the subclass.
                 if let Expr::Name(n) = base {
-                    if ctx.lookup(n).is_none() && self.class_ids.contains_key(n) {
-                        return Err(eerr(
-                            *line,
-                            &format!(
-                                "deleting class attribute `{}.{}` is not supported (class attributes are read-only in D4 v1)",
-                                n, name
-                            ),
-                        ));
+                    if ctx.lookup(n).is_none() {
+                        if let Some(&cid) = self.class_ids.get(n) {
+                            self.used_dyn = true;
+                            let ntmp = self.emit_str_temp(ctx, name, *line)?;
+                            let d = format!("__dcl_{}", ctx.tmp + 1);
+                            ctx.tmp += 1;
+                            ctx.line(&format!(
+                                "let {} = __psa_class_attrs_raw({});",
+                                d, cid
+                            ));
+                            ctx.line(&format!(
+                                "if __psa_dict_find({}, {}) < 0 {{ panic(77069); }};",
+                                d, ntmp
+                            ));
+                            ctx.line(&format!("__psa_dict_del({}, {});", d, ntmp));
+                            return Ok(());
+                        }
                     }
                 }
                 let (bcode, bty) = self.emit_expr(ctx, base, *line)?;
@@ -5801,47 +5920,36 @@ impl Emitter {
                     }
                 }
                 // Class-side attribute read: `ClassName.attr`
-                // where the name is a class, not a variable. In
-                // the D4 v1 fallback shape the (literal) value is
-                // evaluated at the read site.
+                // where the name is a class, not a variable.
+                // The value lives in the class's runtime
+                // registry dict (seeded at program start,
+                // mutable at runtime), so the read walks the
+                // ancestor dicts; a name created by assignment
+                // at runtime is found the same way. Method
+                // names stay an emit error (a method is not a
+                // value on the class side in v1).
                 if let Expr::Name(n) = &**base {
                     if ctx.lookup(n).is_none() {
                         if let Some(&cid) = self.class_ids.get(n) {
-                            let found: Option<Expr> = self.classes[cid]
-                                .flat_attrs
+                            if self.classes[cid]
+                                .flat_methods
                                 .iter()
-                                .find(|(an, _)| an == name)
-                                .map(|(_, ae)| ae.clone());
-                            match found {
-                                Some(Expr::Int(v)) => {
-                                    self.used_dyn = true;
-                                    return Ok((format!("__psa_box_int({})", v), Ty::Dyn));
-                                }
-                                Some(Expr::Float(v)) => {
-                                    self.used_dyn = true;
-                                    return Ok((format!("__psa_box_float({})", fmt_f64(v)), Ty::Dyn));
-                                }
-                                Some(Expr::Bool(b)) => {
-                                    self.used_dyn = true;
-                                    return Ok((format!("__psa_box_bool({})", b), Ty::Dyn));
-                                }
-                                Some(Expr::Str(s)) => {
-                                    let t = self.emit_str_temp(ctx, &s, line)?;
-                                    return Ok((t, Ty::Dyn));
-                                }
-                                Some(_) => {
-                                    return Ok((Ty::Dyn.default_lit().to_string(), Ty::Dyn));
-                                }
-                                None => {
-                                    return Err(eerr(
-                                        line,
-                                        &format!(
-                                            "class `{}` has no attribute `{}` readable as a value in D4 v1 (methods are reached through instances or explicit base calls)",
-                                            n, name
-                                        ),
-                                    ))
-                                }
+                                .any(|(mn, _)| mn == name)
+                            {
+                                return Err(eerr(
+                                    line,
+                                    &format!(
+                                        "class `{}` has no attribute `{}` readable as a value in D4 v1 (methods are reached through instances or explicit base calls)",
+                                        n, name
+                                    ),
+                                ));
                             }
+                            self.used_dyn = true;
+                            let ntmp = self.emit_str_temp(ctx, name, line)?;
+                            return Ok((
+                                format!("__psa_class_{}_cgetattr({})", cid, ntmp),
+                                Ty::Dyn,
+                            ));
                         }
                     }
                 }
@@ -6158,6 +6266,40 @@ impl Emitter {
                         };
                     }
                 }
+                // psa_std: `json.dumps(v)` / `json.loads(s)`
+                // with `import json` bound to the standard
+                // library call the spliced module's SLA entry
+                // points directly (one dynamic argument each).
+                // The parser makes these MethodCall nodes, not
+                // Call(Attr), so the intercept lives here.
+                if self.std_json && obj == "json" && ctx.lookup(obj).is_none() {
+                    let sla_fn = match method.as_str() {
+                        "dumps" => "psa_json_dumps",
+                        "loads" => "psa_json_parse",
+                        _ => {
+                            return Err(eerr(
+                                line,
+                                &format!(
+                                    "psa_std module `json` has no function `{}` in v1 (dumps / loads)",
+                                    method
+                                ),
+                            ))
+                        }
+                    };
+                    if args.len() != 1 {
+                        return Err(eerr(
+                            line,
+                            &format!(
+                                "json.{} takes exactly one positional argument in v1",
+                                method
+                            ),
+                        ));
+                    }
+                    let acode = self.emit_dyn_value(ctx, &args[0], line)?;
+                    self.used_dyn = true;
+                    self.used_psa_json = true;
+                    return Ok((format!("{}({})", sla_fn, acode), Ty::Dyn));
+                }
                 // D6: a method call on an imported module:
                 // `foo.bar(...)` is a call of the module def
                 // `foo.bar`; `foo.Klass(...)` constructs a
@@ -6296,6 +6438,44 @@ impl Emitter {
                 }
             }
             Expr::Call(callee, args, kwargs) => {
+                // psa_std: `json.dumps(v)` / `json.loads(s)`
+                // with `import json` bound to the standard
+                // library call the spliced module's SLA entry
+                // points directly (one dynamic argument each).
+                if self.std_json {
+                    if let Expr::Attr(base, mname) = &**callee {
+                        if let Expr::Name(n) = &**base {
+                            if n == "json" && ctx.lookup(n).is_none() {
+                                let sla_fn = match mname.as_str() {
+                                    "dumps" => "psa_json_dumps",
+                                    "loads" => "psa_json_parse",
+                                    _ => {
+                                        return Err(eerr(
+                                            line,
+                                            &format!(
+                                                "psa_std module `json` has no function `{}` in v1 (dumps / loads)",
+                                                mname
+                                            ),
+                                        ))
+                                    }
+                                };
+                                if args.len() != 1 || !kwargs.is_empty() {
+                                    return Err(eerr(
+                                        line,
+                                        &format!(
+                                            "json.{} takes exactly one positional argument in v1",
+                                            mname
+                                        ),
+                                    ));
+                                }
+                                let acode = self.emit_dyn_value(ctx, &args[0], line)?;
+                                self.used_dyn = true;
+                                self.used_psa_json = true;
+                                return Ok((format!("{}({})", sla_fn, acode), Ty::Dyn));
+                            }
+                        }
+                    }
+                }
                 // D6: a call through an attribute chain rooted
                 // at an imported module: `foo.bar.baz(...)` (a
                 // def of a dotted module) or `foo.bar.Klass(...)`
@@ -7860,6 +8040,10 @@ fn fmt_f64(v: f64) -> String {
 /// aggregate variable (RegisterRedefinition) nor retire a
 /// block-scoped aggregate local (MemoryLeak) — upstream defect
 /// candidate (xxvii), evidence probes q1-q29 in the sapy workdir.
+/// psa_std json module text (psa-std/json.sla in the repo),
+/// spliced into programs that call json.dumps / json.loads.
+const PSA_JSON_SLA: &str = include_str!("../../../psa-std/json.sla");
+
 const DYN_RUNTIME: &str = r#"fn __psa_box_int(x: i64) -> PsaVal {
     return PsaVal { tag: 0, ipay: x, fpay: 0.0 };
 }
