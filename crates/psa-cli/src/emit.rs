@@ -506,9 +506,24 @@ impl Emitter {
         txt.push_str(&format!(") -> {} {{\n", ret_ty.sla()));
         txt.push_str(&ctx.prologue);
         txt.push_str(&ctx.out);
-        // Default fallthrough return (unreachable when the body always
-        // returns; the SLA checker accepts it either way).
-        txt.push_str(&format!("    return {};\n}}\n", ret_ty.default_lit()));
+        // Default fallthrough return, appended only when the body's
+        // last top-level statement is not already a return. A second,
+        // dead return after a live one is accepted by the SLA checker
+        // but the SA-text flattener rejects its expansion: the dead
+        // block materialises the return temp and then falls through
+        // with no terminator (error[FallthroughForbidden], fib/list/
+        // dyn1 on the text route, 2026-11-25).
+        let last_is_return = ctx
+            .out
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .map(|l| l.starts_with("    return "))
+            .unwrap_or(false);
+        if !last_is_return {
+            txt.push_str(&format!("    return {};\n", ret_ty.default_lit()));
+        }
+        txt.push_str("}\n");
         if !self.emitted_set.contains(&name.to_string()) {
             self.emitted_set.push(name.to_string());
             self.emitted.push(txt);
