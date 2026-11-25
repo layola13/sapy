@@ -290,8 +290,11 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
 
     let mut out = String::new();
     out.push_str("@import \"sa_std/io/print.sai\"\n@import \"sa_std/fmt.sai\"\n");
-    if em.used_vec {
+    if em.used_vec || em.used_dyn {
         out.push_str("@import \"sa_std/vec.sa\"\n");
+    }
+    if em.used_dyn {
+        out.push_str("@import \"sa_std/core/box.sa\"\n");
     }
     if em.used_math || em.used_dyn {
         out.push_str("@import \"sa_std/math.sai\"\n");
@@ -324,6 +327,16 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
     }
     out.push_str(&main_txt);
     Ok(out)
+}
+
+/// A list literal's emission plan: a monomorphic static Vec, or a
+/// dynamic (tagged) heap list when the elements are dynamic, of
+/// mixed scalar types, floats (Vec<f64> is miscompiled upstream,
+/// defect (xxiv); the tagged payload carries f64 exactly), or the
+/// literal is empty (no static element type to infer).
+enum ListLit {
+    Static(Ty, Vec<String>),
+    Dyn(Vec<String>),
 }
 
 impl Emitter {
@@ -651,59 +664,75 @@ impl Emitter {
     }
 
     /// Type-check a list literal's elements and emit their codes.
-    /// Returns the list type and one code string per element. Element
-    /// types must agree on one scalar type (int/float/bool in v0.3;
-    /// string elements are heap values and stay out of scope).
+    /// Homogeneous int/bool literals stay monomorphic static Vecs;
+    /// dynamic elements, mixed scalar element types, float elements
+    /// and the empty literal become dynamic heap lists (D2): every
+    /// element code is boxed to a PsaVal. String elements are heap
+    /// values whose dynamic kind lands later in D2 and stay refused.
     fn emit_list_literal(
         &mut self,
         ctx: &mut Ctx,
         elems: &[Expr],
         line: u32,
-    ) -> Result<(Ty, Vec<String>), String> {
-        if elems.is_empty() {
-            return Err(eerr(
-                line,
-                "cannot infer the element type of an empty list literal in v0.3; bind a non-empty list first",
-            ));
-        }
+    ) -> Result<ListLit, String> {
         let mut codes = Vec::new();
-        let mut elem_ty: Option<Ty> = None;
+        let mut tys = Vec::new();
         for e in elems {
             let (code, ty) = self.emit_expr(ctx, e, line)?;
-            match elem_ty {
-                None => {
-                    if ty == Ty::Float {
-                        return Err(eerr(
-                            line,
-                            "list[float] is blocked in v0.3: Vec<f64> element access is miscompiled on both sla routes (hand-written SLA probes independent of psa read pushed f64 elements back wrong on the Rust route and the Zig route alike) — psa refuses to emit silently wrong programs (upstream defect (xxiv), see README)",
-                        ));
-                    }
-                    if Ty::list_of(ty).is_none() {
-                        return Err(eerr(
-                            line,
-                            &format!(
-                                "list elements of type {:?} are not supported in v0.3 (scalar int/float/bool elements only)",
-                                ty
-                            ),
-                        ));
-                    }
-                    elem_ty = Some(ty);
-                }
-                Some(want) => {
-                    if ty != want {
-                        return Err(eerr(
-                            line,
-                            &format!(
-                                "list literal mixes element types {:?} and {:?} (one element type per list)",
-                                want, ty
-                            ),
-                        ));
-                    }
-                }
-            }
             codes.push(code);
+            tys.push(ty);
         }
-        Ok((Ty::list_of(elem_ty.unwrap()).unwrap(), codes))
+        let dyn_list = tys.is_empty()
+            || tys.iter().any(|t| *t == Ty::Dyn || *t == Ty::Float)
+            || tys.iter().any(|t| *t != tys[0]);
+        if dyn_list {
+            if tys.iter().any(|t| !matches!(t, Ty::Int | Ty::Float | Ty::Bool | Ty::Dyn)) {
+                return Err(eerr(
+                    line,
+                    "list elements that are strings or containers cannot become dynamic values yet (the string/container dynamic kinds land later in D2)",
+                ));
+            }
+            self.used_dyn = true;
+            let mut boxed = Vec::new();
+            for (code, ty) in codes.into_iter().zip(tys.iter()) {
+                boxed.push(match ty {
+                    Ty::Dyn => code,
+                    t => self.box_code(code, *t, line)?,
+                });
+            }
+            return Ok(ListLit::Dyn(boxed));
+        }
+        let elem_ty = tys[0];
+        if Ty::list_of(elem_ty).is_none() {
+            return Err(eerr(
+                line,
+                &format!(
+                    "list elements of type {:?} are not supported (scalar int/bool elements, or a dynamic list)",
+                    elem_ty
+                ),
+            ));
+        }
+        Ok(ListLit::Static(Ty::list_of(elem_ty).unwrap(), codes))
+    }
+
+    /// Emit the construction of a dynamic heap list bound to `name`:
+    /// a fresh handle plus one runtime push per element code.
+    fn emit_dyn_list_construct(
+        &mut self,
+        ctx: &mut Ctx,
+        name: &str,
+        codes: &[String],
+        declare: bool,
+    ) {
+        self.used_dyn = true;
+        if declare {
+            ctx.line(&format!("let {} = __psa_list_new();", name));
+        } else {
+            ctx.line(&format!("{} = __psa_list_new();", name));
+        }
+        for code in codes {
+            ctx.line(&format!("__psa_list_push({}, {});", name, code));
+        }
     }
 
     /// Emit `let <name>: Vec<T> = Vec::new();` (or a plain assignment
@@ -734,27 +763,52 @@ impl Emitter {
         elems: &[Expr],
         line: u32,
     ) -> Result<(), String> {
-        let (list_ty, codes) = self.emit_list_literal(ctx, elems, line)?;
-        match ctx.lookup(name) {
-            None => {
-                ctx.declare(name, list_ty).map_err(|m| eerr(line, &m))?;
-                self.emit_list_construct(ctx, name, list_ty, &codes, true);
-                Ok(())
-            }
-            Some(existing) if existing == list_ty => {
-                self.emit_list_construct(ctx, name, list_ty, &codes, false);
-                ctx.revive(name);
-                Ok(())
-            }
-            Some(other) => Err(eerr(
-                line,
-                &format!(
-                    "variable `{}` changes type from {} to {}",
-                    name,
-                    other.py_name(),
-                    list_ty.py_name()
-                ),
-            )),
+        match self.emit_list_literal(ctx, elems, line)? {
+            ListLit::Dyn(codes) => match ctx.lookup(name) {
+                None => {
+                    ctx.declare(name, Ty::Dyn).map_err(|m| eerr(line, &m))?;
+                    self.emit_dyn_list_construct(ctx, name, &codes, true);
+                    Ok(())
+                }
+                Some(Ty::Dyn) => {
+                    ctx.tmp += 1;
+                    let tmp = format!("__psa_ltmp_{}", ctx.tmp);
+                    ctx.declare(&tmp, Ty::Dyn).map_err(|m| eerr(line, &m))?;
+                    self.emit_dyn_list_construct(ctx, &tmp, &codes, true);
+                    self.emit_dyn_store(ctx, name, &tmp)?;
+                    ctx.revive(name);
+                    Ok(())
+                }
+                Some(other) => Err(eerr(
+                    line,
+                    &format!(
+                        "variable `{}` changes type from {} to a dynamic list",
+                        name,
+                        other.py_name()
+                    ),
+                )),
+            },
+            ListLit::Static(list_ty, codes) => match ctx.lookup(name) {
+                None => {
+                    ctx.declare(name, list_ty).map_err(|m| eerr(line, &m))?;
+                    self.emit_list_construct(ctx, name, list_ty, &codes, true);
+                    Ok(())
+                }
+                Some(existing) if existing == list_ty => {
+                    self.emit_list_construct(ctx, name, list_ty, &codes, false);
+                    ctx.revive(name);
+                    Ok(())
+                }
+                Some(other) => Err(eerr(
+                    line,
+                    &format!(
+                        "variable `{}` changes type from {} to {}",
+                        name,
+                        other.py_name(),
+                        list_ty.py_name()
+                    ),
+                )),
+            },
         }
     }
 
@@ -794,12 +848,22 @@ impl Emitter {
                     }
                     Some(Expr::ListLit(elems)) => {
                         // Build the list in a temp, then return it (move).
-                        let (list_ty, codes) = self.emit_list_literal(ctx, elems, *line)?;
-                        ctx.tmp += 1;
-                        let tmp = format!("__psa_ret_{}", ctx.tmp);
-                        self.emit_list_construct(ctx, &tmp, list_ty, &codes, true);
-                        unify_ret(ctx, list_ty, *line)?;
-                        ctx.line(&format!("return {};", tmp));
+                        match self.emit_list_literal(ctx, elems, *line)? {
+                            ListLit::Static(list_ty, codes) => {
+                                ctx.tmp += 1;
+                                let tmp = format!("__psa_ret_{}", ctx.tmp);
+                                self.emit_list_construct(ctx, &tmp, list_ty, &codes, true);
+                                unify_ret(ctx, list_ty, *line)?;
+                                ctx.line(&format!("return {};", tmp));
+                            }
+                            ListLit::Dyn(codes) => {
+                                ctx.tmp += 1;
+                                let tmp = format!("__psa_ret_{}", ctx.tmp);
+                                self.emit_dyn_list_construct(ctx, &tmp, &codes, true);
+                                unify_ret(ctx, Ty::Dyn, *line)?;
+                                ctx.line(&format!("return {};", tmp));
+                            }
+                        }
                     }
                     Some(e) => {
                         if let Expr::Name(n) = e {
@@ -1069,6 +1133,29 @@ impl Emitter {
                 let ty = ctx
                     .lookup(name)
                     .ok_or_else(|| eerr(*line, &format!("index assignment to undefined variable `{}`", name)))?;
+                ctx.check_alive(name, *line)?;
+                let (mut icode, ity) = self.emit_expr(ctx, index, *line)?;
+                if ity == Ty::Dyn {
+                    icode = self.unbox_code(icode, Ty::Int, *line)?;
+                } else if ity != Ty::Int {
+                    return Err(eerr(*line, "list index must be int"));
+                }
+                if ty == Ty::Dyn {
+                    self.used_dyn = true;
+                    let (mut vcode, vty) = self.emit_expr(ctx, value, *line)?;
+                    if vty != Ty::Dyn {
+                        vcode = self.box_code(vcode, vty, *line)?;
+                    }
+                    match op {
+                        None => ctx.line(&format!("__psa_list_set({}, {}, {});", name, icode, vcode)),
+                        Some(bop) => {
+                            let place = format!("__psa_list_get({}, {})", name, icode);
+                            let (code, _) = self.emit_binop(place, Ty::Dyn, *bop, vcode, Ty::Dyn, *line)?;
+                            ctx.line(&format!("__psa_list_set({}, {}, {});", name, icode, code));
+                        }
+                    }
+                    return Ok(());
+                }
                 let elem = match ty.elem() {
                     Some(e) => e,
                     None => {
@@ -1078,13 +1165,6 @@ impl Emitter {
                         ))
                     }
                 };
-                ctx.check_alive(name, *line)?;
-                let (mut icode, ity) = self.emit_expr(ctx, index, *line)?;
-                if ity == Ty::Dyn {
-                    icode = self.unbox_code(icode, Ty::Int, *line)?;
-                } else if ity != Ty::Int {
-                    return Err(eerr(*line, "list index must be int"));
-                }
                 let (mut vcode, vty) = self.emit_expr(ctx, value, *line)?;
                 if vty == Ty::Dyn {
                     vcode = self.unbox_code(vcode, elem, *line)?;
@@ -1433,6 +1513,10 @@ impl Emitter {
             Expr::Float(v) => Ok((fmt_f64(*v), Ty::Float)),
             Expr::Str(s) => Ok((format!("\"{}\"", escape_sla_str(s)), Ty::Str)),
             Expr::Bool(b) => Ok((b.to_string(), Ty::Bool)),
+            Expr::NoneLit => {
+                self.used_dyn = true;
+                Ok((Ty::Dyn.default_lit().to_string(), Ty::Dyn))
+            }
             Expr::Name(n) => {
                 ctx.check_not_deleted(n, line)?;
                 match ctx.lookup(n) {
@@ -1460,6 +1544,20 @@ impl Emitter {
                 let ty = ctx
                     .lookup(&obj)
                     .ok_or_else(|| eerr(line, &format!("undefined variable `{}`", obj)))?;
+                ctx.check_alive(&obj, line)?;
+                let (mut icode, ity) = self.emit_expr(ctx, idx, line)?;
+                if ity == Ty::Dyn {
+                    icode = self.unbox_code(icode, Ty::Int, line)?;
+                } else if ity != Ty::Int {
+                    return Err(eerr(line, "list index must be int"));
+                }
+                if ty == Ty::Dyn {
+                    // Dynamic subscript: the runtime checks the kind
+                    // (list), normalises negative indices and bounds
+                    // (panic 77050/77052).
+                    self.used_dyn = true;
+                    return Ok((format!("__psa_list_get({}, {})", obj, icode), Ty::Dyn));
+                }
                 let elem = match ty.elem() {
                     Some(e) => e,
                     None => {
@@ -1469,13 +1567,6 @@ impl Emitter {
                         ))
                     }
                 };
-                ctx.check_alive(&obj, line)?;
-                let (mut icode, ity) = self.emit_expr(ctx, idx, line)?;
-                if ity == Ty::Dyn {
-                    icode = self.unbox_code(icode, Ty::Int, line)?;
-                } else if ity != Ty::Int {
-                    return Err(eerr(line, "list index must be int"));
-                }
                 // Scalar element: copied out of the borrow (spec s5).
                 Ok((format!("{}[{}]", obj, icode), elem))
             }
@@ -1483,22 +1574,36 @@ impl Emitter {
                 let ty = ctx
                     .lookup(obj)
                     .ok_or_else(|| eerr(line, &format!("undefined variable `{}`", obj)))?;
-                let elem = match ty.elem() {
-                    Some(e) if method == "append" => e,
-                    _ => {
-                        return Err(eerr(
-                            line,
-                            &format!(
-                                "method `{}` is not supported in v0.3 (only list.append)",
-                                method
-                            ),
-                        ))
-                    }
-                };
+                if method != "append" {
+                    return Err(eerr(
+                        line,
+                        &format!(
+                            "method `{}` is not supported (only list.append)",
+                            method
+                        ),
+                    ));
+                }
                 ctx.check_alive(obj, line)?;
                 if args.len() != 1 {
                     return Err(eerr(line, "append takes exactly one argument"));
                 }
+                if ty == Ty::Dyn {
+                    let (mut acode, aty) = self.emit_expr(ctx, &args[0], line)?;
+                    if aty != Ty::Dyn {
+                        acode = self.box_code(acode, aty, line)?;
+                    }
+                    self.used_dyn = true;
+                    return Ok((format!("__psa_list_push({}, {})", obj, acode), Ty::Void));
+                }
+                let elem = match ty.elem() {
+                    Some(e) => e,
+                    _ => {
+                        return Err(eerr(
+                            line,
+                            &format!("append is only supported on lists, not on {}", ty.py_name()),
+                        ))
+                    }
+                };
                 let (mut acode, aty) = self.emit_expr(ctx, &args[0], line)?;
                 if aty == Ty::Dyn {
                     acode = self.unbox_code(acode, elem, line)?;
@@ -1571,6 +1676,10 @@ impl Emitter {
                         return Err(eerr(line, "len() takes exactly one argument"));
                     }
                     let (c, t) = self.emit_expr(ctx, &args[0], line)?;
+                    if t == Ty::Dyn {
+                        self.used_dyn = true;
+                        return Ok((format!("__psa_dyn_len({})", c), Ty::Int));
+                    }
                     if !t.is_list() {
                         return Err(eerr(line, "len() is only supported on lists in v0.3"));
                     }
@@ -2489,6 +2598,7 @@ fn __psa_dyn_pow(a: PsaVal, b: PsaVal) -> PsaVal {
 }
 
 fn __psa_dyn_eq(a: PsaVal, b: PsaVal) -> bool {
+    if a.tag == 4 && b.tag == 4 { return __psa_list_eq(a, b); };
     if a.tag == 3 && b.tag == 3 { return true; };
     if a.tag <= 2 && b.tag <= 2 {
         if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) == __psa_as_float(b); };
@@ -2538,6 +2648,7 @@ fn __psa_dyn_truthy(v: PsaVal) -> bool {
     if v.tag == 1 { return v.fpay != 0.0; };
     if v.tag == 2 { return v.ipay != 0; };
     if v.tag == 3 { return false; };
+    if v.tag == 4 { return __psa_list_len(v) != 0; };
     panic(77010);
 }
 
@@ -2601,6 +2712,7 @@ fn __psa_unbox_bool(v: PsaVal) -> bool {
 }
 
 fn __psa_print_dyn(v: PsaVal) -> i32 {
+    if v.tag == 4 { panic(77051); };
     if v.tag == 0 { println("{}", v.ipay); return 0; };
     if v.tag == 2 {
         if v.ipay != 0 { println("True"); } else { println("False"); };
@@ -2608,6 +2720,83 @@ fn __psa_print_dyn(v: PsaVal) -> i32 {
     };
     if v.tag == 3 { println("None"); return 0; };
     panic(77030);
+}
+
+fn __psa_vec_push_h(p: ptr, x: PsaVal) {
+    let b = unsafe { Box::from_raw(p as *Vec<PsaVal>) };
+    (*b).push(x);
+    let rp: i64 = Box::into_raw(b) as i64;
+}
+
+fn __psa_vec_get_h(p: ptr, i: i64) -> PsaVal {
+    let b = unsafe { Box::from_raw(p as *Vec<PsaVal>) };
+    let v = (*b)[i];
+    let rp: i64 = Box::into_raw(b) as i64;
+    return v;
+}
+
+fn __psa_vec_set_h(p: ptr, i: i64, x: PsaVal) {
+    let b = unsafe { Box::from_raw(p as *Vec<PsaVal>) };
+    (*b)[i] = x;
+    let rp: i64 = Box::into_raw(b) as i64;
+}
+
+fn __psa_vec_len_h(p: ptr) -> i64 {
+    let b = unsafe { Box::from_raw(p as *Vec<PsaVal>) };
+    let n = (*b).len() as i64;
+    let rp: i64 = Box::into_raw(b) as i64;
+    return n;
+}
+
+fn __psa_list_new() -> PsaVal {
+    let xs: Vec<PsaVal> = Vec::new();
+    return PsaVal { tag: 4, ipay: Box::into_raw(Box::new(xs)) as i64, fpay: 0.0 };
+}
+
+fn __psa_list_len(v: PsaVal) -> i64 {
+    if v.tag != 4 { panic(77052); };
+    return __psa_vec_len_h(v.ipay as ptr);
+}
+
+fn __psa_list_norm(v: PsaVal, i: i64) -> i64 {
+    let n = __psa_list_len(v);
+    let j = i;
+    if j < 0 { j = j + n; };
+    if j < 0 || j >= n { panic(77050); };
+    return j;
+}
+
+fn __psa_list_get(v: PsaVal, i: i64) -> PsaVal {
+    if v.tag != 4 { panic(77052); };
+    let j = __psa_list_norm(v, i);
+    return __psa_vec_get_h(v.ipay as ptr, j);
+}
+
+fn __psa_list_set(v: PsaVal, i: i64, x: PsaVal) {
+    if v.tag != 4 { panic(77052); };
+    let j = __psa_list_norm(v, i);
+    __psa_vec_set_h(v.ipay as ptr, j, x);
+}
+
+fn __psa_list_push(v: PsaVal, x: PsaVal) {
+    if v.tag != 4 { panic(77052); };
+    __psa_vec_push_h(v.ipay as ptr, x);
+}
+
+fn __psa_list_eq(a: PsaVal, b: PsaVal) -> bool {
+    let n = __psa_list_len(a);
+    if n != __psa_list_len(b) { return false; };
+    let i: i64 = 0;
+    while i < n {
+        if !(__psa_dyn_eq(__psa_list_get(a, i), __psa_list_get(b, i))) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn __psa_dyn_len(v: PsaVal) -> i64 {
+    if v.tag == 4 { return __psa_list_len(v); };
+    panic(77052);
 }
 
 "#;

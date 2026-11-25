@@ -34,7 +34,7 @@ fn main() {
             }
         }
         "version" | "--version" | "-V" => {
-            println!("psa 0.6.0 (sapy v0.6, D1 + frontend gaps cleared)");
+            println!("psa 0.7.0 (sapy v0.7, D2 slice A: dynamic lists)");
         }
         "help" | "--help" | "-h" => usage(),
         other => {

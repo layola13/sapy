@@ -703,6 +703,7 @@ impl Parser {
             }
             Tok::True => Ok(Expr::Bool(true)),
             Tok::False => Ok(Expr::Bool(false)),
+            Tok::NoneLit => Ok(Expr::NoneLit),
             Tok::Ident(n) => Ok(Expr::Name(n)),
             Tok::LParen => {
                 let e = self.parse_expr()?;
@@ -754,7 +755,7 @@ fn aug_op(t: &Tok) -> Option<BinOp> {
 /// chained comparisons, which duplicate their middle operands).
 fn duplicable(e: &Expr) -> bool {
     match e {
-        Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Name(_) => true,
+        Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::NoneLit | Expr::Name(_) => true,
         Expr::Index(a, b) => duplicable(a) && duplicable(b),
         Expr::Bin(a, _, b) => duplicable(a) && duplicable(b),
         Expr::Unary(_, a) => duplicable(a),

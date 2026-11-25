@@ -1,0 +1,19 @@
+xs = [1, 2.5, True, None]
+print(len(xs))
+print(xs[0])
+print(xs[-1])
+xs.append(10)
+print(len(xs))
+print(xs[4])
+xs[1] = 7
+print(xs[1])
+ys = [1, 2.5, 3]
+zs = [1, 2.5, 3]
+print(ys == zs)
+print(ys == xs)
+if xs:
+    print(111)
+e = []
+print(len(e))
+if e:
+    print(222)

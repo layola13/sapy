@@ -36,6 +36,7 @@ pub enum Tok {
     Not,
     True,
     False,
+    NoneLit,
     // symbols
     LParen,
     RParen,
@@ -343,6 +344,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                         "not" => Tok::Not,
                         "True" => Tok::True,
                         "False" => Tok::False,
+                        "None" => Tok::NoneLit,
                         _ => Tok::Ident(word.to_string()),
                     };
                     out.push(Token { tok, line: tok_line });
