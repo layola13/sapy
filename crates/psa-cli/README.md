@@ -1,4 +1,4 @@
-# psa — the SA-Py compiler (v0.3)
+# psa — the SA-Py compiler (v0.5)
 
 `psa` compiles `.psa` source (a Python-syntax subset) to native
 executables: `.psa` → psa frontend (lexer / parser / type inference) →
@@ -75,6 +75,29 @@ Everything else is a **loud compile error**, never a silent fallback.
   `examples/d0.psa` runs end-to-end and its output matches CPython
   byte for byte.
 
+- D1 (v0.5, the scalar dynamic layer): a variable or function whose
+  type cannot be pinned to one scalar — mixed return branches, a
+  conditional expression with mixed scalar branches, a `None`
+  return next to a value return — becomes **dynamic**: its value is
+  a tagged `PsaVal` (int / float / bool / None) and operations
+  dispatch through a small runtime with Python semantics (true
+  division always float, floor division/modulo follow Python sign
+  rules, cross-kind numeric comparison, operand-returning
+  short-circuit `and`/`or`, truthiness). Static and dynamic values
+  coexist per-variable: static values box at dynamic boundaries,
+  dynamic values unbox at static boundaries with a runtime kind
+  check (a failed unbox is a loud panic, psa's TypeError surface —
+  the static boundary is deliberately stricter than CPython).
+  A dynamic value prints on its own line (int/bool/None; a float
+  dynamic print is blocked by defect (xxiii) below and panics
+  loudly rather than display a wrong value). A variable's type is
+  still pinned by its first binding: a statically inferred variable
+  cannot become dynamic later (loud error). Heap kinds (str/list/
+  dict values as dynamic citizens) are D2. `examples/dyn1.psa`
+  matches CPython byte for byte; the dynamic-style bench
+  `bench/dynsum.psa` (10^6 dynamic additions) runs 0.12s vs
+  CPython's 0.27s (best of 3).
+
 ## Known upstream defects (found 2026-11-25, each blocks one feature)
 
 **(xxiii) f64 display.** The Rust `sla` **build-exe** route prints
@@ -120,6 +143,28 @@ psa routes such values through a fresh temp before assigning
 (`let t = f(x, ...); x = t;`), which lowers cleanly; the upstream
 direct shape is still defective.
 
+**(xxvii) Aggregate assignment and block-scoped locals in the SAB
+lowering (worked around in psa).** Hand-written SLA probes
+independent of psa (q1–q29, `@derive(copy)` struct and tuple)
+establish four shapes on the Rust build-exe route: (a) a plain
+`let t = v;` *moves* a Copy struct (the checker honours the
+derive, `gen_assign` does not — the same missing-metadata family
+as task 161 item ②); (b) *any* reassignment of an aggregate
+variable — straight-line or in branches — traps
+`RegisterRedefinition` (1006): every aggregate assignment is
+emitted as a fresh register definition; (c) a block-scoped local
+bound to a call result — scalar or aggregate, consumed or not —
+is never retired and traps `MemoryLeak` (1012) at function exit;
+(d) a through-borrow field-write setter leaks its borrow
+parameter at function exit. psa's dynamic layer therefore never
+reassigns a `PsaVal`: stores go through a non-Copy stage struct
+whose scalar fields are copied into the destination and which is
+then moved into a void sink (`__psa_stage_of`/`__psa_drop_stage`,
+probe q28), and dynamic bindings first materialised inside a
+block are hoisted to the function prologue. The upstream shapes
+remain defective; a fix there would let psa simplify back to
+plain assignments.
+
 ## Explicitly not in v0.1 (all loud errors)
 
 Classes, attribute access, dicts/sets, lists of non-scalar elements
@@ -131,5 +176,6 @@ generators, first-class functions, type-changing re-binding,
 `continue` in `for`, non-`range` iteration, float `//` / `%`,
 printing a whole list.
 
-Per the SA-Py whitepaper, dynamic typing is a later phase built on a
-tagged-value runtime; v0.1 is the statically inferable subset only.
+Per the SA-Py whitepaper the dynamic face is a tagged-value
+runtime; D1 (v0.5) landed its scalar layer (see the D1 bullet
+above and DYNAMIC-DESIGN.md). Heap kinds are D2.

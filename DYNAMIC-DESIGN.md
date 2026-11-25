@@ -8,6 +8,13 @@
 - `PsaVal`：显式标签结构体（tag: u8 + payload: u64），不玩 NaN-boxing
   位技巧（与 SA Referee 的指针纪律冲突）。payload：int 存 i64 位、
   float 存 f64 位、bool/none 存小整数、堆对象存指针整数。
+  【D1 落地注记 2026-11-25】sla_std 无 f64 位转换原语，D1 实际布局
+  为分槽 `tag: i64 + ipay: i64 + fpay: f64`（float 走 fpay、其余走
+  ipay），语义与单 payload 等价；堆种类（D2）入场后指针仍走 ipay。
+  另：受上游缺陷 (xxvii)（聚合变量不可重赋值、块作用域聚合局部
+  不退役）约束，dyn 变量的存储一律走 stage 模式（非 Copy 中转结构
+  逐字段拷入 + void 汇点退役，emit_dyn_store），块内首次物化的
+  dyn 绑定提升到函数序言声明；上游修复后可简化回普通赋值。
 - 堆对象统一头：{ rc: u64, kind: u8, ... }，kind = str/list/dict/set/
   tuple/object/function。对象布局用 SLA struct + sa_std 容器实现，
   运行时成模块 `psa_std`（随 sapy 仓维护，与 sla 发射层解耦）。
@@ -55,6 +62,11 @@
 - D0 前端补缺（静态可做，先行）：** 幂、位运算、链式比较、三元、
   f-string、多重赋值脱糖、assert。
 - D1 PsaVal + dyn 算术/比较/真值 + 装箱拆箱 + dyn print（对象打印）。
+  【已落地 2026-11-25，psa v0.5】验收：examples/dyn1.psa 与 CPython
+  逐字节一致；dyn_panic_unbox 响亮 panic 77020；静态面回归
+  hello/fib/loop/list/list_types/d0 全对拍；动态风格 bench
+  dynsum（10^6 次动态加法）0.12s vs CPython 0.27s（best-of-3）。
+  dyn float 打印仍被上游 (xxiii) 堵（响亮 panic 77030，不打印错值）。
 - D2 dyn list/dict/str + 下标/切片 + for 遍历 + in 运算。
 - D3 函数动态面：默认参数、关键字参数、*args/**kwargs、lambda/闭包。
 - D4 class（属性/方法/单继承）+ 属性访问全集。

@@ -1,0 +1,11 @@
+def use_int(n):
+    return n * 2
+
+def pickg(flag):
+    if flag:
+        return 1.5
+    return True
+
+print(use_int(21))
+bad = pickg(True)
+print(use_int(bad))

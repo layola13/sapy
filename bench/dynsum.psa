@@ -1,0 +1,11 @@
+def val(i):
+    if i % 3 == 0:
+        return True
+    return i
+
+total = val(0)
+i = 1
+while i <= 1000000:
+    total += val(i)
+    i += 1
+print(total)

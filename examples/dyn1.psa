@@ -1,0 +1,55 @@
+def pick(flag):
+    if flag:
+        return 41
+    return True
+
+def pickg(flag):
+    if flag:
+        return 1.5
+    return True
+
+def ident(v):
+    return v
+
+def inc(n):
+    return n + 1
+
+def maybe(flag):
+    if flag:
+        return 9
+    return
+
+a = pick(True)
+print(a + 1)
+b = pick(False)
+print(b + 1)
+print(a == 41)
+print(b == 1)
+print(a < b)
+x = (10 if 1 < 2 else False)
+print(x)
+print(x + 5)
+if b:
+    print(7)
+print(inc(10))
+print(inc(a))
+print(ident(a))
+print(ident(3) + 100)
+g = pickg(False)
+print(g + 1)
+h = pickg(True)
+print(h > 1.0)
+print(h + h == 3.0)
+z = maybe(False)
+print(z)
+w = maybe(True)
+print(w + 1)
+print(a and 5)
+print(b or 5)
+print(-b)
+q = a // 2
+print(q)
+r = a % 6
+print(r)
+s = (a > 40) and (b < 2)
+print(s)

@@ -18,6 +18,13 @@ pub enum Ty {
     ListFloat,
     ListBool,
     Void,
+    /// A dynamic (tagged) value: the D1 PsaVal runtime. Arises when
+    /// static inference cannot pin one scalar type (mixed return
+    /// branches, mixed conditional-expression branches, a signature
+    /// first inferred from a dynamic argument). D1 dynamic values are
+    /// the scalar kinds int/float/bool/None; dynamic containers and
+    /// strings arrive in D2.
+    Dyn,
 }
 
 impl Ty {
@@ -31,6 +38,7 @@ impl Ty {
             Ty::ListFloat => "Vec<f64>",
             Ty::ListBool => "Vec<bool>",
             Ty::Void => "i32",
+            Ty::Dyn => "PsaVal",
         }
     }
     fn default_lit(&self) -> &'static str {
@@ -41,7 +49,13 @@ impl Ty {
             Ty::Str => "\"\"",
             Ty::ListInt | Ty::ListFloat | Ty::ListBool => "Vec::new()",
             Ty::Void => "0",
+            // The None value of the dynamic runtime (tag 3).
+            Ty::Dyn => "PsaVal { tag: 3, ipay: 0, fpay: 0.0 }",
         }
+    }
+    /// The scalar kinds a dynamic value can hold in D1.
+    fn is_scalar(&self) -> bool {
+        matches!(self, Ty::Int | Ty::Float | Ty::Bool)
     }
     fn is_list(&self) -> bool {
         matches!(self, Ty::ListInt | Ty::ListFloat | Ty::ListBool)
@@ -70,6 +84,7 @@ impl Ty {
             Ty::ListInt => "list[int]".to_string(),
             Ty::ListFloat => "list[float]".to_string(),
             Ty::ListBool => "list[bool]".to_string(),
+            Ty::Dyn => "dynamic".to_string(),
             other => format!("{:?}", other),
         }
     }
@@ -95,6 +110,7 @@ pub struct Emitter {
     used_vec: bool,
     used_ipow: bool,
     used_math: bool,
+    used_dyn: bool,
 }
 
 struct Ctx {
@@ -103,6 +119,13 @@ struct Ctx {
     ret: Option<Ty>,
     fname: String,
     out: String,
+    /// Function-prologue lines (hoisted declarations). On the Rust
+    /// sla build-exe route a block-scoped aggregate local is never
+    /// retired (hand-written probes q16/q29: MemoryLeak at function
+    /// exit), so a dynamic variable or temp first materialised inside
+    /// a block has its `let` hoisted here, to function scope, and is
+    /// filled in place via the stage pattern (see emit_dyn_store).
+    prologue: String,
     indent: usize,
     tmp: usize,
     borrowed: Vec<String>,
@@ -110,6 +133,9 @@ struct Ctx {
     /// there because their materialised temp would only be computed once,
     /// before the loop, not on every evaluation of the condition.
     in_while_cond: bool,
+    /// True when a prescan of the function body showed its returns
+    /// unify to Dyn: every return value is boxed at emission time.
+    dyn_ret: bool,
 }
 
 impl Ctx {
@@ -165,6 +191,33 @@ impl Ctx {
         self.vars.push((name.to_string(), ty, None));
         Ok(())
     }
+
+    /// Declare `name` in the *function* scope and emit its `let`
+    /// (with the type's default literal) into the prologue, wherever
+    /// the current emission point is. Used for dynamic bindings first
+    /// materialised inside a block: the binding must live at function
+    /// scope for the SAB lowering to retire it (probe q29), while
+    /// Ctx keeps it visible for the rest of the function (Python's
+    /// scoping is function-level anyway).
+    fn hoist_declare(&mut self, name: &str, ty: Ty) {
+        let pos = if self.scopes.len() > 1 {
+            self.scopes[1]
+        } else {
+            self.vars.len()
+        };
+        self.vars.insert(pos, (name.to_string(), ty, None));
+        for mark in self.scopes.iter_mut().skip(1) {
+            if *mark >= pos {
+                *mark += 1;
+            }
+        }
+        self.prologue.push_str(&format!(
+            "    let {}: {} = {};\n",
+            name,
+            ty.sla(),
+            ty.default_lit()
+        ));
+    }
 }
 
 fn eerr(line: u32, msg: &str) -> String {
@@ -183,6 +236,7 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
         used_vec: false,
         used_ipow: false,
         used_math: false,
+        used_dyn: false,
     };
     for f in &prog.funcs {
         if em.defs.insert(f.name.clone(), f.clone()).is_some() {
@@ -197,16 +251,19 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
         ret: Some(Ty::Void),
         fname: "main".to_string(),
         out: String::new(),
+        prologue: String::new(),
         indent: 1,
         tmp: 0,
         borrowed: Vec::new(),
         in_while_cond: false,
+        dyn_ret: false,
     };
     for s in &prog.top {
         em.emit_stmt(&mut main_ctx, s)?;
     }
     main_ctx.line("return 0;");
     let mut main_txt = String::from("fn main() -> i32 {\n");
+    main_txt.push_str(&main_ctx.prologue);
     main_txt.push_str(&main_ctx.out);
     main_txt.push_str("}\n");
 
@@ -215,24 +272,30 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
     if em.used_vec {
         out.push_str("@import \"sa_std/vec.sa\"\n");
     }
-    if em.used_math {
+    if em.used_math || em.used_dyn {
         out.push_str("@import \"sa_std/math.sai\"\n");
     }
     out.push('\n');
-    if em.used_ipow {
+    if em.used_dyn {
+        out.push_str("@derive(copy)\nstruct PsaVal { tag: i64, ipay: i64, fpay: f64 }\n\nstruct PsaStage { tag: i64, ipay: i64, fpay: f64 }\n\n");
+    }
+    if em.used_ipow || em.used_dyn {
         out.push_str(
             "fn __psa_ipow(a: i64, e: i64) -> i64 {\n    let r = 1;\n    let b = a;\n    let n = e;\n    while n > 0 {\n        if (n & 1) == 1 { r = r * b; };\n        b = b * b;\n        n = n >> 1;\n    }\n    return r;\n}\n\n",
         );
     }
-    if em.used_floordiv {
+    if em.used_floordiv || em.used_dyn {
         out.push_str(
             "fn __psa_floordiv(a: i64, b: i64) -> i64 {\n    let q = a / b;\n    let r = a % b;\n    if r != 0 && ((r < 0) != (b < 0)) { return q - 1; };\n    return q;\n}\n\n",
         );
     }
-    if em.used_floormod {
+    if em.used_floormod || em.used_dyn {
         out.push_str(
             "fn __psa_floormod(a: i64, b: i64) -> i64 {\n    let r = a % b;\n    if r != 0 && ((r < 0) != (b < 0)) { return r + b; };\n    return r;\n}\n\n",
         );
+    }
+    if em.used_dyn {
+        out.push_str(DYN_RUNTIME);
     }
     for f in &em.emitted {
         out.push_str(f);
@@ -245,7 +308,13 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
 impl Emitter {
     fn ensure_fn(&mut self, name: &str, arg_tys: &[Ty], line: u32) -> Result<Sig, String> {
         if let Some(sig) = self.sigs.get(name) {
-            if sig.params != arg_tys {
+            let compatible = sig.params.len() == arg_tys.len()
+                && sig
+                    .params
+                    .iter()
+                    .zip(arg_tys.iter())
+                    .all(|(p, a)| sig_param_compatible(*p, *a));
+            if !compatible {
                 return Err(eerr(
                     line,
                     &format!(
@@ -303,28 +372,66 @@ impl Emitter {
             Sig { params: arg_tys.to_vec(), param_borrow: borrows.clone(), ret: Some(Ty::Int) },
         );
         self.in_progress.push(name.to_string());
+        let param_vars: Vec<(String, Ty, Option<u32>)> = def
+            .params
+            .iter()
+            .cloned()
+            .zip(arg_tys.iter().cloned())
+            .map(|(n, t)| (n, t, None))
+            .collect();
+        let borrowed_params: Vec<String> = def
+            .params
+            .iter()
+            .zip(borrows.iter())
+            .filter(|(_, b)| **b)
+            .map(|(p, _)| p.clone())
+            .collect();
+        // Prescan the body into a scratch context to learn the unified
+        // return type before emitting for real: when the returns unify
+        // to Dyn, every return value must be boxed, including returns
+        // that textually precede the branch that forced the upgrade.
+        // A prescan error is ignored here; the real emission below
+        // reproduces it identically and reports it.
+        let prescan_ret = {
+            let mut sctx = Ctx {
+                vars: param_vars.clone(),
+                scopes: vec![0],
+                ret: None,
+                fname: name.to_string(),
+                out: String::new(),
+                prologue: String::new(),
+                indent: 1,
+                tmp: 0,
+                borrowed: borrowed_params.clone(),
+                in_while_cond: false,
+                dyn_ret: false,
+            };
+            let r = (|| {
+                for s in &def.body {
+                    self.emit_stmt(&mut sctx, s)?;
+                }
+                Ok::<(), String>(())
+            })();
+            match r {
+                Ok(()) => sctx.ret,
+                Err(_) => None,
+            }
+        };
+        if let Some(pr) = prescan_ret {
+            self.sigs.get_mut(name).unwrap().ret = Some(pr);
+        }
         let mut ctx = Ctx {
-            vars: def
-                .params
-                .iter()
-                .cloned()
-                .zip(arg_tys.iter().cloned())
-                .map(|(n, t)| (n, t, None))
-                .collect(),
+            vars: param_vars,
             scopes: vec![0],
             ret: None,
             fname: name.to_string(),
             out: String::new(),
+            prologue: String::new(),
             indent: 1,
             tmp: 0,
-            borrowed: def
-                .params
-                .iter()
-                .zip(borrows.iter())
-                .filter(|(_, b)| **b)
-                .map(|(p, _)| p.clone())
-                .collect(),
+            borrowed: borrowed_params,
             in_while_cond: false,
+            dyn_ret: prescan_ret == Some(Ty::Dyn),
         };
         let body_res = (|| {
             for s in &def.body {
@@ -374,6 +481,7 @@ impl Emitter {
             }
         }
         txt.push_str(&format!(") -> {} {{\n", ret_ty.sla()));
+        txt.push_str(&ctx.prologue);
         txt.push_str(&ctx.out);
         // Default fallthrough return (unreachable when the body always
         // returns; the SLA checker accepts it either way).
@@ -383,6 +491,125 @@ impl Emitter {
             self.emitted.push(txt);
         }
         Ok(self.sigs.get(name).unwrap().clone())
+    }
+
+    /// Wrap a statically-typed value's code as a dynamic value
+    /// (boxing at a static/dynamic boundary). Dynamic values pass
+    /// through unchanged; kinds that cannot be dynamic in D1 fail
+    /// loudly with the phase that will carry them.
+    fn box_code(&mut self, code: String, ty: Ty, line: u32) -> Result<String, String> {
+        match ty {
+            Ty::Dyn => Ok(code),
+            Ty::Int => {
+                self.used_dyn = true;
+                Ok(format!("__psa_box_int({})", code))
+            }
+            Ty::Float => {
+                self.used_dyn = true;
+                Ok(format!("__psa_box_float({})", code))
+            }
+            Ty::Bool => {
+                self.used_dyn = true;
+                Ok(format!("__psa_box_bool({})", code))
+            }
+            Ty::Str => Err(eerr(
+                line,
+                "string values cannot become dynamic values in D1 (the string runtime is D2; string bindings are also blocked by upstream defect (xxv))",
+            )),
+            t if t.is_list() => Err(eerr(
+                line,
+                "lists cannot become dynamic values in D1 (dynamic containers arrive in D2)",
+            )),
+            _ => Err(eerr(line, "a void value cannot become a dynamic value")),
+        }
+    }
+
+    /// Extract a static value from a dynamic one at a boundary; the
+    /// runtime checks the tag and panics TypeError-style on mismatch
+    /// (design s3: unboxing carries a runtime type assertion).
+    fn unbox_code(&mut self, code: String, want: Ty, line: u32) -> Result<String, String> {
+        self.used_dyn = true;
+        match want {
+            Ty::Int => Ok(format!("__psa_unbox_int({})", code)),
+            Ty::Float => Ok(format!("__psa_unbox_float({})", code)),
+            Ty::Bool => Ok(format!("__psa_unbox_bool({})", code)),
+            Ty::Str => Err(eerr(
+                line,
+                "a dynamic value cannot be unboxed to a string in D1 (the string runtime is D2)",
+            )),
+            t if t.is_list() => Err(eerr(
+                line,
+                "a dynamic value cannot be unboxed to a list in D1 (dynamic containers arrive in D2)",
+            )),
+            _ => Err(eerr(
+                line,
+                &format!("a dynamic value cannot be unboxed to {}", want.py_name()),
+            )),
+        }
+    }
+
+    /// A dynamic value read into a *binding* (assignment target,
+    /// materialised temp): on the Rust sla build-exe route a plain
+    /// `let y = v;` moves a struct variable even when the struct is
+    /// `@derive(copy)` (the checker honours the derive, the SAB
+    /// lowering's assign path does not; hand-written probes q1/q2/q3
+    /// pin calls as copying and bindings as moving). Reading a user
+    /// variable into a binding therefore goes through __psa_clone,
+    /// whose call copies. psa's own temps (the `__psa_` namespace)
+    /// are exempt: they are dead after the binding, so moving them
+    /// is correct and avoids leaving live registers behind.
+    fn dyn_clone_wrap(&mut self, code: String, ty: Ty) -> String {
+        let plain_ident = !code.is_empty()
+            && code.chars().all(|c| c.is_alphanumeric() || c == '_')
+            && !code.chars().next().unwrap().is_numeric();
+        if ty == Ty::Dyn && plain_ident && !code.starts_with("__psa_") {
+            self.used_dyn = true;
+            format!("__psa_clone({})", code)
+        } else {
+            code
+        }
+    }
+
+    /// Store a dynamic value into an existing PsaVal variable
+    /// (assignment, augmented assignment, branch join). A whole-value
+    /// `dst = v;` is not available on the Rust sla build-exe route:
+    /// the SAB lowering emits every aggregate assignment as a fresh
+    /// register definition and traps RegisterRedefinition (probes
+    /// q4/q5/q6/q9), and a block-scoped aggregate temp is never
+    /// retired (q16/q29). The proven shape (probe q28) is: capture
+    /// the value once in a non-Copy stage, copy its scalar fields
+    /// into the destination, then move the stage into a void sink,
+    /// which retires it in the same block.
+    fn emit_dyn_store(
+        &mut self,
+        ctx: &mut Ctx,
+        target: &str,
+        psaval_code: &str,
+    ) -> Result<(), String> {
+        self.used_dyn = true;
+        ctx.tmp += 1;
+        let stg = format!("__psa_stg_{}", ctx.tmp);
+        ctx.declare(&stg, Ty::Dyn)?;
+        ctx.line(&format!("let {}: PsaStage = __psa_stage_of({});", stg, psaval_code));
+        ctx.line(&format!("{}.tag = {}.tag;", target, stg));
+        ctx.line(&format!("{}.ipay = {}.ipay;", target, stg));
+        ctx.line(&format!("{}.fpay = {}.fpay;", target, stg));
+        ctx.line(&format!("__psa_drop_stage({});", stg));
+        Ok(())
+    }
+
+    /// A condition position: bools pass through, dynamic values go
+    /// through the runtime truthiness check, anything else keeps the
+    /// caller's historical error message.
+    fn cond_code(&mut self, code: String, ty: Ty, line: u32, what: &str) -> Result<String, String> {
+        match ty {
+            Ty::Bool => Ok(code),
+            Ty::Dyn => {
+                self.used_dyn = true;
+                Ok(format!("__psa_dyn_truthy({})", code))
+            }
+            _ => Err(eerr(line, what)),
+        }
     }
 
     /// Type-check a list literal's elements and emit their codes.
@@ -519,6 +746,9 @@ impl Emitter {
                     None => {
                         if ctx.fname == "main" {
                             ctx.line("return 0;");
+                        } else if ctx.dyn_ret {
+                            unify_ret(ctx, Ty::Dyn, *line)?;
+                            ctx.line(&format!("return {};", Ty::Dyn.default_lit()));
                         } else {
                             unify_ret(ctx, Ty::Void, *line)?;
                             ctx.line(&format!("return {};", Ty::Void.default_lit()));
@@ -545,7 +775,7 @@ impl Emitter {
                                 ));
                             }
                         }
-                        let (code, ty) = self.emit_expr(ctx, e, *line)?;
+                        let (mut code, ty) = self.emit_expr(ctx, e, *line)?;
                         if ty == Ty::Str {
                             return Err(eerr(
                                 *line,
@@ -559,6 +789,9 @@ impl Emitter {
                             ctx.line(&format!("return {} as i32;", code));
                         } else {
                             unify_ret(ctx, ty, *line)?;
+                            if ctx.dyn_ret && ty != Ty::Dyn {
+                                code = self.box_code(code, ty, *line)?;
+                            }
                             ctx.line(&format!("return {};", code));
                         }
                     }
@@ -570,7 +803,7 @@ impl Emitter {
                 if let Expr::ListLit(elems) = value {
                     return self.emit_list_assign(ctx, name, elems, *line);
                 }
-                let (code, ty) = self.emit_expr(ctx, value, *line)?;
+                let (mut code, mut ty) = self.emit_expr(ctx, value, *line)?;
                 if ty == Ty::Void {
                     return Err(eerr(*line, "cannot assign a void value"));
                 }
@@ -579,6 +812,16 @@ impl Emitter {
                         *line,
                         "binding a string value to a variable is blocked by upstream defect (xxv): string bindings cannot be lowered on the Rust sla build-exe route (see README); string literals in print() work",
                     ));
+                }
+                code = self.dyn_clone_wrap(code, ty);
+                // A dynamic variable accepts any D1 scalar value,
+                // boxed on the way in. The reverse (a statically
+                // inferred variable receiving a dynamic value) stays
+                // a loud error in the match below: psa pins one type
+                // per variable from its first binding.
+                if ty != Ty::Dyn && ctx.lookup(name) == Some(Ty::Dyn) {
+                    code = self.box_code(code, ty, *line)?;
+                    ty = Ty::Dyn;
                 }
                 // Container assignment moves the source binding (spec s3).
                 let src_name = match value {
@@ -598,12 +841,39 @@ impl Emitter {
                 }
                 match ctx.lookup(name) {
                     None => {
-                        ctx.declare(name, ty)
-                            .map_err(|m| eerr(*line, &m))?;
-                        ctx.line(&format!("let {}: {} = {};", name, ty.sla(), code));
+                        if ty == Ty::Dyn {
+                            // A dynamic binding is declared with the
+                            // None literal (hoisted to the prologue
+                            // when inside a block) and filled through
+                            // the stage pattern: a direct `let x =
+                            // <call>;` inside a block is never
+                            // retired on this route (probes q16/q24).
+                            if ctx.scopes.len() > 1 {
+                                ctx.hoist_declare(name, ty);
+                            } else {
+                                ctx.declare(name, ty)
+                                    .map_err(|m| eerr(*line, &m))?;
+                                ctx.line(&format!(
+                                    "let {}: {} = {};",
+                                    name,
+                                    ty.sla(),
+                                    ty.default_lit()
+                                ));
+                            }
+                            self.emit_dyn_store(ctx, name, &code)
+                                .map_err(|m| eerr(*line, &m))?;
+                        } else {
+                            ctx.declare(name, ty)
+                                .map_err(|m| eerr(*line, &m))?;
+                            ctx.line(&format!("let {}: {} = {};", name, ty.sla(), code));
+                        }
                     }
                     Some(existing) => {
-                        if existing == ty {
+                        if existing == ty && existing == Ty::Dyn {
+                            self.emit_dyn_store(ctx, name, &code)
+                                .map_err(|m| eerr(*line, &m))?;
+                            ctx.revive(name);
+                        } else if existing == ty {
                             let nt = expr_mentions(value, name) && expr_has_call(value);
                             assign_line(ctx, name, &code, ty, false, nt)
                                 .map_err(|m| eerr(*line, &m))?;
@@ -612,6 +882,15 @@ impl Emitter {
                             let nt = expr_mentions(value, name) && expr_has_call(value);
                             assign_line(ctx, name, &code, ty, true, nt)
                                 .map_err(|m| eerr(*line, &m))?;
+                        } else if ty == Ty::Dyn {
+                            return Err(eerr(
+                                *line,
+                                &format!(
+                                    "variable `{}` was inferred as {} from its first binding and cannot become dynamic later (psa pins one type per variable; make the first binding dynamic, e.g. through a conditional expression, or use a new name)",
+                                    name,
+                                    existing.py_name()
+                                ),
+                            ));
                         } else {
                             return Err(eerr(
                                 *line,
@@ -644,12 +923,16 @@ impl Emitter {
                     }
                 };
                 ctx.check_alive(name, *line)?;
-                let (icode, ity) = self.emit_expr(ctx, index, *line)?;
-                if ity != Ty::Int {
+                let (mut icode, ity) = self.emit_expr(ctx, index, *line)?;
+                if ity == Ty::Dyn {
+                    icode = self.unbox_code(icode, Ty::Int, *line)?;
+                } else if ity != Ty::Int {
                     return Err(eerr(*line, "list index must be int"));
                 }
-                let (vcode, vty) = self.emit_expr(ctx, value, *line)?;
-                if vty != elem {
+                let (mut vcode, vty) = self.emit_expr(ctx, value, *line)?;
+                if vty == Ty::Dyn {
+                    vcode = self.unbox_code(vcode, elem, *line)?;
+                } else if vty != elem {
                     return Err(eerr(
                         *line,
                         &format!("{} elements must be {:?}, assigned {:?}", ty.py_name(), elem, vty),
@@ -675,8 +958,22 @@ impl Emitter {
                     Box::new(value.clone()),
                 );
                 let (code, ty) = self.emit_expr(ctx, &fake, *line)?;
+                if existing == Ty::Dyn {
+                    // The result is a runtime call that mentions the
+                    // target; storing it goes through the stage
+                    // pattern (a whole-value assignment would trap
+                    // RegisterRedefinition, probes q5/q6).
+                    self.emit_dyn_store(ctx, name, &code)
+                        .map_err(|m| eerr(*line, &m))?;
+                    return Ok(());
+                }
+                // A dynamic target always routes through a temp: the
+                // result is a runtime call that mentions the target,
+                // which is exactly the register-leak shape of defect
+                // (xxvi) when assigned directly.
                 let needs_temp = matches!(op, BinOp::FloorDiv | BinOp::Mod | BinOp::Pow)
-                    || expr_has_call(value);
+                    || expr_has_call(value)
+                    || existing == Ty::Dyn;
                 if ty != existing {
                     if existing == Ty::Float && ty == Ty::Int {
                         assign_line(ctx, name, &code, ty, true, needs_temp)
@@ -708,9 +1005,7 @@ impl Emitter {
             Stmt::If { arms, els, line } => {
                 for (i, (cond, body)) in arms.iter().enumerate() {
                     let (ccode, cty) = self.emit_expr(ctx, cond, *line)?;
-                    if cty != Ty::Bool {
-                        return Err(eerr(*line, "if condition must be bool"));
-                    }
+                    let ccode = self.cond_code(ccode, cty, *line, "if condition must be bool")?;
                     if i == 0 {
                         ctx.line(&format!("if {} {{", ccode));
                     } else {
@@ -735,9 +1030,7 @@ impl Emitter {
                 let res = self.emit_expr(ctx, cond, *line);
                 ctx.in_while_cond = saved;
                 let (ccode, cty) = res?;
-                if cty != Ty::Bool {
-                    return Err(eerr(*line, "while condition must be bool"));
-                }
+                let ccode = self.cond_code(ccode, cty, *line, "while condition must be bool")?;
                 ctx.line(&format!("while {} {{", ccode));
                 ctx.indent += 1;
                 self.emit_block(ctx, body)?;
@@ -746,15 +1039,19 @@ impl Emitter {
                 Ok(())
             }
             Stmt::ForRange { var, start, stop, body, line } => {
-                let (stop_code, stop_ty) = self.emit_expr(ctx, stop, *line)?;
-                if stop_ty != Ty::Int {
+                let (mut stop_code, stop_ty) = self.emit_expr(ctx, stop, *line)?;
+                if stop_ty == Ty::Dyn {
+                    stop_code = self.unbox_code(stop_code, Ty::Int, *line)?;
+                } else if stop_ty != Ty::Int {
                     return Err(eerr(*line, "range() bounds must be int"));
                 }
-                let (start_code, start_ty) = match start {
+                let (mut start_code, start_ty) = match start {
                     Some(e) => self.emit_expr(ctx, e, *line)?,
                     None => ("0".to_string(), Ty::Int),
                 };
-                if start_ty != Ty::Int {
+                if start_ty == Ty::Dyn {
+                    start_code = self.unbox_code(start_code, Ty::Int, *line)?;
+                } else if start_ty != Ty::Int {
                     return Err(eerr(*line, "range() bounds must be int"));
                 }
                 ctx.line("{");
@@ -803,6 +1100,11 @@ impl Emitter {
         // Single bool argument: Python prints True/False.
         if args.len() == 1 {
             let (code, ty) = self.emit_expr(ctx, &args[0], line)?;
+            if ty == Ty::Dyn {
+                self.used_dyn = true;
+                ctx.line(&format!("__psa_print_dyn({});", code));
+                return Ok(());
+            }
             if ty == Ty::Float {
                 return Err(eerr(
                     line,
@@ -831,6 +1133,9 @@ impl Emitter {
         let mut codes = Vec::new();
         for (i, a) in args.iter().enumerate() {
             let (code, ty) = self.emit_expr(ctx, a, line)?;
+            if ty == Ty::Dyn {
+                return Err(eerr(line, "dynamic values in multi-argument print are not supported in D1 (print a dynamic value on its own line)"));
+            }
             if ty == Ty::Bool {
                 return Err(eerr(line, "bool values in multi-argument print are not supported in v0.1"));
             }
@@ -1006,8 +1311,10 @@ impl Emitter {
                     }
                 };
                 ctx.check_alive(&obj, line)?;
-                let (icode, ity) = self.emit_expr(ctx, idx, line)?;
-                if ity != Ty::Int {
+                let (mut icode, ity) = self.emit_expr(ctx, idx, line)?;
+                if ity == Ty::Dyn {
+                    icode = self.unbox_code(icode, Ty::Int, line)?;
+                } else if ity != Ty::Int {
                     return Err(eerr(line, "list index must be int"));
                 }
                 // Scalar element: copied out of the borrow (spec s5).
@@ -1033,8 +1340,10 @@ impl Emitter {
                 if args.len() != 1 {
                     return Err(eerr(line, "append takes exactly one argument"));
                 }
-                let (acode, aty) = self.emit_expr(ctx, &args[0], line)?;
-                if aty != elem {
+                let (mut acode, aty) = self.emit_expr(ctx, &args[0], line)?;
+                if aty == Ty::Dyn {
+                    acode = self.unbox_code(acode, elem, line)?;
+                } else if aty != elem {
                     return Err(eerr(
                         line,
                         &format!("{} elements must be {:?}, appended {:?}", ty.py_name(), elem, aty),
@@ -1045,6 +1354,18 @@ impl Emitter {
             }
             Expr::Unary(op, inner) => {
                 let (code, ty) = self.emit_expr(ctx, inner, line)?;
+                if ty == Ty::Dyn {
+                    self.used_dyn = true;
+                    return match op {
+                        UnOp::Neg => Ok((format!("__psa_dyn_neg({})", code), Ty::Dyn)),
+                        UnOp::Not => {
+                            Ok((format!("!(__psa_dyn_truthy({}))", code), Ty::Bool))
+                        }
+                        UnOp::BitNot => {
+                            Ok((format!("__psa_dyn_bitnot({})", code), Ty::Dyn))
+                        }
+                    };
+                }
                 match op {
                     UnOp::Neg => {
                         if ty == Ty::Int || ty == Ty::Float {
@@ -1105,6 +1426,21 @@ impl Emitter {
                 }
                 let sig = self.ensure_fn(&fname, &arg_tys, line)?;
                 let ret = sig.ret.unwrap_or(Ty::Void);
+                // Static/dynamic boundary (design s3): a dynamic
+                // parameter takes any D1 scalar, boxed here; a scalar
+                // parameter takes a dynamic argument, unboxed here
+                // with a runtime type assertion.
+                for i in 0..args.len() {
+                    let pt = sig.params[i];
+                    let at = arg_tys[i];
+                    if pt == Ty::Dyn && at != Ty::Dyn {
+                        let c = std::mem::take(&mut arg_codes[i]);
+                        arg_codes[i] = self.box_code(c, at, line)?;
+                    } else if at == Ty::Dyn && pt != Ty::Dyn {
+                        let c = std::mem::take(&mut arg_codes[i]);
+                        arg_codes[i] = self.unbox_code(c, pt, line)?;
+                    }
+                }
                 // Ownership at the call site (spec s4/s6): a borrowed
                 // parameter takes `&name`; a consumed parameter moves
                 // the argument binding. A borrowed parameter of the
@@ -1150,6 +1486,27 @@ impl Emitter {
                 if *op == BinOp::Pow {
                     return self.emit_pow(ctx, l, r, line);
                 }
+                if *op == BinOp::And || *op == BinOp::Or {
+                    // With a dynamic operand, and/or have Python's
+                    // value semantics (the result is one of the two
+                    // operands), which needs a materialised temp and
+                    // short-circuit placement of the right operand.
+                    // The right operand is therefore emitted into a
+                    // scratch buffer first: if both sides turn out
+                    // static, its lines are spliced back in order;
+                    // if either side is dynamic, they land inside
+                    // the branch that actually evaluates it.
+                    let (lc, lt) = self.emit_expr(ctx, l, line)?;
+                    let saved_out = std::mem::take(&mut ctx.out);
+                    let r_res = self.emit_expr(ctx, r, line);
+                    let r_lines = std::mem::replace(&mut ctx.out, saved_out);
+                    let (rc, rt) = r_res?;
+                    if lt != Ty::Dyn && rt != Ty::Dyn {
+                        ctx.out.push_str(&r_lines);
+                        return self.emit_binop(lc, lt, *op, rc, rt, line);
+                    }
+                    return self.emit_dyn_logic(ctx, lc, lt, *op, rc, rt, r_lines, line);
+                }
                 let (lc, lt) = self.emit_expr(ctx, l, line)?;
                 let (rc, rt) = self.emit_expr(ctx, r, line)?;
                 self.emit_binop(lc, lt, *op, rc, rt, line)
@@ -1162,9 +1519,7 @@ impl Emitter {
                     ));
                 }
                 let (cc, ct) = self.emit_expr(ctx, cond, line)?;
-                if ct != Ty::Bool {
-                    return Err(eerr(line, "if-expression condition must be bool"));
-                }
+                let cc = self.cond_code(cc, ct, line, "if-expression condition must be bool")?;
                 // Emit each branch into a scratch buffer so any lines a
                 // nested if-expression produces land *inside* the branch
                 // block, not before the whole expression.
@@ -1190,37 +1545,93 @@ impl Emitter {
                         "if-expressions with string branches are blocked by upstream defect (xxv): the value would have to live in a string temp, and string bindings cannot be lowered on the Rust sla build-exe route (see README)",
                     ));
                 }
+                // A void branch (a call that returns nothing) is the
+                // None value of the dynamic runtime.
+                let then_void = tt == Ty::Void;
+                let els_void = et == Ty::Void;
+                let (tc, tt) = if tt == Ty::Void {
+                    (Ty::Dyn.default_lit().to_string(), Ty::Dyn)
+                } else {
+                    (tc, tt)
+                };
+                let (ec, et) = if et == Ty::Void {
+                    (Ty::Dyn.default_lit().to_string(), Ty::Dyn)
+                } else {
+                    (ec, et)
+                };
                 let (ty, tc, ec) = match (tt, et) {
                     (a, b) if a == b => (a, tc, ec),
                     (Ty::Float, Ty::Int) => (Ty::Float, tc, format!("{} as f64", ec)),
                     (Ty::Int, Ty::Float) => (Ty::Float, format!("{} as f64", tc), ec),
+                    (Ty::Dyn, _) => {
+                        let ec = self.box_code(ec, et, line)?;
+                        (Ty::Dyn, tc, ec)
+                    }
+                    (_, Ty::Dyn) => {
+                        let tc = self.box_code(tc, tt, line)?;
+                        (Ty::Dyn, tc, ec)
+                    }
+                    (a, b) if a.is_scalar() && b.is_scalar() => {
+                        // Mixed scalar branches (int/bool, float/bool):
+                        // Python pins no single type, so the value is
+                        // dynamic and both branches are boxed.
+                        let tc = self.box_code(tc, tt, line)?;
+                        let ec = self.box_code(ec, et, line)?;
+                        (Ty::Dyn, tc, ec)
+                    }
                     _ => {
                         return Err(eerr(
                             line,
                             &format!(
-                                "if-expression branches have different types ({} and {}); Python would make this value dynamic — the dynamic face is D1+",
+                                "if-expression branches have incompatible types ({} and {})",
                                 tt.py_name(),
                                 et.py_name()
                             ),
                         ))
                     }
                 };
-                if ty == Ty::Void {
-                    return Err(eerr(line, "if-expression branches produce no value"));
-                }
                 ctx.tmp += 1;
                 let name = format!("__psa_ifexp_{}", ctx.tmp);
-                ctx.declare(&name, ty).map_err(|m| eerr(line, &m))?;
-                ctx.line(&format!("let {}: {} = {};", name, ty.sla(), ty.default_lit()));
+                if ty == Ty::Dyn && ctx.scopes.len() > 1 {
+                    // A block-scoped aggregate temp is never retired
+                    // on this route (probe q29); the temp's `let`
+                    // goes to the function prologue instead.
+                    ctx.hoist_declare(&name, ty);
+                } else {
+                    ctx.declare(&name, ty).map_err(|m| eerr(line, &m))?;
+                    ctx.line(&format!("let {}: {} = {};", name, ty.sla(), ty.default_lit()));
+                }
                 ctx.line(&format!("if {} {{", cc));
                 ctx.out.push_str(&then_lines);
                 ctx.indent += 1;
-                ctx.line(&format!("{} = {};", name, tc));
+                if ty == Ty::Dyn {
+                    if then_void {
+                        ctx.line(&format!("{}.tag = 3;", name));
+                        ctx.line(&format!("{}.ipay = 0;", name));
+                        ctx.line(&format!("{}.fpay = 0.0;", name));
+                    } else {
+                        self.emit_dyn_store(ctx, &name, &tc)
+                            .map_err(|m| eerr(line, &m))?;
+                    }
+                } else {
+                    ctx.line(&format!("{} = {};", name, tc));
+                }
                 ctx.indent -= 1;
                 ctx.line("} else {");
                 ctx.out.push_str(&els_lines);
                 ctx.indent += 1;
-                ctx.line(&format!("{} = {};", name, ec));
+                if ty == Ty::Dyn {
+                    if els_void {
+                        ctx.line(&format!("{}.tag = 3;", name));
+                        ctx.line(&format!("{}.ipay = 0;", name));
+                        ctx.line(&format!("{}.fpay = 0.0;", name));
+                    } else {
+                        self.emit_dyn_store(ctx, &name, &ec)
+                            .map_err(|m| eerr(line, &m))?;
+                    }
+                } else {
+                    ctx.line(&format!("{} = {};", name, ec));
+                }
                 ctx.indent -= 1;
                 ctx.line("};");
                 Ok((name, ty))
@@ -1246,6 +1657,15 @@ impl Emitter {
     ) -> Result<(String, Ty), String> {
         let (lc, lt) = self.emit_expr(ctx, l, line)?;
         let (rc, rt) = self.emit_expr(ctx, r, line)?;
+        if lt == Ty::Dyn || rt == Ty::Dyn {
+            // The runtime can branch on the exponent's actual value,
+            // so the static path's literal-exponent restriction does
+            // not apply to dynamic operands.
+            let lc = self.box_code(lc, lt, line)?;
+            let rc = self.box_code(rc, rt, line)?;
+            self.used_dyn = true;
+            return Ok((format!("__psa_dyn_pow({}, {})", lc, rc), Ty::Dyn));
+        }
         match (lt, rt) {
             (Ty::Int, Ty::Int) => match int_literal(r) {
                 Some(e) if e >= 0 => {
@@ -1284,6 +1704,99 @@ impl Emitter {
         }
     }
 
+    /// `and`/`or` with a dynamic operand: Python returns one of the
+    /// operands (not a bool), so the left value is materialised in a
+    /// temp and the right operand's code is placed inside the branch
+    /// that actually evaluates it (short-circuit preserved, exactly
+    /// like the if-expression temp machinery).
+    fn emit_dyn_logic(
+        &mut self,
+        ctx: &mut Ctx,
+        lc: String,
+        lt: Ty,
+        op: BinOp,
+        rc: String,
+        rt: Ty,
+        r_lines: String,
+        line: u32,
+    ) -> Result<(String, Ty), String> {
+        if ctx.in_while_cond {
+            return Err(eerr(
+                line,
+                "and/or with a dynamic operand is not supported in while conditions in D1 (the condition is re-evaluated every iteration); compute the value before the loop",
+            ));
+        }
+        let lc = self.box_code(lc, lt, line)?;
+        let rc = self.box_code(rc, rt, line)?;
+        self.used_dyn = true;
+        ctx.tmp += 1;
+        let name = format!("__psa_logic_{}", ctx.tmp);
+        if ctx.scopes.len() > 1 {
+            ctx.hoist_declare(&name, Ty::Dyn);
+        } else {
+            ctx.declare(&name, Ty::Dyn).map_err(|m| eerr(line, &m))?;
+            ctx.line(&format!("let {}: PsaVal = {};", name, Ty::Dyn.default_lit()));
+        }
+        self.emit_dyn_store(ctx, &name, &lc)
+            .map_err(|m| eerr(line, &m))?;
+        if op == BinOp::And {
+            ctx.line(&format!("if __psa_dyn_truthy({}) {{", name));
+        } else {
+            ctx.line(&format!("if !(__psa_dyn_truthy({})) {{", name));
+        }
+        ctx.out.push_str(&r_lines);
+        ctx.indent += 1;
+        self.emit_dyn_store(ctx, &name, &rc)
+            .map_err(|m| eerr(line, &m))?;
+        ctx.indent -= 1;
+        ctx.line("};");
+        Ok((name, Ty::Dyn))
+    }
+
+    /// A binary operation with at least one dynamic operand: the
+    /// static side is boxed and the operation dispatches through the
+    /// PsaVal runtime. Comparisons return a plain bool.
+    fn emit_dyn_binop(
+        &mut self,
+        lc: String,
+        lt: Ty,
+        op: BinOp,
+        rc: String,
+        rt: Ty,
+        line: u32,
+    ) -> Result<(String, Ty), String> {
+        let lc = self.box_code(lc, lt, line)?;
+        let rc = self.box_code(rc, rt, line)?;
+        self.used_dyn = true;
+        let dyn_fn = match op {
+            BinOp::Add => "__psa_dyn_add",
+            BinOp::Sub => "__psa_dyn_sub",
+            BinOp::Mul => "__psa_dyn_mul",
+            BinOp::Div => "__psa_dyn_div",
+            BinOp::FloorDiv => "__psa_dyn_floordiv",
+            BinOp::Mod => "__psa_dyn_mod",
+            BinOp::Pow => "__psa_dyn_pow",
+            BinOp::BitAnd => "__psa_dyn_bitand",
+            BinOp::BitOr => "__psa_dyn_bitor",
+            BinOp::BitXor => "__psa_dyn_bitxor",
+            BinOp::Shl => "__psa_dyn_shl",
+            BinOp::Shr => "__psa_dyn_shr",
+            BinOp::Eq => return Ok((format!("__psa_dyn_eq({}, {})", lc, rc), Ty::Bool)),
+            BinOp::NotEq => return Ok((format!("__psa_dyn_ne({}, {})", lc, rc), Ty::Bool)),
+            BinOp::Lt => return Ok((format!("__psa_dyn_lt({}, {})", lc, rc), Ty::Bool)),
+            BinOp::LtEq => return Ok((format!("__psa_dyn_le({}, {})", lc, rc), Ty::Bool)),
+            BinOp::Gt => return Ok((format!("__psa_dyn_gt({}, {})", lc, rc), Ty::Bool)),
+            BinOp::GtEq => return Ok((format!("__psa_dyn_ge({}, {})", lc, rc), Ty::Bool)),
+            BinOp::And | BinOp::Or => {
+                return Err(eerr(
+                    line,
+                    "internal error: dynamic and/or is handled by emit_dyn_logic",
+                ))
+            }
+        };
+        Ok((format!("{}({}, {})", dyn_fn, lc, rc), Ty::Dyn))
+    }
+
     fn emit_binop(
         &mut self,
         lc: String,
@@ -1293,6 +1806,9 @@ impl Emitter {
         rt: Ty,
         line: u32,
     ) -> Result<(String, Ty), String> {
+        if lt == Ty::Dyn || rt == Ty::Dyn {
+            return self.emit_dyn_binop(lc, lt, op, rc, rt, line);
+        }
         match op {
             BinOp::And | BinOp::Or => {
                 if lt != Ty::Bool || rt != Ty::Bool {
@@ -1523,6 +2039,17 @@ fn param_usage(em: &Emitter, def: &Func, param: &str, visiting: &mut Vec<(String
     stmts_consume(em, &def.body, param, visiting)
 }
 
+/// May a call with an argument of type `arg` use a signature whose
+/// parameter was inferred as `param`? Exact matches always may; a
+/// dynamic parameter accepts any D1 scalar (boxed at the call site)
+/// and a scalar parameter accepts a dynamic argument (unboxed with a
+/// runtime type assertion). Everything else stays monomorphic.
+fn sig_param_compatible(param: Ty, arg: Ty) -> bool {
+    param == arg
+        || (param == Ty::Dyn && arg.is_scalar())
+        || (arg == Ty::Dyn && param.is_scalar())
+}
+
 fn unify_ret(ctx: &mut Ctx, ty: Ty, line: u32) -> Result<(), String> {
     match ctx.ret {
         None => {
@@ -1536,6 +2063,22 @@ fn unify_ret(ctx: &mut Ctx, ty: Ty, line: u32) -> Result<(), String> {
                 Ok(())
             } else if existing == Ty::Int && ty == Ty::Float {
                 ctx.ret = Some(Ty::Float);
+                Ok(())
+            } else if (existing == Ty::Void && (ty.is_scalar() || ty == Ty::Dyn))
+                || (ty == Ty::Void && (existing.is_scalar() || existing == Ty::Dyn))
+            {
+                // A bare `return` (None) mixed with value returns:
+                // the function's result is dynamic, None on that path.
+                ctx.ret = Some(Ty::Dyn);
+                Ok(())
+            } else if (existing.is_scalar() && ty.is_scalar())
+                || (existing == Ty::Dyn && ty.is_scalar())
+                || (ty == Ty::Dyn && existing.is_scalar())
+            {
+                // Mixed scalar returns (or a dynamic return among
+                // scalar ones) make the function's return dynamic:
+                // Python would not pin one type here either.
+                ctx.ret = Some(Ty::Dyn);
                 Ok(())
             } else {
                 Err(eerr(
@@ -1685,6 +2228,230 @@ fn fmt_f64(v: f64) -> String {
         format!("{}", v)
     }
 }
+
+/// The D1 dynamic runtime, emitted once when any dynamic value is
+/// used. PsaVal tags: 0 = int, 1 = float, 2 = bool, 3 = None.
+/// The payload is split into an integer slot and a float slot (the
+/// design's single u64 payload would need an f64 bitcast primitive;
+/// the split representation has identical semantics). D1 values are
+/// inline scalars with no identity, so no reference counting yet:
+/// the Perceus rc discipline arrives with the heap kinds in D2.
+/// Panic codes are psa's runtime TypeError surface: 7701x operand
+/// kind errors, 7702x unboxing failures, 77030 float print (blocked
+/// by upstream defect (xxiii): the value is correct, only its text
+/// form is unavailable until the f64 println truncation is fixed).
+/// PsaStage/__psa_stage_of/__psa_drop_stage implement the store
+/// pattern of emit_dyn_store: the SAB lowering cannot reassign an
+/// aggregate variable (RegisterRedefinition) nor retire a
+/// block-scoped aggregate local (MemoryLeak) — upstream defect
+/// candidate (xxvii), evidence probes q1-q29 in the sapy workdir.
+const DYN_RUNTIME: &str = r#"fn __psa_box_int(x: i64) -> PsaVal {
+    return PsaVal { tag: 0, ipay: x, fpay: 0.0 };
+}
+
+fn __psa_box_float(x: f64) -> PsaVal {
+    return PsaVal { tag: 1, ipay: 0, fpay: x };
+}
+
+fn __psa_box_bool(x: bool) -> PsaVal {
+    if x { return PsaVal { tag: 2, ipay: 1, fpay: 0.0 }; };
+    return PsaVal { tag: 2, ipay: 0, fpay: 0.0 };
+}
+
+fn __psa_clone(v: PsaVal) -> PsaVal {
+    return PsaVal { tag: v.tag, ipay: v.ipay, fpay: v.fpay };
+}
+
+fn __psa_stage_of(v: PsaVal) -> PsaStage {
+    return PsaStage { tag: v.tag, ipay: v.ipay, fpay: v.fpay };
+}
+
+fn __psa_drop_stage(s: PsaStage) -> void {
+    return;
+}
+
+fn __psa_as_float(v: PsaVal) -> f64 {
+    if v.tag == 1 { return v.fpay; };
+    if v.tag == 0 || v.tag == 2 { return v.ipay as f64; };
+    panic(77010);
+}
+
+fn __psa_dyn_floor_f(x: f64) -> f64 {
+    if x >= 9223372036854775808.0 { return x; };
+    if x <= -9223372036854775808.0 { return x; };
+    let q = x as i64;
+    let qf = q as f64;
+    if qf > x { return qf - 1.0; };
+    return qf;
+}
+
+fn __psa_dyn_add(a: PsaVal, b: PsaVal) -> PsaVal {
+    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) { return __psa_box_int(a.ipay + b.ipay); };
+    if a.tag <= 2 && b.tag <= 2 { return __psa_box_float(__psa_as_float(a) + __psa_as_float(b)); };
+    panic(77011);
+}
+
+fn __psa_dyn_sub(a: PsaVal, b: PsaVal) -> PsaVal {
+    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) { return __psa_box_int(a.ipay - b.ipay); };
+    if a.tag <= 2 && b.tag <= 2 { return __psa_box_float(__psa_as_float(a) - __psa_as_float(b)); };
+    panic(77011);
+}
+
+fn __psa_dyn_mul(a: PsaVal, b: PsaVal) -> PsaVal {
+    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) { return __psa_box_int(a.ipay * b.ipay); };
+    if a.tag <= 2 && b.tag <= 2 { return __psa_box_float(__psa_as_float(a) * __psa_as_float(b)); };
+    panic(77011);
+}
+
+fn __psa_dyn_div(a: PsaVal, b: PsaVal) -> PsaVal {
+    return __psa_box_float(__psa_as_float(a) / __psa_as_float(b));
+}
+
+fn __psa_dyn_floordiv(a: PsaVal, b: PsaVal) -> PsaVal {
+    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) { return __psa_box_int(__psa_floordiv(a.ipay, b.ipay)); };
+    if a.tag <= 2 && b.tag <= 2 { return __psa_box_float(__psa_dyn_floor_f(__psa_as_float(a) / __psa_as_float(b))); };
+    panic(77011);
+}
+
+fn __psa_dyn_mod(a: PsaVal, b: PsaVal) -> PsaVal {
+    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) { return __psa_box_int(__psa_floormod(a.ipay, b.ipay)); };
+    if a.tag <= 2 && b.tag <= 2 {
+        let fa = __psa_as_float(a);
+        let fb = __psa_as_float(b);
+        return __psa_box_float(fa - __psa_dyn_floor_f(fa / fb) * fb);
+    };
+    panic(77011);
+}
+
+fn __psa_dyn_pow(a: PsaVal, b: PsaVal) -> PsaVal {
+    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) && b.ipay >= 0 { return __psa_box_int(__psa_ipow(a.ipay, b.ipay)); };
+    if a.tag <= 2 && b.tag <= 2 { return __psa_box_float(sa_math_pow(__psa_as_float(a), __psa_as_float(b))); };
+    panic(77011);
+}
+
+fn __psa_dyn_eq(a: PsaVal, b: PsaVal) -> bool {
+    if a.tag == 3 && b.tag == 3 { return true; };
+    if a.tag <= 2 && b.tag <= 2 {
+        if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) == __psa_as_float(b); };
+        return a.ipay == b.ipay;
+    };
+    return false;
+}
+
+fn __psa_dyn_ne(a: PsaVal, b: PsaVal) -> bool {
+    return !(__psa_dyn_eq(a, b));
+}
+
+fn __psa_dyn_lt(a: PsaVal, b: PsaVal) -> bool {
+    if a.tag <= 2 && b.tag <= 2 {
+        if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) < __psa_as_float(b); };
+        return a.ipay < b.ipay;
+    };
+    panic(77012);
+}
+
+fn __psa_dyn_le(a: PsaVal, b: PsaVal) -> bool {
+    if a.tag <= 2 && b.tag <= 2 {
+        if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) <= __psa_as_float(b); };
+        return a.ipay <= b.ipay;
+    };
+    panic(77012);
+}
+
+fn __psa_dyn_gt(a: PsaVal, b: PsaVal) -> bool {
+    if a.tag <= 2 && b.tag <= 2 {
+        if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) > __psa_as_float(b); };
+        return a.ipay > b.ipay;
+    };
+    panic(77012);
+}
+
+fn __psa_dyn_ge(a: PsaVal, b: PsaVal) -> bool {
+    if a.tag <= 2 && b.tag <= 2 {
+        if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) >= __psa_as_float(b); };
+        return a.ipay >= b.ipay;
+    };
+    panic(77012);
+}
+
+fn __psa_dyn_truthy(v: PsaVal) -> bool {
+    if v.tag == 0 { return v.ipay != 0; };
+    if v.tag == 1 { return v.fpay != 0.0; };
+    if v.tag == 2 { return v.ipay != 0; };
+    if v.tag == 3 { return false; };
+    panic(77010);
+}
+
+fn __psa_dyn_neg(v: PsaVal) -> PsaVal {
+    if v.tag == 0 || v.tag == 2 { return __psa_box_int(-(v.ipay)); };
+    if v.tag == 1 { return __psa_box_float(-(v.fpay)); };
+    panic(77015);
+}
+
+fn __psa_dyn_bitnot(v: PsaVal) -> PsaVal {
+    if v.tag == 0 || v.tag == 2 { return __psa_box_int((-(v.ipay) - 1)); };
+    panic(77013);
+}
+
+fn __psa_dyn_bitand(a: PsaVal, b: PsaVal) -> PsaVal {
+    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) { return __psa_box_int(a.ipay & b.ipay); };
+    panic(77013);
+}
+
+fn __psa_dyn_bitor(a: PsaVal, b: PsaVal) -> PsaVal {
+    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) { return __psa_box_int(a.ipay | b.ipay); };
+    panic(77013);
+}
+
+fn __psa_dyn_bitxor(a: PsaVal, b: PsaVal) -> PsaVal {
+    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) { return __psa_box_int(a.ipay ^ b.ipay); };
+    panic(77013);
+}
+
+fn __psa_dyn_shl(a: PsaVal, b: PsaVal) -> PsaVal {
+    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) {
+        if b.ipay < 0 || b.ipay >= 64 { panic(77014); };
+        return __psa_box_int(a.ipay << b.ipay);
+    };
+    panic(77013);
+}
+
+fn __psa_dyn_shr(a: PsaVal, b: PsaVal) -> PsaVal {
+    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) {
+        if b.ipay < 0 || b.ipay >= 64 { panic(77014); };
+        return __psa_box_int(a.ipay >> b.ipay);
+    };
+    panic(77013);
+}
+
+fn __psa_unbox_int(v: PsaVal) -> i64 {
+    if v.tag == 0 { return v.ipay; };
+    if v.tag == 2 { return v.ipay; };
+    panic(77020);
+}
+
+fn __psa_unbox_float(v: PsaVal) -> f64 {
+    if v.tag == 1 { return v.fpay; };
+    if v.tag == 0 || v.tag == 2 { return v.ipay as f64; };
+    panic(77021);
+}
+
+fn __psa_unbox_bool(v: PsaVal) -> bool {
+    if v.tag == 2 { return v.ipay != 0; };
+    panic(77022);
+}
+
+fn __psa_print_dyn(v: PsaVal) -> i32 {
+    if v.tag == 0 { println("{}", v.ipay); return 0; };
+    if v.tag == 2 {
+        if v.ipay != 0 { println("True"); } else { println("False"); };
+        return 0;
+    };
+    if v.tag == 3 { println("None"); return 0; };
+    panic(77030);
+}
+
+"#;
 
 fn escape_sla_str(s: &str) -> String {
     let mut out = String::new();

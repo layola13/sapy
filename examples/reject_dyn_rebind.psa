@@ -1,0 +1,8 @@
+def pick(flag):
+    if flag:
+        return 41
+    return True
+
+x = 5
+x = pick(True)
+print(x)
