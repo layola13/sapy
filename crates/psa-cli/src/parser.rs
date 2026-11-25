@@ -658,9 +658,29 @@ impl Parser {
                 }
                 Tok::LBracket => {
                     self.bump();
-                    let idx = self.parse_expr()?;
-                    self.expect(&Tok::RBracket)?;
-                    e = Expr::Index(Box::new(e), Box::new(idx));
+                    let mut lo = None;
+                    if !matches!(self.peek(), Tok::Colon) {
+                        lo = Some(Box::new(self.parse_expr()?));
+                    }
+                    if matches!(self.peek(), Tok::Colon) {
+                        self.bump();
+                        let mut hi = None;
+                        if !matches!(self.peek(), Tok::Colon | Tok::RBracket) {
+                            hi = Some(Box::new(self.parse_expr()?));
+                        }
+                        let mut step = None;
+                        if matches!(self.peek(), Tok::Colon) {
+                            self.bump();
+                            if !matches!(self.peek(), Tok::RBracket) {
+                                step = Some(Box::new(self.parse_expr()?));
+                            }
+                        }
+                        self.expect(&Tok::RBracket)?;
+                        e = Expr::Slice(Box::new(e), lo, hi, step);
+                    } else {
+                        self.expect(&Tok::RBracket)?;
+                        e = Expr::Index(Box::new(e), lo.unwrap());
+                    }
                 }
                 Tok::Dot => {
                     self.bump();
@@ -795,6 +815,12 @@ fn duplicable(e: &Expr) -> bool {
     match e {
         Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::NoneLit | Expr::Name(_) => true,
         Expr::Index(a, b) => duplicable(a) && duplicable(b),
+        Expr::Slice(a, lo, hi, st) => {
+            duplicable(a)
+                && [lo, hi, st]
+                    .iter()
+                    .all(|o| o.as_ref().map(|e| duplicable(e)).unwrap_or(true))
+        }
         Expr::Bin(a, _, b) => duplicable(a) && duplicable(b),
         Expr::Unary(_, a) => duplicable(a),
         _ => false,

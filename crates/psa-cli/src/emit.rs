@@ -597,6 +597,106 @@ impl Emitter {
         Ok(tmp)
     }
 
+    /// One slice bound as a dynamic value: omitted is None (tag 3),
+    /// ints and bools box, dynamic values pass through.
+    fn slice_bound_code(
+        &mut self,
+        ctx: &mut Ctx,
+        b: &Option<Box<Expr>>,
+        line: u32,
+    ) -> Result<String, String> {
+        match b {
+            None => Ok(Ty::Dyn.default_lit().to_string()),
+            Some(e) => {
+                let (c, t) = self.emit_expr(ctx, e, line)?;
+                match t {
+                    Ty::Dyn => Ok(c),
+                    Ty::Int | Ty::Bool => self.box_code(c, t, line),
+                    _ => Err(eerr(line, "slice indices must be integers or omitted")),
+                }
+            }
+        }
+    }
+
+    /// Construct a container literal as a dynamic value in a temp,
+    /// for nesting inside another container, a subscript store or
+    /// an append.
+    fn emit_container_temp(&mut self, ctx: &mut Ctx, e: &Expr, line: u32) -> Result<String, String> {
+        match e {
+            Expr::ListLit(elems) => {
+                let codes = self.emit_list_literal_dyn(ctx, elems, line)?;
+                ctx.tmp += 1;
+                let tmp = format!("__psa_ctmp_{}", ctx.tmp);
+                self.emit_dyn_list_construct(ctx, &tmp, &codes, true);
+                Ok(tmp)
+            }
+            Expr::DictLit(pairs) => {
+                let codes = self.emit_dict_literal(ctx, pairs, line)?;
+                ctx.tmp += 1;
+                let tmp = format!("__psa_ctmp_{}", ctx.tmp);
+                self.emit_dyn_dict_construct(ctx, &tmp, &codes, true);
+                Ok(tmp)
+            }
+            _ => Err(eerr(line, "internal error: not a container literal")),
+        }
+    }
+
+    /// Element codes and types for a list literal, shared by the
+    /// static/dynamic decision and the forced-dynamic path used for
+    /// nesting. String literals become dynamic strings and nested
+    /// container literals become dynamic container temps.
+    fn list_elem_codes(
+        &mut self,
+        ctx: &mut Ctx,
+        elems: &[Expr],
+        line: u32,
+    ) -> Result<(Vec<String>, Vec<Ty>), String> {
+        let mut codes = Vec::new();
+        let mut tys = Vec::new();
+        for e in elems {
+            if let Expr::Str(s) = e {
+                codes.push(self.emit_str_temp(ctx, s, line)?);
+                tys.push(Ty::Dyn);
+                continue;
+            }
+            if matches!(e, Expr::ListLit(_) | Expr::DictLit(_)) {
+                codes.push(self.emit_container_temp(ctx, e, line)?);
+                tys.push(Ty::Dyn);
+                continue;
+            }
+            let (code, ty) = self.emit_expr(ctx, e, line)?;
+            codes.push(code);
+            tys.push(ty);
+        }
+        Ok((codes, tys))
+    }
+
+    /// A list literal forced onto the dynamic path (used when the
+    /// list itself is an element or value of another container).
+    fn emit_list_literal_dyn(
+        &mut self,
+        ctx: &mut Ctx,
+        elems: &[Expr],
+        line: u32,
+    ) -> Result<Vec<String>, String> {
+        let (codes, tys) = self.list_elem_codes(ctx, elems, line)?;
+        if tys.iter().any(|t| !matches!(t, Ty::Int | Ty::Float | Ty::Bool | Ty::Dyn)) {
+            return Err(eerr(
+                line,
+                "list elements of this type cannot become dynamic values",
+            ));
+        }
+        self.used_dyn = true;
+        let mut boxed = Vec::new();
+        for (code, ty) in codes.into_iter().zip(tys.iter()) {
+            boxed.push(match ty {
+                Ty::Dyn => code,
+                t => self.box_code(code, *t, line)?,
+            });
+        }
+        Ok(boxed)
+    }
+
     /// Extract a static value from a dynamic one at a boundary; the
     /// runtime checks the tag and panics TypeError-style on mismatch
     /// (design s3: unboxing carries a runtime type assertion).
@@ -697,19 +797,7 @@ impl Emitter {
         elems: &[Expr],
         line: u32,
     ) -> Result<ListLit, String> {
-        let mut codes = Vec::new();
-        let mut tys = Vec::new();
-        for e in elems {
-            // String literal elements become dynamic strings.
-            if let Expr::Str(s) = e {
-                codes.push(self.emit_str_temp(ctx, s, line)?);
-                tys.push(Ty::Dyn);
-                continue;
-            }
-            let (code, ty) = self.emit_expr(ctx, e, line)?;
-            codes.push(code);
-            tys.push(ty);
-        }
+        let (codes, tys) = self.list_elem_codes(ctx, elems, line)?;
         let dyn_list = tys.is_empty()
             || tys.iter().any(|t| *t == Ty::Dyn || *t == Ty::Float)
             || tys.iter().any(|t| *t != tys[0]);
@@ -717,7 +805,7 @@ impl Emitter {
             if tys.iter().any(|t| !matches!(t, Ty::Int | Ty::Float | Ty::Bool | Ty::Dyn)) {
                 return Err(eerr(
                     line,
-                    "list elements that are containers cannot become dynamic values yet (nested containers land later in D2)",
+                    "a static container value cannot become a dynamic element (only container literals nest)",
                 ));
             }
             self.used_dyn = true;
@@ -882,6 +970,8 @@ impl Emitter {
             };
             let (mut vcode, vty) = if let Expr::Str(s) = ve {
                 (self.emit_str_temp(ctx, s, line)?, Ty::Dyn)
+            } else if matches!(ve, Expr::ListLit(_) | Expr::DictLit(_)) {
+                (self.emit_container_temp(ctx, ve, line)?, Ty::Dyn)
             } else {
                 self.emit_expr(ctx, ve, line)?
             };
@@ -1312,6 +1402,8 @@ impl Emitter {
                     };
                     let (mut vcode, vty) = if let Expr::Str(s) = value {
                         (self.emit_str_temp(ctx, s, *line)?, Ty::Dyn)
+                    } else if matches!(value, Expr::ListLit(_) | Expr::DictLit(_)) {
+                        (self.emit_container_temp(ctx, value, *line)?, Ty::Dyn)
                     } else {
                         self.emit_expr(ctx, value, *line)?
                     };
@@ -1586,6 +1678,15 @@ impl Emitter {
                 // the same helpers the dynamic repr uses (D2 slice C).
                 let name = match &args[0] {
                     Expr::Name(n) => n.clone(),
+                    // A slice temp is also a plain name.
+                    _ if !code.is_empty()
+                        && code
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && !code.chars().next().unwrap().is_ascii_digit() =>
+                    {
+                        code.clone()
+                    }
                     _ => {
                         return Err(eerr(
                             line,
@@ -1807,14 +1908,33 @@ impl Emitter {
                 "dict literals are only supported as an assignment value or a return value in this slice",
             )),
             Expr::Index(base, idx) => {
+                // Chained indexing on a dynamic sub-expression
+                // (m[1][0]): the inner value is the container.
+                if !matches!(&**base, Expr::Name(_)) {
+                    let (bcode, bty) = self.emit_expr(ctx, base, line)?;
+                    if bty == Ty::Dyn {
+                        self.used_dyn = true;
+                        let (icode, ity) = self.emit_expr(ctx, idx, line)?;
+                        let kcode = match ity {
+                            Ty::Dyn => icode,
+                            Ty::Int | Ty::Bool => self.box_code(icode, ity, line)?,
+                            _ => {
+                                return Err(eerr(
+                                    line,
+                                    "a dynamic subscript key must be an int, bool, None or dynamic value in this slice (string keys land with the ordered-dict rework in D3)",
+                                ))
+                            }
+                        };
+                        return Ok((format!("__psa_dyn_get({}, {})", bcode, kcode), Ty::Dyn));
+                    }
+                    return Err(eerr(
+                        line,
+                        "indexing is only supported on plain variables in v0.3",
+                    ));
+                }
                 let obj = match &**base {
                     Expr::Name(n) => n.clone(),
-                    _ => {
-                        return Err(eerr(
-                            line,
-                            "indexing is only supported on plain variables in v0.3",
-                        ))
-                    }
+                    _ => unreachable!(),
                 };
                 let ty = ctx
                     .lookup(&obj)
@@ -1858,6 +1978,119 @@ impl Emitter {
                 // Scalar element: copied out of the borrow (spec s5).
                 Ok((format!("{}[{}]", obj, icode), elem))
             }
+            Expr::Slice(base, lo, hi, step) => {
+                // A string literal base becomes a dynamic string first.
+                if let Expr::Str(s) = &**base {
+                    let tmp = self.emit_str_temp(ctx, s, line)?;
+                    let lo_c = self.slice_bound_code(ctx, lo, line)?;
+                    let hi_c = self.slice_bound_code(ctx, hi, line)?;
+                    let st_c = self.slice_bound_code(ctx, step, line)?;
+                    return Ok((
+                        format!("__psa_dyn_slice({}, {}, {}, {})", tmp, lo_c, hi_c, st_c),
+                        Ty::Dyn,
+                    ));
+                }
+                // Chained slicing on a dynamic sub-expression.
+                if !matches!(&**base, Expr::Name(_)) {
+                    let (bcode, bty) = self.emit_expr(ctx, base, line)?;
+                    if bty == Ty::Dyn {
+                        self.used_dyn = true;
+                        let lo_c = self.slice_bound_code(ctx, lo, line)?;
+                        let hi_c = self.slice_bound_code(ctx, hi, line)?;
+                        let st_c = self.slice_bound_code(ctx, step, line)?;
+                        return Ok((
+                            format!("__psa_dyn_slice({}, {}, {}, {})", bcode, lo_c, hi_c, st_c),
+                            Ty::Dyn,
+                        ));
+                    }
+                    return Err(eerr(
+                        line,
+                        "slicing is only supported on plain variables in this slice",
+                    ));
+                }
+                let obj = match &**base {
+                    Expr::Name(n) => n.clone(),
+                    _ => unreachable!(),
+                };
+                let ty = ctx
+                    .lookup(&obj)
+                    .ok_or_else(|| eerr(line, &format!("undefined variable `{}`", obj)))?;
+                ctx.check_alive(&obj, line)?;
+                if ty == Ty::Dyn {
+                    self.used_dyn = true;
+                    let lo_c = self.slice_bound_code(ctx, lo, line)?;
+                    let hi_c = self.slice_bound_code(ctx, hi, line)?;
+                    let st_c = self.slice_bound_code(ctx, step, line)?;
+                    return Ok((
+                        format!("__psa_dyn_slice({}, {}, {}, {})", obj, lo_c, hi_c, st_c),
+                        Ty::Dyn,
+                    ));
+                }
+                let elem = match ty.elem() {
+                    Some(e) => e,
+                    None => {
+                        return Err(eerr(
+                            line,
+                            &format!("slicing is only supported on lists, not on {}", ty.py_name()),
+                        ))
+                    }
+                };
+                // Static list slice: stage the bounds once, ask the
+                // runtime for the normalised (start, stop, step),
+                // then copy the selected elements into a fresh Vec.
+                self.used_dyn = true;
+                let mut staged: Vec<(String, &'static str)> = Vec::new();
+                for (i, b) in [lo, hi, step].iter().enumerate() {
+                    match b {
+                        Some(e) => {
+                            let (c, t) = self.emit_expr(ctx, e, line)?;
+                            let c = match t {
+                                Ty::Int => c,
+                                Ty::Dyn => format!("__psa_unbox_int({})", c),
+                                _ => {
+                                    return Err(eerr(
+                                        line,
+                                        "slice indices must be integers",
+                                    ))
+                                }
+                            };
+                            ctx.tmp += 1;
+                            let v = format!("__psa_sb_{}", ctx.tmp);
+                            ctx.line(&format!("let {}: i64 = {};", v, c));
+                            staged.push((v, "true"));
+                            let _ = i;
+                        }
+                        None => staged.push(("0".to_string(), "false")),
+                    }
+                }
+                ctx.tmp += 1;
+                let tag = ctx.tmp;
+                let (sv, se, st) = (
+                    format!("__psa_ss_{}", tag),
+                    format!("__psa_se_{}", tag),
+                    format!("__psa_st_{}", tag),
+                );
+                ctx.line(&format!(
+                    "let ({}, {}, {}) = __psa_slice_bounds((len({}) as i64), {}, {}, {}, {}, {}, {});",
+                    sv, se, st, obj,
+                    staged[0].0, staged[0].1, staged[1].0, staged[1].1, staged[2].0, staged[2].1
+                ));
+                ctx.tmp += 1;
+                let out = format!("__psa_slc_{}", ctx.tmp);
+                ctx.declare(&out, ty).map_err(|m| eerr(line, &m))?;
+                ctx.line(&format!("let {}: {} = Vec::new();", out, ty.sla()));
+                ctx.tmp += 1;
+                let iv = format!("__psa_si_{}", ctx.tmp);
+                ctx.line(&format!("let {}: i64 = {};", iv, sv));
+                ctx.line(&format!(
+                    "while ({} > 0 && {} < {}) || ({} < 0 && {} > {}) {{",
+                    st, iv, se, st, iv, se
+                ));
+                ctx.line(&format!("{}.push({}[{}]);", out, obj, iv));
+                ctx.line(&format!("{} = {} + {};", iv, iv, st));
+                ctx.line("}");
+                Ok((out, ty))
+            }
             Expr::MethodCall { obj, method, args } => {
                 let ty = ctx
                     .lookup(obj)
@@ -1878,6 +2111,8 @@ impl Emitter {
                 if ty == Ty::Dyn {
                     let (mut acode, aty) = if let Expr::Str(s) = &args[0] {
                         (self.emit_str_temp(ctx, s, line)?, Ty::Dyn)
+                    } else if matches!(&args[0], Expr::ListLit(_) | Expr::DictLit(_)) {
+                        (self.emit_container_temp(ctx, &args[0], line)?, Ty::Dyn)
                     } else {
                         self.emit_expr(ctx, &args[0], line)?
                     };
@@ -2130,11 +2365,11 @@ impl Emitter {
                 let saved_out = std::mem::take(&mut ctx.out);
                 ctx.indent += 1;
                 let then_res = self.emit_expr(ctx, then, line);
-                let then_lines = std::mem::replace(&mut ctx.out, saved_out);
+                let mut then_lines = std::mem::replace(&mut ctx.out, saved_out);
                 let (tc, tt) = then_res?;
                 let saved_out = std::mem::take(&mut ctx.out);
                 let els_res = self.emit_expr(ctx, els, line);
-                let els_lines = std::mem::replace(&mut ctx.out, saved_out);
+                let mut els_lines = std::mem::replace(&mut ctx.out, saved_out);
                 ctx.indent -= 1;
                 let (ec, et) = els_res?;
                 if tt.is_list() || et.is_list() {
@@ -2143,12 +2378,44 @@ impl Emitter {
                         "if-expression branches cannot be lists in D0 (a branch value would move out of its scope)",
                     ));
                 }
-                if tt == Ty::Str || et == Ty::Str {
-                    return Err(eerr(
-                        line,
-                        "if-expressions with string branches are blocked by upstream defect (xxv): the value would have to live in a string temp, and string bindings cannot be lowered on the Rust sla build-exe route (see README)",
-                    ));
-                }
+                // String literal branches become dynamic strings,
+                // built inside their own branch lines (D2 slice C).
+                let (tc, tt) = if tt == Ty::Str {
+                    match &**then {
+                        Expr::Str(s) => {
+                            std::mem::swap(&mut ctx.out, &mut then_lines);
+                            let tmp_res = self.emit_str_temp(ctx, s, line);
+                            std::mem::swap(&mut ctx.out, &mut then_lines);
+                            (tmp_res?, Ty::Dyn)
+                        }
+                        _ => {
+                            return Err(eerr(
+                                line,
+                                "if-expression string branches must be plain string literals in this slice",
+                            ))
+                        }
+                    }
+                } else {
+                    (tc, tt)
+                };
+                let (ec, et) = if et == Ty::Str {
+                    match &**els {
+                        Expr::Str(s) => {
+                            std::mem::swap(&mut ctx.out, &mut els_lines);
+                            let tmp_res = self.emit_str_temp(ctx, s, line);
+                            std::mem::swap(&mut ctx.out, &mut els_lines);
+                            (tmp_res?, Ty::Dyn)
+                        }
+                        _ => {
+                            return Err(eerr(
+                                line,
+                                "if-expression string branches must be plain string literals in this slice",
+                            ))
+                        }
+                    }
+                } else {
+                    (ec, et)
+                };
                 // A void branch (a call that returns nothing) is the
                 // None value of the dynamic runtime.
                 let then_void = tt == Ty::Void;
@@ -2587,6 +2854,12 @@ fn param_usage(em: &Emitter, def: &Func, param: &str, visiting: &mut Vec<(String
                 let _ = base;
                 expr_consumes(em, idx, param, visiting)
             }
+            Expr::Slice(base, lo, hi, st) => {
+                let _ = base;
+                [lo, hi, st]
+                    .iter()
+                    .any(|o| o.as_ref().map(|e| expr_consumes(em, e, param, visiting)).unwrap_or(false))
+            }
             Expr::MethodCall { args, .. } => {
                 args.iter().any(|a| expr_consumes(em, a, param, visiting))
             }
@@ -2787,6 +3060,12 @@ fn expr_mentions(e: &Expr, name: &str) -> bool {
             expr_mentions(f, name) || args.iter().any(|a| expr_mentions(a, name))
         }
         Expr::Index(a, b) => expr_mentions(a, name) || expr_mentions(b, name),
+        Expr::Slice(a, lo, hi, st) => {
+            expr_mentions(a, name)
+                || [lo, hi, st]
+                    .iter()
+                    .any(|o| o.as_ref().map(|e| expr_mentions(e, name)).unwrap_or(false))
+        }
         Expr::MethodCall { obj, args, .. } => {
             obj == name || args.iter().any(|a| expr_mentions(a, name))
         }
@@ -2818,6 +3097,12 @@ fn expr_has_call(e: &Expr) -> bool {
         }
         Expr::Unary(_, a) => expr_has_call(a),
         Expr::Index(a, b) => expr_has_call(a) || expr_has_call(b),
+        Expr::Slice(a, lo, hi, st) => {
+            expr_has_call(a)
+                || [lo, hi, st]
+                    .iter()
+                    .any(|o| o.as_ref().map(|e| expr_has_call(e)).unwrap_or(false))
+        }
         Expr::ListLit(elems) => elems.iter().any(expr_has_call),
         Expr::DictLit(pairs) => pairs.iter().any(|(k, v)| expr_has_call(k) || expr_has_call(v)),
         Expr::IfExp { cond, then, els } => {
@@ -3520,6 +3805,93 @@ fn __psa_str_repr(v: PsaVal) -> PsaVal {
     }
     out = __psa_str_push(out, q);
     return out;
+}
+
+fn __psa_slice_idx(x: PsaVal) -> i64 {
+    if x.tag == 3 { return 0; };
+    if x.tag == 0 || x.tag == 2 { return x.ipay; };
+    panic(77065);
+}
+
+fn __psa_slice_bounds(n: i64, lo: i64, has_lo: bool, hi: i64, has_hi: bool, step: i64, has_step: bool) -> (i64, i64, i64) {
+    // CPython slice normalisation: wrap negatives, then clamp to
+    // [0, n] for a positive step and to [-1, n-1] for a negative one.
+    let stp = 1;
+    if has_step { stp = step; };
+    if stp == 0 { panic(77064); };
+    let start = 0;
+    let stop = 0;
+    if stp > 0 {
+        start = 0;
+        if has_lo {
+            start = lo;
+            if start < 0 { start = start + n; };
+            if start < 0 { start = 0; };
+            if start > n { start = n; };
+        };
+        stop = n;
+        if has_hi {
+            stop = hi;
+            if stop < 0 { stop = stop + n; };
+            if stop < 0 { stop = 0; };
+            if stop > n { stop = n; };
+        };
+    } else {
+        start = n - 1;
+        if has_lo {
+            start = lo;
+            if start < 0 { start = start + n; };
+            if start < -1 { start = -1; };
+            if start > n - 1 { start = n - 1; };
+        };
+        stop = -1;
+        if has_hi {
+            stop = hi;
+            if stop < 0 { stop = stop + n; };
+            if stop < -1 { stop = -1; };
+            if stop > n - 1 { stop = n - 1; };
+        };
+    };
+    return (start, stop, stp);
+}
+
+fn __psa_list_slice(v: PsaVal, lo: PsaVal, hi: PsaVal, step: PsaVal) -> PsaVal {
+    let n = __psa_list_len(v);
+    let (start, stop, stp) = __psa_slice_bounds(n, __psa_slice_idx(lo), lo.tag != 3, __psa_slice_idx(hi), hi.tag != 3, __psa_slice_idx(step), step.tag != 3);
+    let out = __psa_list_new();
+    let i = start;
+    if stp > 0 {
+        while i < stop { __psa_list_push(out, __psa_list_get(v, i)); i = i + stp; }
+    } else {
+        while i > stop { __psa_list_push(out, __psa_list_get(v, i)); i = i + stp; }
+    };
+    return out;
+}
+
+fn __psa_str_append_str(dst: PsaVal, src: PsaVal) -> PsaVal {
+    let n = __psa_str_bytes_len(src);
+    let i: i64 = 0;
+    while i < n { dst = __psa_str_push(dst, __psa_bytes_get_h(src.ipay as ptr, i)); i = i + 1; }
+    return dst;
+}
+
+fn __psa_str_slice(v: PsaVal, lo: PsaVal, hi: PsaVal, step: PsaVal) -> PsaVal {
+    let n = __psa_str_len(v);
+    let (start, stop, stp) = __psa_slice_bounds(n, __psa_slice_idx(lo), lo.tag != 3, __psa_slice_idx(hi), hi.tag != 3, __psa_slice_idx(step), step.tag != 3);
+    let out = __psa_str_new();
+    let i = start;
+    if stp > 0 {
+        while i < stop { out = __psa_str_append_str(out, __psa_str_get_cp(v, i)); i = i + stp; }
+    } else {
+        while i > stop { out = __psa_str_append_str(out, __psa_str_get_cp(v, i)); i = i + stp; }
+    };
+    return out;
+}
+
+fn __psa_dyn_slice(v: PsaVal, lo: PsaVal, hi: PsaVal, step: PsaVal) -> PsaVal {
+    if v.tag == 4 { return __psa_list_slice(v, lo, hi, step); };
+    if v.tag == 6 { return __psa_str_slice(v, lo, hi, step); };
+    panic(77052);
 }
 
 "#;

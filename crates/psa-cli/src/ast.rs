@@ -56,6 +56,8 @@ pub enum Expr {
     /// literals are not parsed (a `{` primary always expects pairs).
     DictLit(Vec<(Expr, Expr)>),
     Index(Box<Expr>, Box<Expr>),
+    /// `base[lo:hi:step]` — any of lo/hi/step may be omitted.
+    Slice(Box<Expr>, Option<Box<Expr>>, Option<Box<Expr>>, Option<Box<Expr>>),
     MethodCall { obj: String, method: String, args: Vec<Expr> },
     /// `then if cond else els` (Python conditional expression).
     IfExp { cond: Box<Expr>, then: Box<Expr>, els: Box<Expr> },

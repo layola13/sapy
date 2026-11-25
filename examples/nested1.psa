@@ -1,0 +1,35 @@
+m = [[1, 2], [3, 4]]
+print(m)
+print(m[0])
+print(m[1][0])
+print(len(m))
+print(len(m[0]))
+deep = [[["x"]]]
+print(deep)
+print(deep[0][0][0])
+mix = [1, [2, 3], "four", {5: "five"}]
+print(mix[1][1])
+print(mix[3][5])
+d = {1: [10, 20], 2: {3: "three"}}
+print(d[1])
+print(d[1][1])
+print(d[2][3])
+xs = []
+xs.append([7, 8])
+print(xs)
+print(xs[0][1])
+ys = [1, "two"]
+ys[0] = [9]
+print(ys)
+print(ys[0][0])
+d2 = {}
+d2[1] = [1, 2]
+print(d2[1])
+def fetch():
+    return [[1], [2, 3]]
+g = fetch()
+print(g[1][1])
+v = "yes" if len(m) > 1 else "no"
+print(v)
+w = "yes" if len(m) > 5 else "no"
+print(w)
