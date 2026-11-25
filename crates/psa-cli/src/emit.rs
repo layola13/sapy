@@ -295,6 +295,8 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
     }
     if em.used_dyn {
         out.push_str("@import \"sa_std/core/box.sa\"\n");
+        out.push_str("@import \"sa_std/hashmap.sa\"\n");
+        out.push_str("@import \"sa_std/core/option.sa\"\n");
     }
     if em.used_math || em.used_dyn {
         out.push_str("@import \"sa_std/math.sai\"\n");
@@ -812,6 +814,109 @@ impl Emitter {
         }
     }
 
+    /// Type-check a dict literal's pairs and emit key/value codes.
+    /// Keys are int/bool/None expressions or dynamic values (the
+    /// runtime normalises bool keys onto int keys and None onto a
+    /// sentinel, matching Python key identity for those kinds).
+    /// Float keys stay loud (Python float key identity needs
+    /// value-based hashing) and string keys land with the dynamic
+    /// string runtime. Values are any D1 scalar or dynamic value,
+    /// boxed on the way in.
+    fn emit_dict_literal(
+        &mut self,
+        ctx: &mut Ctx,
+        pairs: &[(Expr, Expr)],
+        line: u32,
+    ) -> Result<Vec<(String, String)>, String> {
+        self.used_dyn = true;
+        let mut out = Vec::new();
+        for (ke, ve) in pairs {
+            let (kcode, kty) = self.emit_expr(ctx, ke, line)?;
+            let kcode = match kty {
+                Ty::Dyn => kcode,
+                Ty::Int | Ty::Bool => self.box_code(kcode, kty, line)?,
+                Ty::Float => {
+                    return Err(eerr(
+                        line,
+                        "float dict keys are not supported yet (Python float key identity needs value-based hashing)",
+                    ))
+                }
+                Ty::Str => {
+                    return Err(eerr(
+                        line,
+                        "string dict keys land with the dynamic string runtime later in D2",
+                    ))
+                }
+                _ => {
+                    return Err(eerr(
+                        line,
+                        "dict keys must be int, bool, None or dynamic values in this slice",
+                    ))
+                }
+            };
+            let (mut vcode, vty) = self.emit_expr(ctx, ve, line)?;
+            if vty != Ty::Dyn {
+                vcode = self.box_code(vcode, vty, line)?;
+            }
+            out.push((kcode, vcode));
+        }
+        Ok(out)
+    }
+
+    /// Emit the construction of a dynamic dict bound to `name`: a
+    /// fresh handle plus one runtime set per key/value code pair.
+    fn emit_dyn_dict_construct(
+        &mut self,
+        ctx: &mut Ctx,
+        name: &str,
+        pairs: &[(String, String)],
+        declare: bool,
+    ) {
+        self.used_dyn = true;
+        if declare {
+            ctx.line(&format!("let {} = __psa_dict_new();", name));
+        } else {
+            ctx.line(&format!("{} = __psa_dict_new();", name));
+        }
+        for (k, v) in pairs {
+            ctx.line(&format!("__psa_dict_set({}, {}, {});", name, k, v));
+        }
+    }
+
+    fn emit_dict_assign(
+        &mut self,
+        ctx: &mut Ctx,
+        name: &str,
+        pairs: &[(Expr, Expr)],
+        line: u32,
+    ) -> Result<(), String> {
+        let codes = self.emit_dict_literal(ctx, pairs, line)?;
+        match ctx.lookup(name) {
+            None => {
+                ctx.declare(name, Ty::Dyn).map_err(|m| eerr(line, &m))?;
+                self.emit_dyn_dict_construct(ctx, name, &codes, true);
+                Ok(())
+            }
+            Some(Ty::Dyn) => {
+                ctx.tmp += 1;
+                let tmp = format!("__psa_ltmp_{}", ctx.tmp);
+                ctx.declare(&tmp, Ty::Dyn).map_err(|m| eerr(line, &m))?;
+                self.emit_dyn_dict_construct(ctx, &tmp, &codes, true);
+                self.emit_dyn_store(ctx, name, &tmp)?;
+                ctx.revive(name);
+                Ok(())
+            }
+            Some(other) => Err(eerr(
+                line,
+                &format!(
+                    "variable `{}` changes type from {} to a dynamic dict",
+                    name,
+                    other.py_name()
+                ),
+            )),
+        }
+    }
+
     fn emit_block(&mut self, ctx: &mut Ctx, stmts: &[Stmt]) -> Result<(), String> {
         ctx.scopes.push(ctx.vars.len());
         for s in stmts {
@@ -865,6 +970,15 @@ impl Emitter {
                             }
                         }
                     }
+                    Some(Expr::DictLit(pairs)) => {
+                        // Build the dict in a temp, then return it (move).
+                        let codes = self.emit_dict_literal(ctx, pairs, *line)?;
+                        ctx.tmp += 1;
+                        let tmp = format!("__psa_ret_{}", ctx.tmp);
+                        self.emit_dyn_dict_construct(ctx, &tmp, &codes, true);
+                        unify_ret(ctx, Ty::Dyn, *line)?;
+                        ctx.line(&format!("return {};", tmp));
+                    }
                     Some(e) => {
                         if let Expr::Name(n) = e {
                             if ctx.borrowed.contains(n) {
@@ -905,6 +1019,10 @@ impl Emitter {
                 // List literals are constructed statement-wise.
                 if let Expr::ListLit(elems) = value {
                     return self.emit_list_assign(ctx, name, elems, *line);
+                }
+                // Dict literals likewise (always dynamic, D2 slice C).
+                if let Expr::DictLit(pairs) = value {
+                    return self.emit_dict_assign(ctx, name, pairs, *line);
                 }
                 let (mut code, mut ty) = self.emit_expr(ctx, value, *line)?;
                 if ty == Ty::Void {
@@ -1134,27 +1252,38 @@ impl Emitter {
                     .lookup(name)
                     .ok_or_else(|| eerr(*line, &format!("index assignment to undefined variable `{}`", name)))?;
                 ctx.check_alive(name, *line)?;
-                let (mut icode, ity) = self.emit_expr(ctx, index, *line)?;
-                if ity == Ty::Dyn {
-                    icode = self.unbox_code(icode, Ty::Int, *line)?;
-                } else if ity != Ty::Int {
-                    return Err(eerr(*line, "list index must be int"));
-                }
                 if ty == Ty::Dyn {
                     self.used_dyn = true;
+                    let (icode, ity) = self.emit_expr(ctx, index, *line)?;
+                    let kcode = match ity {
+                        Ty::Dyn => icode,
+                        Ty::Int | Ty::Bool => self.box_code(icode, ity, *line)?,
+                        _ => {
+                            return Err(eerr(
+                                *line,
+                                "a dynamic subscript key must be an int, bool, None or dynamic value in this slice (string keys land with the dynamic string runtime)",
+                            ))
+                        }
+                    };
                     let (mut vcode, vty) = self.emit_expr(ctx, value, *line)?;
                     if vty != Ty::Dyn {
                         vcode = self.box_code(vcode, vty, *line)?;
                     }
                     match op {
-                        None => ctx.line(&format!("__psa_list_set({}, {}, {});", name, icode, vcode)),
+                        None => ctx.line(&format!("__psa_dyn_set({}, {}, {});", name, kcode, vcode)),
                         Some(bop) => {
-                            let place = format!("__psa_list_get({}, {})", name, icode);
+                            let place = format!("__psa_dyn_get({}, {})", name, kcode);
                             let (code, _) = self.emit_binop(place, Ty::Dyn, *bop, vcode, Ty::Dyn, *line)?;
-                            ctx.line(&format!("__psa_list_set({}, {}, {});", name, icode, code));
+                            ctx.line(&format!("__psa_dyn_set({}, {}, {});", name, kcode, code));
                         }
                     }
                     return Ok(());
+                }
+                let (mut icode, ity) = self.emit_expr(ctx, index, *line)?;
+                if ity == Ty::Dyn {
+                    icode = self.unbox_code(icode, Ty::Int, *line)?;
+                } else if ity != Ty::Int {
+                    return Err(eerr(*line, "list index must be int"));
                 }
                 let elem = match ty.elem() {
                     Some(e) => e,
@@ -1587,6 +1716,10 @@ impl Emitter {
                 line,
                 "list literals are only supported as an assignment value or a return value in v0.3",
             )),
+            Expr::DictLit(_) => Err(eerr(
+                line,
+                "dict literals are only supported as an assignment value or a return value in this slice",
+            )),
             Expr::Index(base, idx) => {
                 let obj = match &**base {
                     Expr::Name(n) => n.clone(),
@@ -1601,18 +1734,31 @@ impl Emitter {
                     .lookup(&obj)
                     .ok_or_else(|| eerr(line, &format!("undefined variable `{}`", obj)))?;
                 ctx.check_alive(&obj, line)?;
+                if ty == Ty::Dyn {
+                    // Dynamic subscript: the key stays a PsaVal and
+                    // the runtime dispatches on the container kind
+                    // (list: int key, negative-index normalisation,
+                    // bounds panic 77050; dict: key normalisation,
+                    // missing-key panic 77054; other kinds 77052).
+                    self.used_dyn = true;
+                    let (icode, ity) = self.emit_expr(ctx, idx, line)?;
+                    let kcode = match ity {
+                        Ty::Dyn => icode,
+                        Ty::Int | Ty::Bool => self.box_code(icode, ity, line)?,
+                        _ => {
+                            return Err(eerr(
+                                line,
+                                "a dynamic subscript key must be an int, bool, None or dynamic value in this slice (string keys land with the dynamic string runtime)",
+                            ))
+                        }
+                    };
+                    return Ok((format!("__psa_dyn_get({}, {})", obj, kcode), Ty::Dyn));
+                }
                 let (mut icode, ity) = self.emit_expr(ctx, idx, line)?;
                 if ity == Ty::Dyn {
                     icode = self.unbox_code(icode, Ty::Int, line)?;
                 } else if ity != Ty::Int {
                     return Err(eerr(line, "list index must be int"));
-                }
-                if ty == Ty::Dyn {
-                    // Dynamic subscript: the runtime checks the kind
-                    // (list), normalises negative indices and bounds
-                    // (panic 77050/77052).
-                    self.used_dyn = true;
-                    return Ok((format!("__psa_list_get({}, {})", obj, icode), Ty::Dyn));
                 }
                 let elem = match ty.elem() {
                     Some(e) => e,
@@ -2105,9 +2251,9 @@ impl Emitter {
             BinOp::BitXor => "__psa_dyn_bitxor",
             BinOp::Shl => "__psa_dyn_shl",
             BinOp::Shr => "__psa_dyn_shr",
-            BinOp::In => return Ok((format!("__psa_list_contains({}, {})", rc, lc), Ty::Bool)),
+            BinOp::In => return Ok((format!("__psa_dyn_contains({}, {})", rc, lc), Ty::Bool)),
             BinOp::NotIn => {
-                return Ok((format!("!(__psa_list_contains({}, {}))", rc, lc), Ty::Bool))
+                return Ok((format!("!(__psa_dyn_contains({}, {}))", rc, lc), Ty::Bool))
             }
             BinOp::Eq => return Ok((format!("__psa_dyn_eq({}, {})", lc, rc), Ty::Bool)),
             BinOp::NotEq => return Ok((format!("__psa_dyn_ne({}, {})", lc, rc), Ty::Bool)),
@@ -2311,6 +2457,9 @@ fn param_usage(em: &Emitter, def: &Func, param: &str, visiting: &mut Vec<(String
                 args.iter().any(|a| expr_consumes(em, a, param, visiting))
             }
             Expr::ListLit(elems) => elems.iter().any(|a| expr_consumes(em, a, param, visiting)),
+            Expr::DictLit(pairs) => pairs.iter().any(|(k, v)| {
+                expr_consumes(em, k, param, visiting) || expr_consumes(em, v, param, visiting)
+            }),
             _ => false,
         }
     }
@@ -2508,6 +2657,9 @@ fn expr_mentions(e: &Expr, name: &str) -> bool {
             obj == name || args.iter().any(|a| expr_mentions(a, name))
         }
         Expr::ListLit(elems) => elems.iter().any(|a| expr_mentions(a, name)),
+        Expr::DictLit(pairs) => pairs
+            .iter()
+            .any(|(k, v)| expr_mentions(k, name) || expr_mentions(v, name)),
         Expr::IfExp { cond, then, els } => {
             expr_mentions(cond, name)
                 || expr_mentions(then, name)
@@ -2533,6 +2685,7 @@ fn expr_has_call(e: &Expr) -> bool {
         Expr::Unary(_, a) => expr_has_call(a),
         Expr::Index(a, b) => expr_has_call(a) || expr_has_call(b),
         Expr::ListLit(elems) => elems.iter().any(expr_has_call),
+        Expr::DictLit(pairs) => pairs.iter().any(|(k, v)| expr_has_call(k) || expr_has_call(v)),
         Expr::IfExp { cond, then, els } => {
             expr_has_call(cond) || expr_has_call(then) || expr_has_call(els)
         }
@@ -2662,6 +2815,8 @@ fn __psa_dyn_pow(a: PsaVal, b: PsaVal) -> PsaVal {
 }
 
 fn __psa_dyn_eq(a: PsaVal, b: PsaVal) -> bool {
+    if a.tag == 5 && b.tag == 5 { panic(77056); };
+    if a.tag == 5 || b.tag == 5 { return false; };
     if a.tag == 4 && b.tag == 4 { return __psa_list_eq(a, b); };
     if a.tag == 3 && b.tag == 3 { return true; };
     if a.tag <= 2 && b.tag <= 2 {
@@ -2713,6 +2868,7 @@ fn __psa_dyn_truthy(v: PsaVal) -> bool {
     if v.tag == 2 { return v.ipay != 0; };
     if v.tag == 3 { return false; };
     if v.tag == 4 { return __psa_list_len(v) != 0; };
+    if v.tag == 5 { return __psa_dict_len(v) != 0; };
     panic(77010);
 }
 
@@ -2777,6 +2933,7 @@ fn __psa_unbox_bool(v: PsaVal) -> bool {
 
 fn __psa_print_dyn(v: PsaVal) -> i32 {
     if v.tag == 4 { panic(77051); };
+    if v.tag == 5 { panic(77057); };
     if v.tag == 0 { println("{}", v.ipay); return 0; };
     if v.tag == 2 {
         if v.ipay != 0 { println("True"); } else { println("False"); };
@@ -2860,6 +3017,7 @@ fn __psa_list_eq(a: PsaVal, b: PsaVal) -> bool {
 
 fn __psa_dyn_len(v: PsaVal) -> i64 {
     if v.tag == 4 { return __psa_list_len(v); };
+    if v.tag == 5 { return __psa_dict_len(v); };
     panic(77052);
 }
 
@@ -2872,6 +3030,90 @@ fn __psa_list_contains(v: PsaVal, x: PsaVal) -> bool {
         i = i + 1;
     }
     return false;
+}
+
+fn __psa_map_set_h(p: ptr, k: i64, tag: i64, ipay: i64, fpay: f64) {
+    let b = unsafe { Box::from_raw(p as *HashMap<i64, PsaVal>) };
+    (*b).insert(k, PsaVal { tag: tag, ipay: ipay, fpay: fpay });
+    let rp: i64 = Box::into_raw(b) as i64;
+}
+
+fn __psa_map_get_h(p: ptr, k: i64) -> PsaVal {
+    let b = unsafe { Box::from_raw(p as *HashMap<i64, PsaVal>) };
+    let o = (*b).get(k).copied();
+    let rp: i64 = Box::into_raw(b) as i64;
+    if o.is_some() { let u = o.unwrap(); return PsaVal { tag: u.tag, ipay: u.ipay, fpay: u.fpay }; };
+    panic(77054);
+}
+
+fn __psa_map_has_h(p: ptr, k: i64) -> bool {
+    let b = unsafe { Box::from_raw(p as *HashMap<i64, PsaVal>) };
+    let o = (*b).get(k).copied();
+    let rp: i64 = Box::into_raw(b) as i64;
+    return o.is_some();
+}
+
+fn __psa_map_len_h(p: ptr) -> i64 {
+    let b = unsafe { Box::from_raw(p as *HashMap<i64, PsaVal>) };
+    let n = (*b).len() as i64;
+    let rp: i64 = Box::into_raw(b) as i64;
+    return n;
+}
+
+fn __psa_dict_new() -> PsaVal {
+    let m: HashMap<i64, PsaVal> = HashMap::new();
+    return PsaVal { tag: 5, ipay: Box::into_raw(Box::new(m)) as i64, fpay: 0.0 };
+}
+
+fn __psa_key_norm(k: PsaVal) -> i64 {
+    if k.tag == 0 { return k.ipay; };
+    if k.tag == 2 { return k.ipay; };
+    if k.tag == 3 { return -9223372036854775801; };
+    panic(77053);
+}
+
+fn __psa_dict_set(v: PsaVal, k: PsaVal, x: PsaVal) {
+    if v.tag != 5 { panic(77052); };
+    __psa_map_set_h(v.ipay as ptr, __psa_key_norm(k), x.tag, x.ipay, x.fpay);
+}
+
+fn __psa_dict_get(v: PsaVal, k: PsaVal) -> PsaVal {
+    if v.tag != 5 { panic(77052); };
+    return __psa_map_get_h(v.ipay as ptr, __psa_key_norm(k));
+}
+
+fn __psa_dict_contains(v: PsaVal, k: PsaVal) -> bool {
+    if v.tag != 5 { panic(77052); };
+    return __psa_map_has_h(v.ipay as ptr, __psa_key_norm(k));
+}
+
+fn __psa_dict_len(v: PsaVal) -> i64 {
+    if v.tag != 5 { panic(77052); };
+    return __psa_map_len_h(v.ipay as ptr);
+}
+
+fn __psa_key_int(k: PsaVal) -> i64 {
+    if k.tag == 0 { return k.ipay; };
+    if k.tag == 2 { return k.ipay; };
+    panic(77050);
+}
+
+fn __psa_dyn_get(v: PsaVal, k: PsaVal) -> PsaVal {
+    if v.tag == 4 { return __psa_list_get(v, __psa_key_int(k)); };
+    if v.tag == 5 { return __psa_dict_get(v, k); };
+    panic(77052);
+}
+
+fn __psa_dyn_set(v: PsaVal, k: PsaVal, x: PsaVal) {
+    if v.tag == 4 { __psa_list_set(v, __psa_key_int(k), x); return; };
+    if v.tag == 5 { __psa_dict_set(v, k, x); return; };
+    panic(77052);
+}
+
+fn __psa_dyn_contains(v: PsaVal, x: PsaVal) -> bool {
+    if v.tag == 4 { return __psa_list_contains(v, x); };
+    if v.tag == 5 { return __psa_dict_contains(v, x); };
+    panic(77052);
 }
 
 "#;

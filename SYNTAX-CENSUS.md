@@ -22,16 +22,16 @@ Value 动态面（DYNAMIC-DESIGN.md）；【排除】= v1 明确不做、响亮�
 | 算术 + - * / // % ** | 支持 | D0 补 **：int 字面量指数走精确整数幂、其余走 sa_math_pow；int 非字面量指数响亮拒绝（结果类型取决于指数符号）；D1：任一操作数动态时走 PsaVal 运行时分派（** 按运行时指数符号分支、/ 恒 float、// % 按 Python 符号规则） |
 | 位运算 & \| ^ ~ << >> | 支持 | D0 已补，静态仅 int 操作数；D1：动态操作数运行时校验后分派 |
 | 比较 == != < <= > >= | 支持 | D0 补链式比较：中间操作数须纯（不得含调用），响亮拒绝不可复制者；D1：动态操作数跨类比较（int/float/bool 数值互通、None 等值、跨类排序响亮 panic） |
-| in / not in、is / is not | 部分 | D2 切片 B（2026-11-25）：in/not in 对动态 list 已支持（运行时逐元素 dyn_eq）；静态 list/str/dict 的 in 与 is/is not 仍 缺口-动态 |
+| in / not in、is / is not | 部分 | D2 切片 B（2026-11-25）：in/not in 对动态 list 已支持（运行时逐元素 dyn_eq）；D2 切片 C：动态 dict 的 in/not in 已支持（键归一化后查表）；静态 list/str 的 in 与 is/is not 仍 缺口-动态 |
 | and/or/not | 支持 | 纯 bool 发射为 SLA &&/\|\|，其短路语义受上游 (xviii) 影响；D1：含动态操作数时走运行时真值 + 返回操作数语义，短路保留；while 条件内动态 and/or 响亮拒绝 |
 | 三元表达式 x if c else y | 支持 | D0 已补：物化为临时变量 + if/else，可嵌套；while 条件内响亮拒绝；str 分支被 (xxv) 堵；D1：分支标量类型不一致或含动态时装箱为动态值 |
-| 下标 xs[i] | 部分 | 静态 list 仅读标量元素；D2 切片 A：动态 list 下标读/写全支持（含负下标归一化、越界响亮 panic 77050、非 list 动态值 panic 77052）；切片仍 缺口-动态 |
+| 下标 xs[i] | 部分 | 静态 list 仅读标量元素；D2 切片 A：动态 list 下标读/写全支持（含负下标归一化、越界响亮 panic 77050、非 list 动态值 panic 77052）；D2 切片 C：动态 dict 下标读（缺失键响亮 panic 77054）；切片仍 缺口-动态 |
 | 切片 xs[a:b:c] | 缺口-动态 | list/str 都要，运行时产新容器 |
 | 属性访问 obj.attr | 缺口-动态 | 类与模块属性都靠它 |
 | 方法调用 | 部分 | 仅 list.append；str/list/dict 方法集 缺口-动态 |
 | 函数调用（位置参数） | 支持 | 关键字参数、默认值、*args/**kwargs 缺口-动态 |
 | lambda | 缺口-动态 | 闭包同项 |
-| 列表/字典/集合字面量 | 部分 | 同类型 int/bool list 静态；D2 切片 A：异构标量/含动态元素/float/空 list 字面量 = 动态堆 list（标签 4），append/len/下标/相等/真值全支持，print(list) 待 repr 运行时（响亮 panic 77051）；dict/set/嵌套仍 缺口-动态 |
+| 列表/字典/集合字面量 | 部分 | 同类型 int/bool list 静态；D2 切片 A：异构标量/含动态元素/float/空 list 字面量 = 动态堆 list（标签 4），append/len/下标/相等/真值全支持，print(list) 待 repr 运行时（响亮 panic 77051）；D2 切片 C：dict 字面量 = 动态堆 dict（标签 5，Box<HashMap<i64,PsaVal>>），int/bool/None 键（bool 键与 int 键同一、None 键哨兵，与 Python 键同一性一致），值任意 D1 标量/动态值，print(dict) 待 repr（响亮 panic 77057）、dict 相等响亮 panic 77056（待键迭代面）；str/float 键与 set/嵌套容器字面量仍 缺口-动态（响亮拒绝） |
 | 元组字面量与拆包 | 缺口-动态 | 静态元组可先行（前端+结构体） |
 | 推导式（list/dict/set/生成器） | 缺口-动态 | list 推导式最高频，先做 |
 | 生成器表达式/yield | 缺口-动态 | 需状态机或协程运行时，分期后段 |
@@ -42,7 +42,7 @@ Value 动态面（DYNAMIC-DESIGN.md）；【排除】= v1 明确不做、响亮�
 | 项 | 状态 | 备注 |
 |---|---|---|
 | 赋值、增广赋值 | 支持 | 多重赋值 a=b=1、序列拆包 a,b=b,a 已支持（2026-11-25 晚间段：RHS 先求值入临时量再绑定；链式绑定的 list 别名响亮拒绝——所有权不可别名）。附带修复：`q = p` 标量新绑定在 SAB 路会 MOVE 源（(xxvii)(a) 族），psa 改先声明后赋值绕行 |
-| 下标赋值 xs[i]=v | 部分 | 静态 list + D2 切片 A 动态 list（含增广下标赋值）；dict 下标赋值 缺口-动态 |
+| 下标赋值 xs[i]=v | 部分 | 静态 list + D2 切片 A 动态 list（含增广下标赋值）；D2 切片 C：动态 dict 下标赋值（含增广）已支持 |
 | if/elif/else、while、break/continue | 支持 | while/else、for/else 缺口-前端（低频） |
 | for x in range(...) | 部分 | range 一/二参；D2 切片 B：for x in <list 变量> 已支持（静态与动态 list，长度逐轮重读、与 CPython 迭代器语义一致；continue 响亮拒绝）；for 遍历 str/dict 仍 缺口-动态 |
 | return、pass | 支持 | return 多值（元组）随元组项 |
@@ -60,7 +60,7 @@ Value 动态面（DYNAMIC-DESIGN.md）；【排除】= v1 明确不做、响亮�
 | 项 | 状态 | 备注 |
 |---|---|---|
 | print | 部分 | 多参/bool 有限形态；sep/end 缺口-动态；D1：单个动态值打印已支持（int/bool/None；float 动态打印被 (xxiii) 堵、响亮 panic 77030）；多参中的动态值响亮拒绝 |
-| len | 部分 | 静态 list + D2 切片 A 动态 list（__psa_dyn_len 运行时分发）；str/dict/set 随动态面 |
+| len | 部分 | 静态 list + D2 切片 A 动态 list、切片 C 动态 dict（__psa_dyn_len 运行时分发）；str/set 随动态面 |
 | range | 部分 | 仅 for 头；range 对象本身 缺口 |
 | int/float/str/bool 转换 | 缺口-动态 | 高频，随动态面 |
 | type/isinstance | 缺口-动态 | 动态面标签即 type |

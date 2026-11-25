@@ -745,6 +745,24 @@ impl Parser {
                 self.expect(&Tok::RBracket)?;
                 Ok(Expr::ListLit(elems))
             }
+            Tok::LBrace => {
+                let mut pairs = Vec::new();
+                if !matches!(self.peek(), Tok::RBrace) {
+                    loop {
+                        let k = self.parse_expr()?;
+                        self.expect(&Tok::Colon)?;
+                        let v = self.parse_expr()?;
+                        pairs.push((k, v));
+                        if matches!(self.peek(), Tok::Comma) {
+                            self.bump();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&Tok::RBrace)?;
+                Ok(Expr::DictLit(pairs))
+            }
             t => Err(perr(line, &format!("unexpected token {:?} in expression", t))),
         }
     }

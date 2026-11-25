@@ -52,6 +52,9 @@ pub enum Expr {
     Unary(UnOp, Box<Expr>),
     Call(Box<Expr>, Vec<Expr>),
     ListLit(Vec<Expr>),
+    /// `{k: v, ...}` — dynamic dict literal (D2 slice C). Set
+    /// literals are not parsed (a `{` primary always expects pairs).
+    DictLit(Vec<(Expr, Expr)>),
     Index(Box<Expr>, Box<Expr>),
     MethodCall { obj: String, method: String, args: Vec<Expr> },
     /// `then if cond else els` (Python conditional expression).

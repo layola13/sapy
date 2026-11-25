@@ -42,6 +42,8 @@ pub enum Tok {
     RParen,
     LBracket,
     RBracket,
+    LBrace,
+    RBrace,
     Comma,
     Colon,
     Dot,
@@ -366,6 +368,14 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 b']' => {
                     pos += 1;
                     out.push(Token { tok: Tok::RBracket, line: tok_line });
+                }
+                b'{' => {
+                    pos += 1;
+                    out.push(Token { tok: Tok::LBrace, line: tok_line });
+                }
+                b'}' => {
+                    pos += 1;
+                    out.push(Token { tok: Tok::RBrace, line: tok_line });
                 }
                 b',' => {
                     pos += 1;
