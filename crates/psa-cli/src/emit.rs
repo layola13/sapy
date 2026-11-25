@@ -93,6 +93,8 @@ pub struct Emitter {
     used_floordiv: bool,
     used_floormod: bool,
     used_vec: bool,
+    used_ipow: bool,
+    used_math: bool,
 }
 
 struct Ctx {
@@ -104,6 +106,10 @@ struct Ctx {
     indent: usize,
     tmp: usize,
     borrowed: Vec<String>,
+    /// True while emitting a while-condition: if-expressions are rejected
+    /// there because their materialised temp would only be computed once,
+    /// before the loop, not on every evaluation of the condition.
+    in_while_cond: bool,
 }
 
 impl Ctx {
@@ -175,6 +181,8 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
         used_floordiv: false,
         used_floormod: false,
         used_vec: false,
+        used_ipow: false,
+        used_math: false,
     };
     for f in &prog.funcs {
         if em.defs.insert(f.name.clone(), f.clone()).is_some() {
@@ -192,6 +200,7 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
         indent: 1,
         tmp: 0,
         borrowed: Vec::new(),
+        in_while_cond: false,
     };
     for s in &prog.top {
         em.emit_stmt(&mut main_ctx, s)?;
@@ -206,7 +215,15 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
     if em.used_vec {
         out.push_str("@import \"sa_std/vec.sa\"\n");
     }
+    if em.used_math {
+        out.push_str("@import \"sa_std/math.sai\"\n");
+    }
     out.push('\n');
+    if em.used_ipow {
+        out.push_str(
+            "fn __psa_ipow(a: i64, e: i64) -> i64 {\n    let r = 1;\n    let b = a;\n    let n = e;\n    while n > 0 {\n        if (n & 1) == 1 { r = r * b; };\n        b = b * b;\n        n = n >> 1;\n    }\n    return r;\n}\n\n",
+        );
+    }
     if em.used_floordiv {
         out.push_str(
             "fn __psa_floordiv(a: i64, b: i64) -> i64 {\n    let q = a / b;\n    let r = a % b;\n    if r != 0 && ((r < 0) != (b < 0)) { return q - 1; };\n    return q;\n}\n\n",
@@ -256,6 +273,12 @@ impl Emitter {
                 ),
             ));
         }
+        if arg_tys.iter().any(|t| *t == Ty::Str) {
+            return Err(eerr(
+                line,
+                "passing a string value to a function is blocked by upstream defect (xxv): string bindings cannot be lowered on the Rust sla build-exe route (see README)",
+            ));
+        }
         // Ownership per parameter, from the callee body alone (spec
         // s4): a list parameter the body only reads or writes through
         // is borrowed (SLA &Vec<T>); one it moves out of is consumed
@@ -301,6 +324,7 @@ impl Emitter {
                 .filter(|(_, b)| **b)
                 .map(|(p, _)| p.clone())
                 .collect(),
+            in_while_cond: false,
         };
         let body_res = (|| {
             for s in &def.body {
@@ -522,6 +546,12 @@ impl Emitter {
                             }
                         }
                         let (code, ty) = self.emit_expr(ctx, e, *line)?;
+                        if ty == Ty::Str {
+                            return Err(eerr(
+                                *line,
+                                "returning a string value is blocked by upstream defect (xxv): string bindings cannot be lowered on the Rust sla build-exe route (see README)",
+                            ));
+                        }
                         if ctx.fname == "main" {
                             if ty != Ty::Int {
                                 return Err(eerr(*line, "main must return an int"));
@@ -543,6 +573,12 @@ impl Emitter {
                 let (code, ty) = self.emit_expr(ctx, value, *line)?;
                 if ty == Ty::Void {
                     return Err(eerr(*line, "cannot assign a void value"));
+                }
+                if ty == Ty::Str {
+                    return Err(eerr(
+                        *line,
+                        "binding a string value to a variable is blocked by upstream defect (xxv): string bindings cannot be lowered on the Rust sla build-exe route (see README); string literals in print() work",
+                    ));
                 }
                 // Container assignment moves the source binding (spec s3).
                 let src_name = match value {
@@ -568,10 +604,14 @@ impl Emitter {
                     }
                     Some(existing) => {
                         if existing == ty {
-                            ctx.line(&format!("{} = {};", name, code));
+                            let nt = expr_mentions(value, name) && expr_has_call(value);
+                            assign_line(ctx, name, &code, ty, false, nt)
+                                .map_err(|m| eerr(*line, &m))?;
                             ctx.revive(name);
                         } else if existing == Ty::Float && ty == Ty::Int {
-                            ctx.line(&format!("{} = {} as f64;", name, code));
+                            let nt = expr_mentions(value, name) && expr_has_call(value);
+                            assign_line(ctx, name, &code, ty, true, nt)
+                                .map_err(|m| eerr(*line, &m))?;
                         } else {
                             return Err(eerr(
                                 *line,
@@ -635,9 +675,12 @@ impl Emitter {
                     Box::new(value.clone()),
                 );
                 let (code, ty) = self.emit_expr(ctx, &fake, *line)?;
+                let needs_temp = matches!(op, BinOp::FloorDiv | BinOp::Mod | BinOp::Pow)
+                    || expr_has_call(value);
                 if ty != existing {
                     if existing == Ty::Float && ty == Ty::Int {
-                        ctx.line(&format!("{} = {} as f64;", name, code));
+                        assign_line(ctx, name, &code, ty, true, needs_temp)
+                            .map_err(|m| eerr(*line, &m))?;
                         return Ok(());
                     }
                     return Err(eerr(
@@ -645,7 +688,8 @@ impl Emitter {
                         &format!("augmented assignment changes `{}` from {:?} to {:?}", name, existing, ty),
                     ));
                 }
-                ctx.line(&format!("{} = {};", name, code));
+                assign_line(ctx, name, &code, ty, false, needs_temp)
+                    .map_err(|m| eerr(*line, &m))?;
                 Ok(())
             }
             Stmt::ExprStmt { value, line } => {
@@ -686,7 +730,11 @@ impl Emitter {
                 Ok(())
             }
             Stmt::While { cond, body, line } => {
-                let (ccode, cty) = self.emit_expr(ctx, cond, *line)?;
+                let saved = ctx.in_while_cond;
+                ctx.in_while_cond = true;
+                let res = self.emit_expr(ctx, cond, *line);
+                ctx.in_while_cond = saved;
+                let (ccode, cty) = res?;
                 if cty != Ty::Bool {
                     return Err(eerr(*line, "while condition must be bool"));
                 }
@@ -742,6 +790,15 @@ impl Emitter {
         if args.is_empty() {
             ctx.line("println(\"\");");
             return Ok(());
+        }
+        // An f-string as the sole argument lowers to one println whose
+        // format string is assembled from its literal parts.
+        if args.len() == 1 {
+            if let Expr::FStr(parts) = &args[0] {
+                return self.emit_print_fstr(ctx, parts, line);
+            }
+        } else if args.iter().any(|a| matches!(a, Expr::FStr(_))) {
+            return Err(eerr(line, "an f-string must be the only print argument in D0"));
         }
         // Single bool argument: Python prints True/False.
         if args.len() == 1 {
@@ -806,6 +863,105 @@ impl Emitter {
             ctx.line(&format!("println(\"{}\");", fmt));
         } else {
             ctx.line(&format!("println(\"{}\", {});", fmt, codes.join(", ")));
+        }
+        Ok(())
+    }
+
+    /// print(f"...") — assemble println output from the f-string's parts.
+    /// Literal parts become format text (braces are rejected: SLA's
+    /// println has no brace escaping, as a probe showed `{{}}` printing
+    /// a lone `{`); interpolated ints become `{}` holes. A single bool
+    /// interpolation is rendered by emitting both println variants under
+    /// an if/else (there is no string temp to hold "True"/"False" —
+    /// string bindings are blocked upstream, defect (xxv)).
+    fn emit_print_fstr(
+        &mut self,
+        ctx: &mut Ctx,
+        parts: &[FStrPart],
+        line: u32,
+    ) -> Result<(), String> {
+        let mut fmt = String::new();
+        let mut codes: Vec<String> = Vec::new();
+        let mut bool_hole: Option<(String, usize)> = None;
+        for part in parts {
+            match part {
+                FStrPart::Lit(s) => {
+                    if s.contains('{') || s.contains('}') {
+                        return Err(eerr(
+                            line,
+                            "f-string literal text containing braces is not supported in D0 (SLA println has no brace escaping)",
+                        ));
+                    }
+                    fmt.push_str(&escape_sla_str(s));
+                }
+                FStrPart::Expr(e) => {
+                    if let Expr::Str(s) = e {
+                        if s.contains('{') || s.contains('}') {
+                            return Err(eerr(
+                                line,
+                                "f-string literal text containing braces is not supported in D0 (SLA println has no brace escaping)",
+                            ));
+                        }
+                        fmt.push_str(&escape_sla_str(s));
+                        continue;
+                    }
+                    let (code, ty) = self.emit_expr(ctx, e, line)?;
+                    match ty {
+                        Ty::Int => {
+                            fmt.push_str("{}");
+                            codes.push(code);
+                        }
+                        Ty::Bool => {
+                            if bool_hole.is_some() {
+                                return Err(eerr(
+                                    line,
+                                    "f-strings with more than one bool interpolation are not supported in D0",
+                                ));
+                            }
+                            bool_hole = Some((code, fmt.len()));
+                        }
+                        Ty::Str => {
+                            return Err(eerr(
+                                line,
+                                "interpolating a string value in an f-string is blocked by upstream defect (xxv): string values cannot be held in variables on the Rust sla build-exe route (see README); interpolate a literal or a number",
+                            ));
+                        }
+                        Ty::Float => {
+                            return Err(eerr(
+                                line,
+                                "interpolating a float in an f-string is blocked: the Rust sla build-exe route truncates f64 in println (upstream defect, see README)",
+                            ));
+                        }
+                        _ => {
+                            return Err(eerr(
+                                line,
+                                &format!(
+                                    "values of type {} cannot be interpolated in an f-string in D0",
+                                    ty.py_name()
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let args = if codes.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", codes.join(", "))
+        };
+        match bool_hole {
+            None => {
+                ctx.line(&format!("println(\"{}\"{}) ;", fmt, args));
+            }
+            Some((bcode, pos)) => {
+                let fmt_true = format!("{}True{}", &fmt[..pos], &fmt[pos..]);
+                let fmt_false = format!("{}False{}", &fmt[..pos], &fmt[pos..]);
+                ctx.line(&format!(
+                    "if {} {{ println(\"{}\"{}) ; }} else {{ println(\"{}\"{}) ; }};",
+                    bcode, fmt_true, args, fmt_false, args
+                ));
+            }
         }
         Ok(())
     }
@@ -904,6 +1060,14 @@ impl Emitter {
                             Err(eerr(line, "not needs a bool"))
                         }
                     }
+                    UnOp::BitNot => {
+                        if ty == Ty::Int {
+                            // ~x == -x - 1 exactly; no SLA operator needed.
+                            Ok((format!("(-({}) - 1)", code), Ty::Int))
+                        } else {
+                            Err(eerr(line, "~ needs an int operand"))
+                        }
+                    }
                 }
             }
             Expr::Call(callee, args) => {
@@ -983,10 +1147,140 @@ impl Emitter {
                 Ok((format!("{}({})", fname, arg_codes.join(", ")), ret))
             }
             Expr::Bin(l, op, r) => {
+                if *op == BinOp::Pow {
+                    return self.emit_pow(ctx, l, r, line);
+                }
                 let (lc, lt) = self.emit_expr(ctx, l, line)?;
                 let (rc, rt) = self.emit_expr(ctx, r, line)?;
                 self.emit_binop(lc, lt, *op, rc, rt, line)
             }
+            Expr::IfExp { cond, then, els } => {
+                if ctx.in_while_cond {
+                    return Err(eerr(
+                        line,
+                        "if-expressions are not supported in while conditions in D0 (the condition is re-evaluated every iteration); compute the value before the loop",
+                    ));
+                }
+                let (cc, ct) = self.emit_expr(ctx, cond, line)?;
+                if ct != Ty::Bool {
+                    return Err(eerr(line, "if-expression condition must be bool"));
+                }
+                // Emit each branch into a scratch buffer so any lines a
+                // nested if-expression produces land *inside* the branch
+                // block, not before the whole expression.
+                let saved_out = std::mem::take(&mut ctx.out);
+                ctx.indent += 1;
+                let then_res = self.emit_expr(ctx, then, line);
+                let then_lines = std::mem::replace(&mut ctx.out, saved_out);
+                let (tc, tt) = then_res?;
+                let saved_out = std::mem::take(&mut ctx.out);
+                let els_res = self.emit_expr(ctx, els, line);
+                let els_lines = std::mem::replace(&mut ctx.out, saved_out);
+                ctx.indent -= 1;
+                let (ec, et) = els_res?;
+                if tt.is_list() || et.is_list() {
+                    return Err(eerr(
+                        line,
+                        "if-expression branches cannot be lists in D0 (a branch value would move out of its scope)",
+                    ));
+                }
+                if tt == Ty::Str || et == Ty::Str {
+                    return Err(eerr(
+                        line,
+                        "if-expressions with string branches are blocked by upstream defect (xxv): the value would have to live in a string temp, and string bindings cannot be lowered on the Rust sla build-exe route (see README)",
+                    ));
+                }
+                let (ty, tc, ec) = match (tt, et) {
+                    (a, b) if a == b => (a, tc, ec),
+                    (Ty::Float, Ty::Int) => (Ty::Float, tc, format!("{} as f64", ec)),
+                    (Ty::Int, Ty::Float) => (Ty::Float, format!("{} as f64", tc), ec),
+                    _ => {
+                        return Err(eerr(
+                            line,
+                            &format!(
+                                "if-expression branches have different types ({} and {}); Python would make this value dynamic — the dynamic face is D1+",
+                                tt.py_name(),
+                                et.py_name()
+                            ),
+                        ))
+                    }
+                };
+                if ty == Ty::Void {
+                    return Err(eerr(line, "if-expression branches produce no value"));
+                }
+                ctx.tmp += 1;
+                let name = format!("__psa_ifexp_{}", ctx.tmp);
+                ctx.declare(&name, ty).map_err(|m| eerr(line, &m))?;
+                ctx.line(&format!("let {}: {} = {};", name, ty.sla(), ty.default_lit()));
+                ctx.line(&format!("if {} {{", cc));
+                ctx.out.push_str(&then_lines);
+                ctx.indent += 1;
+                ctx.line(&format!("{} = {};", name, tc));
+                ctx.indent -= 1;
+                ctx.line("} else {");
+                ctx.out.push_str(&els_lines);
+                ctx.indent += 1;
+                ctx.line(&format!("{} = {};", name, ec));
+                ctx.indent -= 1;
+                ctx.line("};");
+                Ok((name, ty))
+            }
+            Expr::FStr(_) => Err(eerr(
+                line,
+                "f-strings are supported as the sole argument of print() in D0; a general string value needs the string runtime (D2)",
+            )),
+        }
+    }
+
+    /// `**`: int ** int with a literal non-negative exponent uses the
+    /// exact integer helper; anything involving a float (or a negative
+    /// literal int exponent, whose Python result is a float) goes through
+    /// sa_std's `sa_math_pow`. A non-literal int exponent is rejected:
+    /// its Python result type depends on the runtime sign.
+    fn emit_pow(
+        &mut self,
+        ctx: &mut Ctx,
+        l: &Expr,
+        r: &Expr,
+        line: u32,
+    ) -> Result<(String, Ty), String> {
+        let (lc, lt) = self.emit_expr(ctx, l, line)?;
+        let (rc, rt) = self.emit_expr(ctx, r, line)?;
+        match (lt, rt) {
+            (Ty::Int, Ty::Int) => match int_literal(r) {
+                Some(e) if e >= 0 => {
+                    self.used_ipow = true;
+                    Ok((format!("__psa_ipow({}, {})", lc, rc), Ty::Int))
+                }
+                Some(_) => {
+                    self.used_math = true;
+                    Ok((
+                        format!("sa_math_pow({} as f64, {} as f64)", lc, rc),
+                        Ty::Float,
+                    ))
+                }
+                None => Err(eerr(
+                    line,
+                    "int ** needs a literal exponent in D0: with a computed exponent the Python result type (int vs float) depends on its sign — use a float base, or wait for the dynamic face (D1+)",
+                )),
+            },
+            (Ty::Float, Ty::Float)
+            | (Ty::Int, Ty::Float)
+            | (Ty::Float, Ty::Int) => {
+                self.used_math = true;
+                let lf = if lt == Ty::Int {
+                    format!("{} as f64", lc)
+                } else {
+                    lc
+                };
+                let rf = if rt == Ty::Int {
+                    format!("{} as f64", rc)
+                } else {
+                    rc
+                };
+                Ok((format!("sa_math_pow({}, {})", lf, rf), Ty::Float))
+            }
+            _ => Err(eerr(line, "** needs numeric operands")),
         }
     }
 
@@ -1085,6 +1379,23 @@ impl Emitter {
                 }
                 _ => Err(eerr(line, "% on non-integers is not supported in v0.1")),
             },
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
+                if lt != Ty::Int || rt != Ty::Int {
+                    return Err(eerr(
+                        line,
+                        "bitwise operators need int operands in D0 (Python also allows them on bools; that arrives with the dynamic face)",
+                    ));
+                }
+                let sym = match op {
+                    BinOp::BitAnd => "&",
+                    BinOp::BitOr => "|",
+                    BinOp::BitXor => "^",
+                    BinOp::Shl => "<<",
+                    _ => ">>",
+                };
+                Ok((format!("({} {} {})", lc, sym, rc), Ty::Int))
+            }
+            BinOp::Pow => Err(eerr(line, "internal error: ** is handled by emit_pow")),
         }
     }
 }
@@ -1275,6 +1586,96 @@ fn def_calls(stmts: &[Stmt], name: &str) -> bool {
         }
     }
     false
+}
+
+/// Emit `name = code;` (with an `as f64` widening cast when asked).
+/// When the value is a call that mentions the target itself, the direct
+/// shape `x = f(x, ...)` leaves a live register at function exit in the
+/// Rust sla build-exe lowering (defect (xxvi)); routing the value
+/// through a fresh temp first is the sound shape, so do that.
+fn assign_line(
+    ctx: &mut Ctx,
+    name: &str,
+    code: &str,
+    ty: Ty,
+    widen: bool,
+    needs_temp: bool,
+) -> Result<(), String> {
+    if needs_temp {
+        ctx.tmp += 1;
+        let tmp = format!("__psa_asn_{}", ctx.tmp);
+        ctx.declare(&tmp, ty)?;
+        ctx.line(&format!("let {}: {} = {};", tmp, ty.sla(), code));
+        if widen {
+            ctx.line(&format!("{} = {} as f64;", name, tmp));
+        } else {
+            ctx.line(&format!("{} = {};", name, tmp));
+        }
+    } else if widen {
+        ctx.line(&format!("{} = {} as f64;", name, code));
+    } else {
+        ctx.line(&format!("{} = {};", name, code));
+    }
+    Ok(())
+}
+
+/// Does the expression mention variable `name` anywhere?
+fn expr_mentions(e: &Expr, name: &str) -> bool {
+    match e {
+        Expr::Name(n) => n == name,
+        Expr::Bin(a, _, b) => expr_mentions(a, name) || expr_mentions(b, name),
+        Expr::Unary(_, a) => expr_mentions(a, name),
+        Expr::Call(f, args) => {
+            expr_mentions(f, name) || args.iter().any(|a| expr_mentions(a, name))
+        }
+        Expr::Index(a, b) => expr_mentions(a, name) || expr_mentions(b, name),
+        Expr::MethodCall { obj, args, .. } => {
+            obj == name || args.iter().any(|a| expr_mentions(a, name))
+        }
+        Expr::ListLit(elems) => elems.iter().any(|a| expr_mentions(a, name)),
+        Expr::IfExp { cond, then, els } => {
+            expr_mentions(cond, name)
+                || expr_mentions(then, name)
+                || expr_mentions(els, name)
+        }
+        Expr::FStr(parts) => parts
+            .iter()
+            .any(|p| matches!(p, FStrPart::Expr(x) if expr_mentions(x, name))),
+        _ => false,
+    }
+}
+
+/// Does the expression contain a call — including the helper calls that
+/// `//`, `%` (on ints) and `**` lower to?
+fn expr_has_call(e: &Expr) -> bool {
+    match e {
+        Expr::Call(..) | Expr::MethodCall { .. } => true,
+        Expr::Bin(a, op, b) => {
+            matches!(op, BinOp::FloorDiv | BinOp::Mod | BinOp::Pow)
+                || expr_has_call(a)
+                || expr_has_call(b)
+        }
+        Expr::Unary(_, a) => expr_has_call(a),
+        Expr::Index(a, b) => expr_has_call(a) || expr_has_call(b),
+        Expr::ListLit(elems) => elems.iter().any(expr_has_call),
+        Expr::IfExp { cond, then, els } => {
+            expr_has_call(cond) || expr_has_call(then) || expr_has_call(els)
+        }
+        Expr::FStr(parts) => parts
+            .iter()
+            .any(|p| matches!(p, FStrPart::Expr(x) if expr_has_call(x))),
+        _ => false,
+    }
+}
+
+/// The value of an integer literal expression, including a negated one
+/// (`-3` parses as unary minus over a literal).
+fn int_literal(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::Int(v) => Some(*v),
+        Expr::Unary(UnOp::Neg, inner) => int_literal(inner).map(|v| -v),
+        _ => None,
+    }
 }
 
 fn fmt_f64(v: f64) -> String {

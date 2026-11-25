@@ -8,6 +8,12 @@ pub enum BinOp {
     Div,     // Python `/` (true division)
     FloorDiv,
     Mod,
+    Pow,     // Python `**`
+    BitOr,   // `|`
+    BitXor,  // `^`
+    BitAnd,  // `&`
+    Shl,     // `<<`
+    Shr,     // `>>`
     Eq,
     NotEq,
     Lt,
@@ -22,6 +28,14 @@ pub enum BinOp {
 pub enum UnOp {
     Neg,
     Not,
+    BitNot, // `~`
+}
+
+/// One part of an f-string: literal text or an interpolated expression.
+#[derive(Debug, Clone)]
+pub enum FStrPart {
+    Lit(String),
+    Expr(Expr),
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +51,10 @@ pub enum Expr {
     ListLit(Vec<Expr>),
     Index(Box<Expr>, Box<Expr>),
     MethodCall { obj: String, method: String, args: Vec<Expr> },
+    /// `then if cond else els` (Python conditional expression).
+    IfExp { cond: Box<Expr>, then: Box<Expr>, els: Box<Expr> },
+    /// f-string with already-parsed interpolation expressions.
+    FStr(Vec<FStrPart>),
 }
 
 #[derive(Debug, Clone)]

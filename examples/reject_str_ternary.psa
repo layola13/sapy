@@ -1,0 +1,2 @@
+x = 7
+print("big" if x > 5 else "small")

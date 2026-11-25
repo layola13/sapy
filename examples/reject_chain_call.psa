@@ -1,0 +1,4 @@
+def f():
+    return 2
+
+print(1 < f() < 3)

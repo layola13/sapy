@@ -1,8 +1,16 @@
 //! Indentation-aware lexer for the .psa subset.
 //!
 //! Produces Newline / Indent / Dedent tokens Python-style. Anything outside
-//! the v0.1 subset (tabs in indentation, `**`, subscripts, f-strings, ...)
+//! the supported subset (tabs in indentation, f-string format specs, ...)
 //! is a loud error, never a silent skip.
+
+/// One part of an f-string token: literal text, or the source text of an
+/// interpolated expression (the parser re-parses it).
+#[derive(Debug, Clone, PartialEq)]
+pub enum FPart {
+    Lit(String),
+    Expr(String),
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
@@ -10,6 +18,7 @@ pub enum Tok {
     Int(i64),
     Float(f64),
     Str(String),
+    FStr(Vec<FPart>),
     // keywords
     Def,
     Return,
@@ -41,6 +50,13 @@ pub enum Tok {
     Slash,
     FloorDiv,
     Percent,
+    Pow,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Tilde,
+    Shl,
+    Shr,
     EqEq,
     NotEq,
     Lt,
@@ -51,6 +67,15 @@ pub enum Tok {
     PlusEq,
     MinusEq,
     StarEq,
+    SlashEq,
+    FloorDivEq,
+    PercentEq,
+    PowEq,
+    BitAndEq,
+    BitOrEq,
+    BitXorEq,
+    ShlEq,
+    ShrEq,
     Newline,
     Indent,
     Dedent,
@@ -213,6 +238,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                         pos += 1;
                     }
                     let word = &src[start..pos];
+                    // f-string: `f` immediately followed by a quote.
+                    if (word == "f" || word == "F")
+                        && pos < n
+                        && (bytes[pos] == b'"' || bytes[pos] == b'\'')
+                    {
+                        let parts = scan_fstring(src, bytes, &mut pos, tok_line)?;
+                        out.push(Token { tok: Tok::FStr(parts), line: tok_line });
+                        continue;
+                    }
                     let tok = match word {
                         "def" => Tok::Def,
                         "return" => Tok::Return,
@@ -284,9 +318,14 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 }
                 b'*' => {
                     if peek(bytes, pos, b'*') {
-                        return Err(err(tok_line, "operator ** is not supported in v0.1"));
-                    }
-                    if peek(bytes, pos, b'=') {
+                        if pos + 2 < n && bytes[pos + 2] == b'=' {
+                            pos += 3;
+                            out.push(Token { tok: Tok::PowEq, line: tok_line });
+                        } else {
+                            pos += 2;
+                            out.push(Token { tok: Tok::Pow, line: tok_line });
+                        }
+                    } else if peek(bytes, pos, b'=') {
                         pos += 2;
                         out.push(Token { tok: Tok::StarEq, line: tok_line });
                     } else {
@@ -296,16 +335,60 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 }
                 b'/' => {
                     if peek(bytes, pos, b'/') {
+                        if pos + 2 < n && bytes[pos + 2] == b'=' {
+                            pos += 3;
+                            out.push(Token { tok: Tok::FloorDivEq, line: tok_line });
+                        } else {
+                            pos += 2;
+                            out.push(Token { tok: Tok::FloorDiv, line: tok_line });
+                        }
+                    } else if peek(bytes, pos, b'=') {
                         pos += 2;
-                        out.push(Token { tok: Tok::FloorDiv, line: tok_line });
+                        out.push(Token { tok: Tok::SlashEq, line: tok_line });
                     } else {
                         pos += 1;
                         out.push(Token { tok: Tok::Slash, line: tok_line });
                     }
                 }
                 b'%' => {
+                    if peek(bytes, pos, b'=') {
+                        pos += 2;
+                        out.push(Token { tok: Tok::PercentEq, line: tok_line });
+                    } else {
+                        pos += 1;
+                        out.push(Token { tok: Tok::Percent, line: tok_line });
+                    }
+                }
+                b'&' => {
+                    if peek(bytes, pos, b'=') {
+                        pos += 2;
+                        out.push(Token { tok: Tok::BitAndEq, line: tok_line });
+                    } else {
+                        pos += 1;
+                        out.push(Token { tok: Tok::BitAnd, line: tok_line });
+                    }
+                }
+                b'|' => {
+                    if peek(bytes, pos, b'=') {
+                        pos += 2;
+                        out.push(Token { tok: Tok::BitOrEq, line: tok_line });
+                    } else {
+                        pos += 1;
+                        out.push(Token { tok: Tok::BitOr, line: tok_line });
+                    }
+                }
+                b'^' => {
+                    if peek(bytes, pos, b'=') {
+                        pos += 2;
+                        out.push(Token { tok: Tok::BitXorEq, line: tok_line });
+                    } else {
+                        pos += 1;
+                        out.push(Token { tok: Tok::BitXor, line: tok_line });
+                    }
+                }
+                b'~' => {
                     pos += 1;
-                    out.push(Token { tok: Tok::Percent, line: tok_line });
+                    out.push(Token { tok: Tok::Tilde, line: tok_line });
                 }
                 b'=' => {
                     if peek(bytes, pos, b'=') {
@@ -325,7 +408,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     }
                 }
                 b'<' => {
-                    if peek(bytes, pos, b'=') {
+                    if peek(bytes, pos, b'<') {
+                        if pos + 2 < n && bytes[pos + 2] == b'=' {
+                            pos += 3;
+                            out.push(Token { tok: Tok::ShlEq, line: tok_line });
+                        } else {
+                            pos += 2;
+                            out.push(Token { tok: Tok::Shl, line: tok_line });
+                        }
+                    } else if peek(bytes, pos, b'=') {
                         pos += 2;
                         out.push(Token { tok: Tok::LtEq, line: tok_line });
                     } else {
@@ -334,7 +425,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     }
                 }
                 b'>' => {
-                    if peek(bytes, pos, b'=') {
+                    if peek(bytes, pos, b'>') {
+                        if pos + 2 < n && bytes[pos + 2] == b'=' {
+                            pos += 3;
+                            out.push(Token { tok: Tok::ShrEq, line: tok_line });
+                        } else {
+                            pos += 2;
+                            out.push(Token { tok: Tok::Shr, line: tok_line });
+                        }
+                    } else if peek(bytes, pos, b'=') {
                         pos += 2;
                         out.push(Token { tok: Tok::GtEq, line: tok_line });
                     } else {
@@ -361,6 +460,145 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
     }
     out.push(Token { tok: Tok::Eof, line });
     Ok(out)
+}
+
+/// Scan an f-string body; `*pos` is at the opening quote on entry and just
+/// past the closing quote on return. Format specs (`{x:.2f}`) and
+/// conversions (`{x!r}`) are loud errors in D0.
+fn scan_fstring(
+    src: &str,
+    bytes: &[u8],
+    pos: &mut usize,
+    line: u32,
+) -> Result<Vec<FPart>, String> {
+    let n = bytes.len();
+    let quote = bytes[*pos];
+    *pos += 1;
+    let mut parts: Vec<FPart> = Vec::new();
+    let mut lit = String::new();
+    loop {
+        if *pos >= n || bytes[*pos] == b'\n' {
+            return Err(err(line, "unterminated f-string literal"));
+        }
+        let c = bytes[*pos];
+        if c == quote {
+            *pos += 1;
+            break;
+        }
+        if c == b'\\' {
+            *pos += 1;
+            if *pos >= n {
+                return Err(err(line, "unterminated escape in f-string"));
+            }
+            match bytes[*pos] {
+                b'n' => lit.push('\n'),
+                b't' => lit.push('\t'),
+                b'\\' => lit.push('\\'),
+                b'"' => lit.push('"'),
+                b'\'' => lit.push('\''),
+                other => {
+                    return Err(err(
+                        line,
+                        &format!("unsupported escape \\{} in f-string", other as char),
+                    ))
+                }
+            }
+            *pos += 1;
+            continue;
+        }
+        if c == b'{' {
+            if *pos + 1 < n && bytes[*pos + 1] == b'{' {
+                lit.push('{');
+                *pos += 2;
+                continue;
+            }
+            // Capture the interpolated expression source.
+            let start = *pos + 1;
+            let mut i = start;
+            let mut depth = 1usize; // the f-string brace itself
+            let mut paren = 0usize;
+            let mut bracket = 0usize;
+            while i < n && depth > 0 {
+                let ch = bytes[i];
+                if ch == b'\n' {
+                    return Err(err(line, "unterminated {...} in f-string"));
+                }
+                if ch == b'"' || ch == b'\'' {
+                    // Skip a string literal inside the expression.
+                    let q = ch;
+                    i += 1;
+                    while i < n && bytes[i] != q {
+                        if bytes[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    if i >= n {
+                        return Err(err(line, "unterminated string inside f-string expression"));
+                    }
+                    i += 1;
+                    continue;
+                }
+                // Format spec / conversion markers only count at the
+                // expression's top level (not inside (), [], or {}).
+                if depth == 1 && paren == 0 && bracket == 0 {
+                    if ch == b':' && !(i + 1 < n && bytes[i + 1] == b'=') {
+                        return Err(err(
+                            line,
+                            "f-string format specs ({x:...}) are not supported in D0",
+                        ));
+                    }
+                    if ch == b'!'
+                        && i + 1 < n
+                        && bytes[i + 1].is_ascii_alphabetic()
+                    {
+                        return Err(err(
+                            line,
+                            "f-string conversions ({x!r}) are not supported in D0",
+                        ));
+                    }
+                }
+                match ch {
+                    b'{' => depth += 1,
+                    b'}' => depth -= 1,
+                    b'(' => paren += 1,
+                    b')' => paren = paren.saturating_sub(1),
+                    b'[' => bracket += 1,
+                    b']' => bracket = bracket.saturating_sub(1),
+                    _ => {}
+                }
+                i += 1;
+            }
+            if depth != 0 {
+                return Err(err(line, "unterminated {...} in f-string"));
+            }
+            let expr_src = src[start..i - 1].trim().to_string();
+            if expr_src.is_empty() {
+                return Err(err(line, "empty {} in f-string"));
+            }
+            if !lit.is_empty() {
+                parts.push(FPart::Lit(std::mem::take(&mut lit)));
+            }
+            parts.push(FPart::Expr(expr_src));
+            *pos = i;
+            continue;
+        }
+        if c == b'}' {
+            if *pos + 1 < n && bytes[*pos + 1] == b'}' {
+                lit.push('}');
+                *pos += 2;
+                continue;
+            }
+            return Err(err(line, "single '}' in f-string; use '}}' for a literal brace"));
+        }
+        let ch_len = utf8_len(c);
+        lit.push_str(&src[*pos..*pos + ch_len]);
+        *pos += ch_len;
+    }
+    if !lit.is_empty() {
+        parts.push(FPart::Lit(lit));
+    }
+    Ok(parts)
 }
 
 fn peek(bytes: &[u8], pos: usize, want: u8) -> bool {

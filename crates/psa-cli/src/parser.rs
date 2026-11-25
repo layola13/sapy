@@ -260,10 +260,7 @@ impl Parser {
                             self.bump();
                             let op = match self.peek() {
                                 Tok::Assign => Some(None),
-                                Tok::PlusEq => Some(Some(BinOp::Add)),
-                                Tok::MinusEq => Some(Some(BinOp::Sub)),
-                                Tok::StarEq => Some(Some(BinOp::Mul)),
-                                _ => None,
+                                t => aug_op(t).map(Some),
                             };
                             if let Some(op) = op {
                                 self.bump();
@@ -289,15 +286,10 @@ impl Parser {
                         let value = self.parse_expr()?;
                         Ok(Stmt::Assign { name, value, line })
                     }
-                    Some(Tok::PlusEq) | Some(Tok::MinusEq) | Some(Tok::StarEq) => {
+                    Some(t) if aug_op(&t).is_some() => {
                         self.bump(); // name
                         let optok = self.bump();
-                        let op = match optok {
-                            Tok::PlusEq => BinOp::Add,
-                            Tok::MinusEq => BinOp::Sub,
-                            Tok::StarEq => BinOp::Mul,
-                            _ => unreachable!(),
-                        };
+                        let op = aug_op(&optok).unwrap();
                         let value = self.parse_expr()?;
                         Ok(Stmt::AugAssign { name, op, value, line })
                     }
@@ -315,7 +307,26 @@ impl Parser {
     }
 
     pub fn parse_expr(&mut self) -> Result<Expr, String> {
-        self.parse_or()
+        self.parse_ternary()
+    }
+
+    /// Python conditional expression: `then if cond else els`. The `then`
+    /// operand is an or-expression; the else branch is a full expression
+    /// (so `a if c1 else b if c2 else d` chains like elif).
+    fn parse_ternary(&mut self) -> Result<Expr, String> {
+        let then = self.parse_or()?;
+        if matches!(self.peek(), Tok::If) {
+            self.bump();
+            let cond = self.parse_or()?;
+            self.expect(&Tok::Else)?;
+            let els = self.parse_expr()?;
+            return Ok(Expr::IfExp {
+                cond: Box::new(cond),
+                then: Box::new(then),
+                els: Box::new(els),
+            });
+        }
+        Ok(then)
     }
 
     fn parse_or(&mut self) -> Result<Expr, String> {
@@ -348,27 +359,93 @@ impl Parser {
     }
 
     fn parse_cmp(&mut self) -> Result<Expr, String> {
-        let lhs = self.parse_add()?;
-        let op = match self.peek() {
-            Tok::EqEq => Some(BinOp::Eq),
-            Tok::NotEq => Some(BinOp::NotEq),
-            Tok::Lt => Some(BinOp::Lt),
-            Tok::LtEq => Some(BinOp::LtEq),
-            Tok::Gt => Some(BinOp::Gt),
-            Tok::GtEq => Some(BinOp::GtEq),
-            _ => None,
-        };
-        if let Some(op) = op {
+        let mut operands = vec![self.parse_bitor()?];
+        let mut ops: Vec<BinOp> = Vec::new();
+        loop {
+            let op = match self.peek() {
+                Tok::EqEq => BinOp::Eq,
+                Tok::NotEq => BinOp::NotEq,
+                Tok::Lt => BinOp::Lt,
+                Tok::LtEq => BinOp::LtEq,
+                Tok::Gt => BinOp::Gt,
+                Tok::GtEq => BinOp::GtEq,
+                _ => break,
+            };
+            ops.push(op);
+            self.bump();
+            operands.push(self.parse_bitor()?);
+        }
+        if ops.is_empty() {
+            return Ok(operands.pop().unwrap());
+        }
+        // Chained comparison: `a < b < c` == `(a < b) and (b < c)`, with
+        // the middle operands evaluated once in Python. psa evaluates
+        // pure operands twice instead (same result); a middle operand
+        // with side effects cannot be duplicated — reject it loudly.
+        for mid in &operands[1..operands.len() - 1] {
+            if !duplicable(mid) {
+                return Err(perr(
+                    self.line(),
+                    "chained comparison with a call or computed value in the middle is not supported in D0 (it would be evaluated twice); bind it to a variable first",
+                ));
+            }
+        }
+        let mut acc: Option<Expr> = None;
+        for i in 0..ops.len() {
+            let pair = Expr::Bin(
+                Box::new(operands[i].clone()),
+                ops[i],
+                Box::new(operands[i + 1].clone()),
+            );
+            acc = Some(match acc {
+                None => pair,
+                Some(a) => Expr::Bin(Box::new(a), BinOp::And, Box::new(pair)),
+            });
+        }
+        Ok(acc.unwrap())
+    }
+
+    fn parse_bitor(&mut self) -> Result<Expr, String> {
+        let mut lhs = self.parse_bitxor()?;
+        while matches!(self.peek(), Tok::BitOr) {
+            self.bump();
+            let rhs = self.parse_bitxor()?;
+            lhs = Expr::Bin(Box::new(lhs), BinOp::BitOr, Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bitxor(&mut self) -> Result<Expr, String> {
+        let mut lhs = self.parse_bitand()?;
+        while matches!(self.peek(), Tok::BitXor) {
+            self.bump();
+            let rhs = self.parse_bitand()?;
+            lhs = Expr::Bin(Box::new(lhs), BinOp::BitXor, Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bitand(&mut self) -> Result<Expr, String> {
+        let mut lhs = self.parse_shift()?;
+        while matches!(self.peek(), Tok::BitAnd) {
+            self.bump();
+            let rhs = self.parse_shift()?;
+            lhs = Expr::Bin(Box::new(lhs), BinOp::BitAnd, Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_shift(&mut self) -> Result<Expr, String> {
+        let mut lhs = self.parse_add()?;
+        loop {
+            let op = match self.peek() {
+                Tok::Shl => BinOp::Shl,
+                Tok::Shr => BinOp::Shr,
+                _ => break,
+            };
             self.bump();
             let rhs = self.parse_add()?;
-            // Chained comparisons (a < b < c) are not in v0.1.
-            if matches!(
-                self.peek(),
-                Tok::EqEq | Tok::NotEq | Tok::Lt | Tok::LtEq | Tok::Gt | Tok::GtEq
-            ) {
-                return Err(perr(self.line(), "chained comparisons are not supported in v0.1"));
-            }
-            return Ok(Expr::Bin(Box::new(lhs), op, Box::new(rhs)));
+            lhs = Expr::Bin(Box::new(lhs), op, Box::new(rhs));
         }
         Ok(lhs)
     }
@@ -415,7 +492,25 @@ impl Parser {
             self.bump();
             return self.parse_unary();
         }
-        self.parse_postfix()
+        if matches!(self.peek(), Tok::Tilde) {
+            self.bump();
+            let e = self.parse_unary()?;
+            return Ok(Expr::Unary(UnOp::BitNot, Box::new(e)));
+        }
+        self.parse_power()
+    }
+
+    /// Python power: `primary ** factor`, right-associative, and binding
+    /// tighter than a unary minus on its left (`-2 ** 2 == -4`), while the
+    /// exponent itself may carry a sign (`2 ** -1`).
+    fn parse_power(&mut self) -> Result<Expr, String> {
+        let base = self.parse_postfix()?;
+        if matches!(self.peek(), Tok::Pow) {
+            self.bump();
+            let exp = self.parse_unary()?;
+            return Ok(Expr::Bin(Box::new(base), BinOp::Pow, Box::new(exp)));
+        }
+        Ok(base)
     }
 
     fn parse_postfix(&mut self) -> Result<Expr, String> {
@@ -491,6 +586,18 @@ impl Parser {
             Tok::Int(v) => Ok(Expr::Int(v)),
             Tok::Float(v) => Ok(Expr::Float(v)),
             Tok::Str(s) => Ok(Expr::Str(s)),
+            Tok::FStr(parts) => {
+                let mut out = Vec::new();
+                for p in parts {
+                    match p {
+                        crate::lexer::FPart::Lit(s) => out.push(FStrPart::Lit(s)),
+                        crate::lexer::FPart::Expr(src) => {
+                            out.push(FStrPart::Expr(parse_fstr_expr(&src, line)?))
+                        }
+                    }
+                }
+                Ok(Expr::FStr(out))
+            }
             Tok::True => Ok(Expr::Bool(true)),
             Tok::False => Ok(Expr::Bool(false)),
             Tok::Ident(n) => Ok(Expr::Name(n)),
@@ -516,6 +623,63 @@ impl Parser {
             }
             t => Err(perr(line, &format!("unexpected token {:?} in expression", t))),
         }
+    }
+}
+
+/// Map an augmented-assignment token (`+=`, `//=`, `**=`, ...) to its
+/// binary operator.
+fn aug_op(t: &Tok) -> Option<BinOp> {
+    Some(match t {
+        Tok::PlusEq => BinOp::Add,
+        Tok::MinusEq => BinOp::Sub,
+        Tok::StarEq => BinOp::Mul,
+        Tok::SlashEq => BinOp::Div,
+        Tok::FloorDivEq => BinOp::FloorDiv,
+        Tok::PercentEq => BinOp::Mod,
+        Tok::PowEq => BinOp::Pow,
+        Tok::BitAndEq => BinOp::BitAnd,
+        Tok::BitOrEq => BinOp::BitOr,
+        Tok::BitXorEq => BinOp::BitXor,
+        Tok::ShlEq => BinOp::Shl,
+        Tok::ShrEq => BinOp::Shr,
+        _ => return None,
+    })
+}
+
+/// True when an expression is pure and deterministic, so evaluating it
+/// twice yields the same value with no observable difference (used by
+/// chained comparisons, which duplicate their middle operands).
+fn duplicable(e: &Expr) -> bool {
+    match e {
+        Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Name(_) => true,
+        Expr::Index(a, b) => duplicable(a) && duplicable(b),
+        Expr::Bin(a, _, b) => duplicable(a) && duplicable(b),
+        Expr::Unary(_, a) => duplicable(a),
+        _ => false,
+    }
+}
+
+/// Re-parse the source of one f-string `{...}` interpolation as an
+/// expression of its own.
+fn parse_fstr_expr(src: &str, line: u32) -> Result<Expr, String> {
+    let toks = crate::lexer::lex(src)
+        .map_err(|e| perr(line, &format!("in f-string: {}", e)))?;
+    let mut p = Parser::new(toks);
+    let e = p.parse_expr().map_err(|e| {
+        perr(
+            line,
+            &format!(
+                "in f-string expression (format specs and conversions are not supported in D0): {}",
+                e
+            ),
+        )
+    })?;
+    match p.peek() {
+        Tok::Newline | Tok::Eof => Ok(e),
+        t => Err(perr(
+            line,
+            &format!("trailing token {:?} in f-string expression", t),
+        )),
     }
 }
 

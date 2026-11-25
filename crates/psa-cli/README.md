@@ -58,6 +58,23 @@ Everything else is a **loud compile error**, never a silent fallback.
   **blocked** by upstream defect (xxiv) below: it is a loud error
   until the `Vec<f64>` miscompilation is fixed.
 
+- D0 (v0.4, the v1 charter's frontend batch): `**` (int ** int with
+  a literal exponent is exact integer power; a negative literal
+  exponent or any float operand goes through sa_std `sa_math_pow`;
+  a non-literal int exponent is a loud error — its Python result
+  type depends on the exponent's sign), bitwise `& | ^ ~ << >>`,
+  chained comparisons (`a < b < c`; middle operands must be pure —
+  a call in the middle is a loud error), conditional expressions
+  (`x if c else y`, nestable; not in `while` conditions, where the
+  materialised temp would only be computed once), and f-strings as
+  the sole `print()` argument (interpolated ints and string
+  literals; at most one bool interpolation; format specs and
+  conversions are loud errors; an f-string anywhere else is a loud
+  error until the D2 string runtime). All augmented-assignment
+  forms (`//=`, `**=`, `&=`, ...) work through the same operators.
+  `examples/d0.psa` runs end-to-end and its output matches CPython
+  byte for byte.
+
 ## Known upstream defects (found 2026-11-25, each blocks one feature)
 
 **(xxiii) f64 display.** The Rust `sla` **build-exe** route prints
@@ -81,11 +98,34 @@ lowerings are implicated. Until this is fixed upstream, **psa
 refuses `list[float]`** (loud error) rather than emit silently
 wrong programs. `list[int]` and `list[bool]` are unaffected.
 
+**(xxv) String bindings.** On the Rust `sla` **build-exe** route a
+string value cannot be held in a variable at all: an inferred
+`let s = "world"` fails SAB lowering with
+`UnsupportedSabDirectFeature: string literal let binding`, an
+explicitly annotated `let s: &str = "world"` fails the type checker
+(`expected borrow, actual raw_ptr`), and a `format(...)` String
+cannot be printed either. The same shapes work inside `@test`
+bodies via the `sla test` route (see the upstream corpus minim), so
+this is specific to the build-exe lowering path. Until it is fixed
+upstream, **psa refuses to bind, pass, or return a string value**
+(loud error); string literals used directly in `print()` work, as
+before. This also blocks string branches of conditional
+expressions and string-value interpolation in f-strings.
+
+**(xxvi) Self-referential call assignment (worked around in psa).**
+The direct shape `x = f(x, ...)` — including the helper calls that
+`//`, `%`, and `**` lower to — leaves a live register at function
+exit (`MemoryLeak`, trap 1012) in the Rust build-exe lowering.
+psa routes such values through a fresh temp before assigning
+(`let t = f(x, ...); x = t;`), which lowers cleanly; the upstream
+direct shape is still defective.
+
 ## Explicitly not in v0.1 (all loud errors)
 
 Classes, attribute access, dicts/sets, lists of non-scalar elements
-(strings, nested lists), string operations and comparisons, `**`,
-chained comparisons,
+(strings, nested lists), string operations and comparisons,
+string variables (blocked by (xxv) above), f-strings outside
+`print()`, f-string format specs and conversions,
 keyword arguments, defaults, annotations, imports, exceptions,
 generators, first-class functions, type-changing re-binding,
 `continue` in `for`, non-`range` iteration, float `//` / `%`,
