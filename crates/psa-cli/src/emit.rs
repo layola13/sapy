@@ -297,6 +297,10 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
         out.push_str("@import \"sa_std/core/box.sa\"\n");
         out.push_str("@import \"sa_std/hashmap.sa\"\n");
         out.push_str("@import \"sa_std/core/option.sa\"\n");
+        out.push_str("@import \"sa_std/string.sa\"\n");
+        out.push_str("@import \"sa_std/ptr.sa\"\n");
+        out.push_str("@import \"sla_std/wrap/io.sla\"\n");
+        out.push_str("@import \"sla_std/wrap/fmt.sla\"\n");
     }
     if em.used_math || em.used_dyn {
         out.push_str("@import \"sa_std/math.sai\"\n");
@@ -1533,7 +1537,44 @@ impl Emitter {
                 ));
             }
             if ty.is_list() {
-                return Err(eerr(line, "printing a whole list is not supported in v0.3 (print its elements or len)"));
+                // Static list repr, byte-printed elementwise through
+                // the same helpers the dynamic repr uses (D2 slice C).
+                let name = match &args[0] {
+                    Expr::Name(n) => n.clone(),
+                    _ => {
+                        return Err(eerr(
+                            line,
+                            "printing a list is only supported for a plain list variable in this slice",
+                        ))
+                    }
+                };
+                let elem = ty.elem().unwrap();
+                if elem != Ty::Int && elem != Ty::Bool {
+                    return Err(eerr(line, "static list elements must be int or bool to print"));
+                }
+                self.used_dyn = true;
+                ctx.tmp += 1;
+                let iv = format!("__psa_pi_{}", ctx.tmp);
+                ctx.line("sla_print_bytes(STR_PTR(\"[\"), STR_LEN(\"[\"));");
+                ctx.line(&format!("let {}: i64 = 0;", iv));
+                ctx.line(&format!("while {} < (len({}) as i64) {{", iv, name));
+                ctx.line(&format!(
+                    "if {} > 0 {{ sla_print_bytes(STR_PTR(\", \"), STR_LEN(\", \")); }};",
+                    iv
+                ));
+                if elem == Ty::Int {
+                    ctx.line(&format!("__psa_print_i64({}[{}]);", name, iv));
+                } else {
+                    ctx.line(&format!(
+                        "if {}[{}] {{ sla_print_bytes(STR_PTR(\"True\"), STR_LEN(\"True\")); }} else {{ sla_print_bytes(STR_PTR(\"False\"), STR_LEN(\"False\")); }};",
+                        name, iv
+                    ));
+                }
+                ctx.line(&format!("{} = {} + 1;", iv, iv));
+                ctx.line("}");
+                ctx.line("sla_print_bytes(STR_PTR(\"]\"), STR_LEN(\"]\"));");
+                ctx.line("sla_print_bytes(STR_PTR(\"\\n\"), STR_LEN(\"\\n\"));");
+                return Ok(());
             }
             if ty == Ty::Bool {
                 ctx.line(&format!("if {} {{ println(\"True\"); }} else {{ println(\"False\"); }};", code));
@@ -2931,8 +2972,39 @@ fn __psa_unbox_bool(v: PsaVal) -> bool {
     panic(77022);
 }
 
+fn __psa_print_i64(x: i64) {
+    let buf = [0u8; 32];
+    let olen = [0u64; 4];
+    let rc = sla_fmt_i64_into(x, 10, PTR_BYTE_ADD(&buf, 0), 32, &olen[0]);
+    sla_print_bytes(PTR_BYTE_ADD(&buf, 0), olen[0]);
+}
+
+fn __psa_print_repr(v: PsaVal) {
+    if v.tag == 0 { __psa_print_i64(v.ipay); return; };
+    if v.tag == 2 {
+        if v.ipay != 0 { sla_print_bytes(STR_PTR("True"), STR_LEN("True")); } else { sla_print_bytes(STR_PTR("False"), STR_LEN("False")); };
+        return;
+    };
+    if v.tag == 3 { sla_print_bytes(STR_PTR("None"), STR_LEN("None")); return; };
+    if v.tag == 4 { __psa_print_list_repr(v); return; };
+    if v.tag == 5 { panic(77057); };
+    panic(77058);
+}
+
+fn __psa_print_list_repr(v: PsaVal) {
+    sla_print_bytes(STR_PTR("["), STR_LEN("["));
+    let n = __psa_list_len(v);
+    let i: i64 = 0;
+    while i < n {
+        if i > 0 { sla_print_bytes(STR_PTR(", "), STR_LEN(", ")); };
+        __psa_print_repr(__psa_list_get(v, i));
+        i = i + 1;
+    }
+    sla_print_bytes(STR_PTR("]"), STR_LEN("]"));
+}
+
 fn __psa_print_dyn(v: PsaVal) -> i32 {
-    if v.tag == 4 { panic(77051); };
+    if v.tag == 4 { __psa_print_list_repr(v); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
     if v.tag == 5 { panic(77057); };
     if v.tag == 0 { println("{}", v.ipay); return 0; };
     if v.tag == 2 {

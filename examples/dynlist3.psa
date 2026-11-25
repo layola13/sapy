@@ -1,0 +1,14 @@
+xs = [1, 2, 3]
+print(xs)
+e = []
+print(e)
+d = [10, 20]
+print(d)
+s = [7]
+print(s)
+m = [1, None, True, False, -5]
+print(m)
+big = [1000000, -9223372036854775807]
+print(big)
+xs[0] = 42
+print(xs)

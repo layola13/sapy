@@ -31,7 +31,7 @@ Value 动态面（DYNAMIC-DESIGN.md）；【排除】= v1 明确不做、响亮�
 | 方法调用 | 部分 | 仅 list.append；str/list/dict 方法集 缺口-动态 |
 | 函数调用（位置参数） | 支持 | 关键字参数、默认值、*args/**kwargs 缺口-动态 |
 | lambda | 缺口-动态 | 闭包同项 |
-| 列表/字典/集合字面量 | 部分 | 同类型 int/bool list 静态；D2 切片 A：异构标量/含动态元素/float/空 list 字面量 = 动态堆 list（标签 4），append/len/下标/相等/真值全支持，print(list) 待 repr 运行时（响亮 panic 77051）；D2 切片 C：dict 字面量 = 动态堆 dict（标签 5，Box<HashMap<i64,PsaVal>>），int/bool/None 键（bool 键与 int 键同一、None 键哨兵，与 Python 键同一性一致），值任意 D1 标量/动态值，print(dict) 待 repr（响亮 panic 77057）、dict 相等响亮 panic 77056（待键迭代面）；str/float 键与 set/嵌套容器字面量仍 缺口-动态（响亮拒绝） |
+| 列表/字典/集合字面量 | 部分 | 同类型 int/bool list 静态；D2 切片 A：异构标量/含动态元素/float/空 list 字面量 = 动态堆 list（标签 4），append/len/下标/相等/真值全支持；D2 切片 C：list repr 已落地（静态与动态 list 的 print 均逐字节同 CPython，元素限 int/bool/None/嵌套动态 list；float 元素响亮 panic 77058——待最短往返浮点格式化器）；dict 字面量 = 动态堆 dict（标签 5，Box<HashMap<i64,PsaVal>>），int/bool/None 键（bool 键与 int 键同一、None 键哨兵，与 Python 键同一性一致），值任意 D1 标量/动态值，print(dict) 响亮 panic 77057（dict repr 须保插入序，HashMap 迭代序不合，待有序 dict 结构）、dict 相等响亮 panic 77056（待键迭代面）；str/float 键与 set/嵌套容器字面量仍 缺口-动态（响亮拒绝） |
 | 元组字面量与拆包 | 缺口-动态 | 静态元组可先行（前端+结构体） |
 | 推导式（list/dict/set/生成器） | 缺口-动态 | list 推导式最高频，先做 |
 | 生成器表达式/yield | 缺口-动态 | 需状态机或协程运行时，分期后段 |
