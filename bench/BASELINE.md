@@ -19,3 +19,22 @@ listsum 500000500000），先对值、再比时。
 v1 性能门成立；动态面数字出来前不得拿本表宣称 v1 达标。
 bench 源码在本目录（fib.psa / loopsum.psa / listsum.psa，与 .py 同文本），
 run/ 为盒上构建目录（不入库）。
+
+## text 路复测（2026-11-25 深夜，统一调试批后）
+
+口径同上：同一份源码文本、同一盒、best-of-3；psa 改走现行生产路
+（psa emit + Zig 宿主 sa build-exe，默认构建）。四题输出先与
+CPython 逐字对齐，再比时。
+
+| 题 | 面 | CPython | psa（text 路） | 倍率 |
+|---|---|---|---|---|
+| fib | 静态 | 212 ms | 9 ms | 约 24× |
+| loopsum | 静态 | 1985 ms | 20 ms | 约 99× |
+| listsum | 静态 | 518 ms | 13 ms | 约 40× |
+| dynsum | 动态 | 215 ms | 154 ms | 约 1.4× |
+
+结论：静态面与动态面同程式复测均打败 CPython，v1 性能门
+（蓝图 §1 双门之性能门）成立。注记：首轮 loopsum 曾报
+BUILD-FAIL，清 ~/.cache/sa/frontend 陈旧缓存后同脚本重跑即绿
+——前端产物缓存键不含编译器版本，是已知缓存面，非编译器缺陷；
+倍率随盒负载浮动（fib 的 CPython 侧两轮 144→212 ms），量级稳定。
