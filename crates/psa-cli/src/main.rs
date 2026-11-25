@@ -34,7 +34,7 @@ fn main() {
             }
         }
         "version" | "--version" | "-V" => {
-            println!("psa 0.8.0 (sapy v0.8, D2 slices A+B+C: dynamic lists, for-each, in, dynamic dicts, list repr, dynamic strings, nested containers, slices)");
+            println!("psa 0.9.0 (sapy v0.9, D0-D7 complete: static + dynamic faces, kwargs/defaults, ordered dict, lambdas, classes, tuples/sets/comprehensions, methods, exceptions with cross-function propagation, with/files, imports, generators/coroutines, match, overflow guards; unified batch 25/25 on the SLA->SA text route; psa_std in progress toward v1)");
         }
         "help" | "--help" | "-h" => usage(),
         other => {
