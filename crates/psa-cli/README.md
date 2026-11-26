@@ -1,10 +1,61 @@
-# psa — the SA-Py compiler (v0.5)
+# psa — the SA-Py compiler (v1.0.0)
 
 `psa` compiles `.psa` source (a Python-syntax subset) to native
 executables: `.psa` → psa frontend (lexer / parser / type inference) →
 generated SLA source → the `sla` pipeline (checker + SA emission) →
 the `sa` toolchain (`build-exe`). The binary is named `psa`, mirroring
 how the SLA compiler binary is named `sla`.
+
+## Current status — psa v1.0.0 (2026-11-26)
+
+**psa v1.0.0 is released** (this repository, commit `37d0fb6`, tag
+`psa-v1.0.0`). Everything in the D2–D7 list is implemented: dynamic
+heap kinds (dyn list/dict/str, slicing, iteration, `in`), function
+defaults / keyword arguments / `*args` / `**kwargs`, ordered dicts,
+lambda and function values, classes, tuple/set literals and
+comprehensions, method dispatch, exceptions, `with`/files, `import`,
+generators and coroutines (over SLA spawn/chan), `match`, and the
+dynamic overflow guard (loud panic, never a silent wrap).
+
+- Acceptance: the unified debug batch passes **25/25** on the text
+  route — 23 programs byte-identical to CPython, 2 negatives refused
+  loudly. The five D3 illegal-usage negatives were each checked
+  individually and are all refused loudly.
+- Syntax census (46 binding items, `SYNTAX-CENSUS.md`): supported
+  34, partial 8, frontend gaps 2, dynamic gaps 2.
+- Performance vs CPython (text route): fib ≈24×, loop sum ≈99×,
+  list sum ≈40×, dynamic sum ≈1.4×.
+- Builds and acceptance run **only on the SLA→SA text route** (the
+  Zig plugin host's `sa build-exe` over `psa emit` output). The SAB
+  route is sealed and is not used for verification; `psa build-exe`'s
+  internal route is not the acceptance route.
+- psa_std: `json` is wired end-to-end and verified. Verified modules:
+  math, string, csv, logging, collections, itertools, functools,
+  bisect, heapq, base64, random, re. `argparse` is verified at module
+  level (its method syntax awaits emitter-side std-object tracking);
+  `datetime`/`os` are at compile-check level. The networking group —
+  `socket` + `urllib` — was verified byte-identical against CPython
+  on 2026-11-26.
+- The `examples/` corpus: files named `reject_*` are **loud refusals
+  of illegal usages inside supported features** (a lambda capturing
+  an outer variable, a non-literal default, an unknown keyword
+  argument), **not** markers of unsupported features.
+- Known gaps, stated plainly: upstream defect (xxiii) — f64 printing
+  — is unfixed, so float printing stays refused (temporary: the
+  refusal flips when the fix lands); (xxv) string bindings remain a
+  registered gap on the string surface; (xxxiv) HashMap by-value
+  insert is localised and its fix is in progress (task 166); the
+  parser does not yet support multi-line literals (xxxviii).
+- Newly chartered (2026-11-26): clear structured error feedback —
+  stable diagnostic codes, source locations, plain-language
+  messages, fix hints, `--error-format=json`, and a machine-readable
+  panic-code table. The error census and format design are complete;
+  implementation is queued.
+
+The sections below this one are the **v0.1–v0.5 historical record**
+(the subset as it stood at each increment). They are retained for
+history and are labelled as such; where they conflict with this
+status section, this section governs.
 
 ```sh
 psa emit      <file.psa>          # print the generated SLA source
@@ -16,9 +67,14 @@ The generated `.sla` file is written next to the source for inspection.
 `psa` locates `sa_std` by walking ancestors of the source file, of the
 `sla` binary (`PSA_SLA`), and of the cwd, unless `SA_STD_DIR` is set.
 
-## The v0.1 subset — only what is listed here is supported
+## [Historical record] The v0.1 subset — as it stood at v0.1–v0.5
 
-Everything else is a **loud compile error**, never a silent fallback.
+> This section and the two that follow it describe the subset as it
+> stood in the v0.1–v0.5 era. They are **not** the current support
+> surface — see "Current status — psa v1.0.0" above. At the time,
+> everything not listed here was a **loud compile error**, never a
+> silent fallback; that loud-refusal discipline is unchanged in
+> v1.0.0.
 
 - Top-level statements (wrapped into `main`) and `def` functions with
   positional parameters; recursion works (recursive return type must
@@ -98,7 +154,21 @@ Everything else is a **loud compile error**, never a silent fallback.
   `bench/dynsum.psa` (10^6 dynamic additions) runs 0.12s vs
   CPython's 0.27s (best of 3).
 
-## Known upstream defects (found 2026-11-25, each blocks one feature)
+## [Historical record] Known upstream defects (found 2026-11-25, each blocks one feature)
+
+> Status update (2026-11-26): (xxiii) is still open — float printing
+> remains refused, temporarily, and flips when the upstream fix
+> lands. (xxiv) is still registered. (xxv) was specific to the Rust
+> build-exe route described below; on the current text route, string
+> bindings landed with D2 as dynamic strings and the blanket refusal
+> was withdrawn, while the string surface's remaining shapes stay
+> registered as a gap. (xxvii) concerns the SAB lowering, a route
+> that is now sealed and unused for builds or acceptance. Two
+> further gaps were registered after this section was written:
+> (xxxiv) HashMap by-value insert storing a dangling pointer
+> (localised; fix in progress, task 166) and (xxxviii) the psa
+> parser rejecting multi-line literals (implicit line joining
+> unimplemented).
 
 **(xxiii) f64 display.** The Rust `sla` **build-exe** route prints
 f64 values through `println("{}", x)` with the fraction truncated:
@@ -165,7 +235,7 @@ block are hoisted to the function prologue. The upstream shapes
 remain defective; a fix there would let psa simplify back to
 plain assignments.
 
-## Explicitly not in v0.1 (all loud errors)
+## [Historical record] Explicitly not in v0.1 (all loud errors)
 
 Classes, attribute access, dicts/sets, lists of non-scalar elements
 (strings, nested lists), string operations and comparisons,
@@ -175,6 +245,15 @@ keyword arguments, defaults, annotations, imports, exceptions,
 generators, first-class functions, type-changing re-binding,
 `continue` in `for`, non-`range` iteration, float `//` / `%`,
 printing a whole list.
+
+> **This list is historical.** As of v1.0.0 most of it — classes,
+> attribute access, dicts/sets, nested and heterogeneous lists,
+> string operations, keyword arguments, defaults, imports,
+> exceptions, generators, first-class functions, non-`range`
+> iteration, printing a whole list (list repr) — is **supported**
+> and batch-verified (see "Current status" above and
+> `SYNTAX-CENSUS.md`). Reading this section as the current support
+> surface inverts the facts.
 
 Per the SA-Py whitepaper the dynamic face is a tagged-value
 runtime; D1 (v0.5) landed its scalar layer (see the D1 bullet
