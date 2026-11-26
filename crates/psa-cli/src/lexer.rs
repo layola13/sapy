@@ -260,6 +260,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                                 }
                                 match bytes[pos] {
                                     b'n' => s.push('\n'),
+                                    b'r' => s.push('\r'),
                                     b't' => s.push('\t'),
                                     b'\\' => s.push('\\'),
                                     b'"' => s.push('"'),
@@ -305,6 +306,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                             }
                             match bytes[pos] {
                                 b'n' => s.push('\n'),
+                                b'r' => s.push('\r'),
                                 b't' => s.push('\t'),
                                 b'\\' => s.push('\\'),
                                 b'"' => s.push('"'),
@@ -607,6 +609,7 @@ fn scan_fstring(
             }
             match bytes[*pos] {
                 b'n' => lit.push('\n'),
+                b'r' => lit.push('\r'),
                 b't' => lit.push('\t'),
                 b'\\' => lit.push('\\'),
                 b'"' => lit.push('"'),
