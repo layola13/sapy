@@ -1,0 +1,372 @@
+// psa_std base64 (L1): CPython's base64 module (the
+// RFC 4648 codecs) over PsaVal. See README-base64.md
+// for the module contract. Panic codes: 77152 argument
+// of the wrong type (CPython TypeError), 77153 invalid
+// input (CPython binascii.Error, a ValueError).
+//
+// Representation ruling (registered in the README
+// fragment): psa has no bytes value type yet (a census
+// gap on the frontend), and the established psa
+// convention for byte strings is a dyn str whose byte
+// buffer IS the byte string -- that is what the D6
+// file surface does (__psa_file_read_all pushes raw
+// file bytes into a dyn str; __psa_file_write writes
+// the buffer back out). base64 follows it: inputs and
+// outputs are dyn strs read and written byte-wise.
+// Encoding a text str therefore encodes its UTF-8 byte
+// buffer, exactly CPython's b64encode(s.encode()).
+//
+// Decode semantics were checked against CPython
+// (binascii.a2b_base64 / a2b_base32 / a2b_base16 as
+// driven by the base64 module), not assumed:
+// - b64 decode (validate=False, the CPython default)
+//   follows binascii.a2b_base64, probed case by case
+//   against CPython 3.12/3.13 (it is NOT the textbook
+//   machine): the data characters form ONE continuous
+//   6-bit stream, bytes being emitted as the stream
+//   fills them; '=' and non-alphabet bytes never
+//   enter the stream (data after a padded quantum
+//   keeps decoding into the same stream). Validation
+//   happens only at end of input, over d = the data
+//   character count and tail = the number of '='
+//   after the last data character: d % 4 == 1 is an
+//   error; d % 4 == 2 with tail < 2 is an error;
+//   d % 4 == 3 with tail < 1 is an error. The
+//   leftover bits of a covered partial quantum are
+//   dropped, zero or not.
+// - b32 decode is strict: every character must be in
+//   the alphabet (uppercase only unless the casefold
+//   entry point is used) or be trailing '=' padding in
+//   exactly the RFC counts; anything else is an error,
+//   including data after a padded quantum.
+// - b16 decode is strict hex, even length, uppercase
+//   unless the casefold entry point is used.
+
+fn __psa_b64_str(v: PsaVal) -> void {
+    if v.tag != 6 { panic(77152); };
+    return;
+}
+
+fn __psa_b64_byte(v: PsaVal, i: i64) -> i64 {
+    return __psa_bytes_get_h(v.ipay as ptr, i) as i64;
+}
+
+// ---- base64 core ----
+
+fn __psa_b64_val(b: i64, alt: bool) -> i64 {
+    // Alphabet value of one byte, or -1. With alt, the
+    // urlsafe '-' and '_' take the places of '+' and
+    // '/' (CPython translates them before decoding, so
+    // '+' and '/' keep their standard values too).
+    if b >= 65 {
+        if b <= 90 { return b - 65; };
+    };
+    if b >= 97 {
+        if b <= 122 { return b - 97 + 26; };
+    };
+    if b >= 48 {
+        if b <= 57 { return b - 48 + 52; };
+    };
+    if b == 43 { return 62; };
+    if b == 47 { return 63; };
+    if alt {
+        if b == 45 { return 62; };
+        if b == 95 { return 63; };
+    };
+    return -1;
+}
+
+fn __psa_b64_chr(v: i64, alt: bool) -> u8 {
+    if v < 26 { return (65 + v) as u8; };
+    if v < 52 { return (97 + v - 26) as u8; };
+    if v < 62 { return (48 + v - 52) as u8; };
+    if v == 62 {
+        if alt { return 45u8; };
+        return 43u8;
+    };
+    if alt { return 95u8; };
+    return 47u8;
+}
+
+fn __psa_b64_encode(v: PsaVal, alt: bool) -> PsaVal {
+    __psa_b64_str(v);
+    let out = __psa_str_new();
+    let n = __psa_bytes_len_h(v.ipay as ptr);
+    let i: i64 = 0;
+    while i + 3 <= n {
+        let b0 = __psa_b64_byte(v, i);
+        let b1 = __psa_b64_byte(v, i + 1);
+        let b2 = __psa_b64_byte(v, i + 2);
+        let w = (b0 << 16) | (b1 << 8) | b2;
+        out = __psa_str_push(out, __psa_b64_chr((w >> 18) & 63, alt));
+        out = __psa_str_push(out, __psa_b64_chr((w >> 12) & 63, alt));
+        out = __psa_str_push(out, __psa_b64_chr((w >> 6) & 63, alt));
+        out = __psa_str_push(out, __psa_b64_chr(w & 63, alt));
+        i = i + 3;
+    }
+    let rem = n - i;
+    if rem == 1 {
+        let b0 = __psa_b64_byte(v, i);
+        let w = b0 << 16;
+        out = __psa_str_push(out, __psa_b64_chr((w >> 18) & 63, alt));
+        out = __psa_str_push(out, __psa_b64_chr((w >> 12) & 63, alt));
+        out = __psa_str_push(out, 61u8);
+        out = __psa_str_push(out, 61u8);
+    };
+    if rem == 2 {
+        let b0 = __psa_b64_byte(v, i);
+        let b1 = __psa_b64_byte(v, i + 1);
+        let w = (b0 << 16) | (b1 << 8);
+        out = __psa_str_push(out, __psa_b64_chr((w >> 18) & 63, alt));
+        out = __psa_str_push(out, __psa_b64_chr((w >> 12) & 63, alt));
+        out = __psa_str_push(out, __psa_b64_chr((w >> 6) & 63, alt));
+        out = __psa_str_push(out, 61u8);
+    };
+    return out;
+}
+
+fn __psa_b64_decode(v: PsaVal, alt: bool) -> PsaVal {
+    // The a2b_base64 model described in the header:
+    // one continuous bit stream over the data
+    // characters; '=' only counts towards the tail
+    // coverage checked at end of input.
+    __psa_b64_str(v);
+    let out = __psa_str_new();
+    let n = __psa_bytes_len_h(v.ipay as ptr);
+    let acc: i64 = 0;
+    let nbits: i64 = 0;
+    let dcount: i64 = 0;
+    let tail: i64 = 0;
+    let i: i64 = 0;
+    while i < n {
+        let b = __psa_b64_byte(v, i);
+        if b == 61 {
+            tail = tail + 1;
+        } else {
+            let val = __psa_b64_val(b, alt);
+            if val >= 0 {
+                tail = 0;
+                dcount = dcount + 1;
+                acc = (acc << 6) | val;
+                nbits = nbits + 6;
+                if nbits >= 8 {
+                    nbits = nbits - 8;
+                    out = __psa_str_push(out, ((acc >> nbits) & 255) as u8);
+                    acc = acc & ((1 << nbits) - 1);
+                };
+            };
+        };
+        i = i + 1;
+    }
+    let r = dcount % 4;
+    if r == 1 { panic(77153); };
+    if r == 2 {
+        if tail < 2 { panic(77153); };
+    };
+    if r == 3 {
+        if tail < 1 { panic(77153); };
+    };
+    return out;
+}
+
+fn psa_base64_b64encode(v: PsaVal) -> PsaVal {
+    return __psa_b64_encode(v, false);
+}
+
+fn psa_base64_b64decode(v: PsaVal) -> PsaVal {
+    return __psa_b64_decode(v, false);
+}
+
+fn psa_base64_standard_b64encode(v: PsaVal) -> PsaVal {
+    // CPython's standard_b64encode IS b64encode.
+    return __psa_b64_encode(v, false);
+}
+
+fn psa_base64_standard_b64decode(v: PsaVal) -> PsaVal {
+    return __psa_b64_decode(v, false);
+}
+
+fn psa_base64_urlsafe_b64encode(v: PsaVal) -> PsaVal {
+    return __psa_b64_encode(v, true);
+}
+
+fn psa_base64_urlsafe_b64decode(v: PsaVal) -> PsaVal {
+    return __psa_b64_decode(v, true);
+}
+
+// ---- base32 ----
+
+fn __psa_b32_chr(v: i64) -> u8 {
+    // Alphabet "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567".
+    if v < 26 { return (65 + v) as u8; };
+    return (50 + v - 26) as u8;
+}
+
+fn __psa_b32_val(b: i64, fold: bool) -> i64 {
+    if b >= 65 {
+        if b <= 90 { return b - 65; };
+    };
+    if b >= 50 {
+        if b <= 55 { return b - 50 + 26; };
+    };
+    if fold {
+        if b >= 97 {
+            if b <= 122 { return b - 97; };
+        };
+    };
+    return -1;
+}
+
+fn psa_base64_b32encode(v: PsaVal) -> PsaVal {
+    __psa_b64_str(v);
+    let out = __psa_str_new();
+    let n = __psa_bytes_len_h(v.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        // One group: up to 5 bytes, left-aligned in a
+        // 40-bit accumulator; ceil(8*rem/5) characters
+        // and '=' padding to 8.
+        let rem = n - i;
+        let take = rem;
+        if take > 5 { take = 5; };
+        let w: i64 = 0;
+        let k: i64 = 0;
+        while k < take {
+            w = w | (__psa_b64_byte(v, i + k) << (32 - 8 * k));
+            k = k + 1;
+        }
+        let chars = 8;
+        if take == 1 { chars = 2; };
+        if take == 2 { chars = 4; };
+        if take == 3 { chars = 5; };
+        if take == 4 { chars = 7; };
+        let j: i64 = 0;
+        while j < chars {
+            out = __psa_str_push(out, __psa_b32_chr((w >> (35 - 5 * j)) & 31));
+            j = j + 1;
+        }
+        while j < 8 {
+            out = __psa_str_push(out, 61u8);
+            j = j + 1;
+        }
+        i = i + take;
+    }
+    return out;
+}
+
+fn __psa_b32_decode(v: PsaVal, fold: bool) -> PsaVal {
+    __psa_b64_str(v);
+    let out = __psa_str_new();
+    let n = __psa_bytes_len_h(v.ipay as ptr);
+    let acc: i64 = 0;
+    let nbits: i64 = 0;
+    let data: i64 = 0;
+    let pad: i64 = 0;
+    let i: i64 = 0;
+    while i < n {
+        let b = __psa_b64_byte(v, i);
+        if b == 61 {
+            pad = pad + 1;
+        } else {
+            if pad > 0 { panic(77153); };
+            let val = __psa_b32_val(b, fold);
+            if val < 0 { panic(77153); };
+            acc = (acc << 5) | val;
+            nbits = nbits + 5;
+            data = data + 1;
+            if nbits >= 8 {
+                out = __psa_str_push(out, ((acc >> (nbits - 8)) & 255) as u8);
+                nbits = nbits - 8;
+                acc = acc & ((1 << nbits) - 1);
+            };
+        };
+        i = i + 1;
+    }
+    // The final quantum must be complete: total length
+    // a multiple of 8, with a data count (mod 8) that
+    // encodes whole bytes -- 0, 2, 4, 5 or 7 -- and the
+    // matching padding count. Anything else is
+    // CPython's "Incorrect padding" / "Non-base32
+    // digit" territory.
+    let dm = data % 8;
+    if (data + pad) % 8 != 0 { panic(77153); };
+    if dm == 1 { panic(77153); };
+    if dm == 3 { panic(77153); };
+    if dm == 6 { panic(77153); };
+    if pad > 0 {
+        if dm == 0 { panic(77153); };
+        if pad % 8 != 8 - dm { panic(77153); };
+    };
+    return out;
+}
+
+fn psa_base64_b32decode(v: PsaVal) -> PsaVal {
+    return __psa_b32_decode(v, false);
+}
+
+fn psa_base64_b32decode_casefold(v: PsaVal) -> PsaVal {
+    // b32decode(s, casefold=True).
+    return __psa_b32_decode(v, true);
+}
+
+// ---- base16 ----
+
+fn __psa_b16_chr(v: i64) -> u8 {
+    if v < 10 { return (48 + v) as u8; };
+    return (65 + v - 10) as u8;
+}
+
+fn __psa_b16_val(b: i64, fold: bool) -> i64 {
+    if b >= 48 {
+        if b <= 57 { return b - 48; };
+    };
+    if b >= 65 {
+        if b <= 70 { return b - 65 + 10; };
+    };
+    if fold {
+        if b >= 97 {
+            if b <= 102 { return b - 97 + 10; };
+        };
+    };
+    return -1;
+}
+
+fn psa_base64_b16encode(v: PsaVal) -> PsaVal {
+    __psa_b64_str(v);
+    let out = __psa_str_new();
+    let n = __psa_bytes_len_h(v.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        let b = __psa_b64_byte(v, i);
+        out = __psa_str_push(out, __psa_b16_chr(b >> 4));
+        out = __psa_str_push(out, __psa_b16_chr(b & 15));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn __psa_b16_decode(v: PsaVal, fold: bool) -> PsaVal {
+    __psa_b64_str(v);
+    let n = __psa_bytes_len_h(v.ipay as ptr);
+    if n % 2 != 0 { panic(77153); };
+    let out = __psa_str_new();
+    let i: i64 = 0;
+    while i < n {
+        let hi = __psa_b16_val(__psa_b64_byte(v, i), fold);
+        if hi < 0 { panic(77153); };
+        let lo = __psa_b16_val(__psa_b64_byte(v, i + 1), fold);
+        if lo < 0 { panic(77153); };
+        out = __psa_str_push(out, ((hi << 4) | lo) as u8);
+        i = i + 2;
+    }
+    return out;
+}
+
+fn psa_base64_b16decode(v: PsaVal) -> PsaVal {
+    return __psa_b16_decode(v, false);
+}
+
+fn psa_base64_b16decode_casefold(v: PsaVal) -> PsaVal {
+    // b16decode(s, casefold=True).
+    return __psa_b16_decode(v, true);
+}

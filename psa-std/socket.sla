@@ -1,0 +1,1082 @@
+@import "sa_std/net.sai"
+
+// psa_std socket (net group L2): CPython's socket
+// module over the sa_std net externs (sa_std/net.sai,
+// canonical sa_std/net/socket/net.sai), over PsaVal.
+// See README-socket.md for the module contract, the
+// base-capability census it was written against and
+// the registered divergences. Panic codes (7718x
+// segment, registered in README-socket.md):
+//   77180 argument of the wrong type or value
+//         (CPython TypeError / ValueError)
+//   77181 name resolution failure (CPython
+//         socket.gaierror)
+//   77182 operating-system error (CPython OSError)
+//   77183 operation timed out (CPython
+//         socket.timeout / TimeoutError)
+//   77184 operation would block (CPython
+//         BlockingIOError)
+//   77185 operation not supported by the base
+//         (loud-refusal stubs; never faked)
+//
+// Representation rulings (registered in the README):
+// - A socket object is a tag-5 dict record carrying
+//   the marker key "psasock", the opaque u64 handle
+//   the base returns (0 = not materialised yet),
+//   "kind" (1 stream / 2 datagram), "role" (0 plain,
+//   1 listener), "family", "timeout" (None or float
+//   seconds), "closed", "bhost" / "bport" (the
+//   pending bind for stream sockets, whose handle
+//   only exists after listen()). CPython creates
+//   the OS socket at construction; the base creates
+//   handles at connect / listen / bind time, so the
+//   psa record defers materialisation the same way.
+// - Byte strings are dyn strs whose byte buffer IS
+//   the byte string (the base64 / D6 file-surface
+//   ruling): send data is read byte-wise, received
+//   bytes are returned as a dyn str.
+// - Extern buffers are staged through stack arrays
+//   exactly as os.sla / logging.sla do (a dyn str's
+//   ipay is a Vec handle, not a byte pointer): host
+//   names stage at 256 bytes, stream payloads move
+//   in 4096-byte chunks, one datagram is staged
+//   whole at 4096 bytes. Longer inputs panic
+//   (77180) instead of truncating.
+
+// ---- literal keys ----
+
+fn __psa_sock_lit_psasock() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 112u8); s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 111u8); s = __psa_str_push(s, 99u8); s = __psa_str_push(s, 107u8);
+    return s;
+}
+
+fn __psa_sock_lit_handle() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 104u8); s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 110u8); s = __psa_str_push(s, 100u8); s = __psa_str_push(s, 108u8); s = __psa_str_push(s, 101u8);
+    return s;
+}
+
+fn __psa_sock_lit_kind() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 107u8); s = __psa_str_push(s, 105u8); s = __psa_str_push(s, 110u8); s = __psa_str_push(s, 100u8);
+    return s;
+}
+
+fn __psa_sock_lit_family() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 102u8); s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 109u8); s = __psa_str_push(s, 105u8); s = __psa_str_push(s, 108u8); s = __psa_str_push(s, 121u8);
+    return s;
+}
+
+fn __psa_sock_lit_timeout() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 116u8); s = __psa_str_push(s, 105u8); s = __psa_str_push(s, 109u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 111u8); s = __psa_str_push(s, 117u8); s = __psa_str_push(s, 116u8);
+    return s;
+}
+
+fn __psa_sock_lit_closed() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 99u8); s = __psa_str_push(s, 108u8); s = __psa_str_push(s, 111u8); s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 100u8);
+    return s;
+}
+
+fn __psa_sock_lit_bhost() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 98u8); s = __psa_str_push(s, 104u8); s = __psa_str_push(s, 111u8); s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 116u8);
+    return s;
+}
+
+fn __psa_sock_lit_bport() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 98u8); s = __psa_str_push(s, 112u8); s = __psa_str_push(s, 111u8); s = __psa_str_push(s, 114u8); s = __psa_str_push(s, 116u8);
+    return s;
+}
+fn __psa_sock_lit_role() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 114u8); s = __psa_str_push(s, 111u8); s = __psa_str_push(s, 108u8); s = __psa_str_push(s, 101u8);
+    return s;
+}
+
+fn __psa_sock_lit_any() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 48u8); s = __psa_str_push(s, 46u8); s = __psa_str_push(s, 48u8); s = __psa_str_push(s, 46u8); s = __psa_str_push(s, 48u8); s = __psa_str_push(s, 46u8); s = __psa_str_push(s, 48u8);
+    return s;
+}
+
+// ---- internal helpers ----
+
+// Raises the panic matching a failed sa_std net call.
+// The precise SA_NET_ERROR_CODE_* family is consulted
+// first (native error), then the coarse SA_STD status;
+// the colliding SA_NET_ERR_* family is never used
+// (its ACCESS and TIMEOUT constants are both 4 --
+// PHASE1 report D1, registered in the README).
+fn __psa_sock_raise(status: i32) -> void {
+    let e = sa_std_last_error();
+    let code = sa_std_net_error_code_from_native_error(e);
+    let c = code;
+    if c <= 1 {
+        let c2 = sa_std_net_error_code_from_status(status);
+        c = c2;
+    };
+    if c == 2 { panic(77181); };
+    if c == 4 { panic(77183); };
+    if c == 6 { panic(77184); };
+    panic(77182);
+}
+
+fn __psa_sock_rec(v: PsaVal) -> PsaVal {
+    if v.tag != 5 { panic(77180); };
+    if __psa_dict_contains(v, __psa_sock_lit_psasock()) == false { panic(77180); };
+    return v;
+}
+
+fn __psa_sock_get_i(rec: PsaVal, key: PsaVal) -> i64 {
+    let x = __psa_dict_get(rec, key);
+    return x.ipay;
+}
+
+fn __psa_sock_handle(rec: PsaVal) -> u64 {
+    return __psa_sock_get_i(rec, __psa_sock_lit_handle()) as u64;
+}
+
+fn __psa_sock_is_closed(rec: PsaVal) -> bool {
+    return __psa_sock_get_i(rec, __psa_sock_lit_closed()) != 0;
+}
+
+fn __psa_sock_check_open(rec: PsaVal) -> void {
+    if __psa_sock_is_closed(rec) { panic(77182); };
+}
+
+// The stored timeout: 0 = None (blocking), 1 = a
+// non-negative float in seconds, 2 = zero (the
+// socket is non-blocking). out is seconds.
+fn __psa_sock_timeout_mode(rec: PsaVal) -> i64 {
+    let t = __psa_dict_get(rec, __psa_sock_lit_timeout());
+    if t.tag == 3 { return 0; };
+    if t.fpay == 0.0 { return 2; };
+    return 1;
+}
+
+fn __psa_sock_timeout_secs(rec: PsaVal) -> f64 {
+    let t = __psa_dict_get(rec, __psa_sock_lit_timeout());
+    if t.tag == 1 { return t.fpay; };
+    if t.tag == 0 { return t.ipay as f64; };
+    return 0.0;
+}
+
+// Applies the record's timeout to a live handle:
+// positive timeouts become read/write timeouts in
+// nanoseconds; zero flips the handle non-blocking;
+// None restores blocking.
+fn __psa_sock_apply_timeout(rec: PsaVal, h: u64) -> void {
+    let mode = __psa_sock_timeout_mode(rec);
+    let kind = __psa_sock_get_i(rec, __psa_sock_lit_kind());
+    if mode == 1 {
+        let ns = (__psa_sock_timeout_secs(rec) * 1000000000.0) as u64;
+        if kind == 2 {
+            let st1 = sa_std_net_udp_set_read_timeout(h, ns);
+            if st1 != 0 { __psa_sock_raise(st1); };
+            let st2 = sa_std_net_udp_set_write_timeout(h, ns);
+            if st2 != 0 { __psa_sock_raise(st2); };
+        } else {
+            let st1 = sa_std_net_tcp_stream_set_read_timeout(h, ns);
+            if st1 != 0 { __psa_sock_raise(st1); };
+            let st2 = sa_std_net_tcp_stream_set_write_timeout(h, ns);
+            if st2 != 0 { __psa_sock_raise(st2); };
+        }
+    };
+    if mode == 2 {
+        if kind == 1 {
+            let st = sa_std_net_tcp_stream_set_nonblocking(h, 1);
+            if st != 0 { __psa_sock_raise(st); };
+        }
+    };
+    if mode == 0 {
+        if kind == 1 {
+            let st = sa_std_net_tcp_stream_set_nonblocking(h, 0);
+            if st != 0 { __psa_sock_raise(st); };
+        }
+    };
+}
+
+fn __psa_sock_new_rec(family: i64, kind: i64) -> PsaVal {
+    let rec = __psa_dict_new();
+    __psa_dict_set(rec, __psa_sock_lit_psasock(), __psa_box_int(1));
+    __psa_dict_set(rec, __psa_sock_lit_handle(), __psa_box_int(0));
+    __psa_dict_set(rec, __psa_sock_lit_kind(), __psa_box_int(kind));
+    __psa_dict_set(rec, __psa_sock_lit_role(), __psa_box_int(0));
+    __psa_dict_set(rec, __psa_sock_lit_family(), __psa_box_int(family));
+    __psa_dict_set(rec, __psa_sock_lit_timeout(), __psa_m_none());
+    __psa_dict_set(rec, __psa_sock_lit_closed(), __psa_box_int(0));
+    __psa_dict_set(rec, __psa_sock_lit_bhost(), __psa_sock_lit_any());
+    __psa_dict_set(rec, __psa_sock_lit_bport(), __psa_box_int(0));
+    return rec;
+}
+
+// Validates a CPython (host, port) address value:
+// a 2-tuple (4-tuples accepted, flowinfo / scope
+// ignored as the base has no surface for them --
+// registered). Returns via the two helpers below.
+fn __psa_sock_addr_host(addr: PsaVal) -> PsaVal {
+    if addr.tag != 10 { panic(77180); };
+    if __psa_vec_len_h(addr.ipay as ptr) < 2 { panic(77180); };
+    let h = __psa_tuple_get(addr, 0);
+    if h.tag != 6 { panic(77180); };
+    return h;
+}
+
+fn __psa_sock_addr_port(addr: PsaVal) -> i64 {
+    if addr.tag != 10 { panic(77180); };
+    if __psa_vec_len_h(addr.ipay as ptr) < 2 { panic(77180); };
+    let p = __psa_tuple_get(addr, 1);
+    if p.tag != 0 { panic(77180); };
+    if p.ipay < 0 { panic(77180); };
+    if p.ipay > 65535 { panic(77180); };
+    return p.ipay;
+}
+
+// Staging note: host names are copied into the
+// caller's [0u8; 256] stack buffer inline at each
+// call site (the os.sla pattern -- there is no
+// byte-store-through-pointer macro in the house
+// surface, so no shared staging helper exists);
+// the copy panics (77180) rather than truncating
+// when the name exceeds the buffer. Received bytes
+// are likewise built into a dyn str inline.
+
+// Builds an address tuple from a base NetAddr
+// handle (host bytes are borrowed from the handle;
+// copied out before the caller frees it).
+fn __psa_sock_addr_tuple(ah: u64) -> PsaVal {
+    let hp = sa_net_addr_host(ah);
+    let hl = sa_net_addr_host_len(ah);
+    let host = __psa_str_new();
+    let i: u64 = 0;
+    while i < hl {
+        host = __psa_str_push(host, PTR_BYTE_AT(hp, i));
+        i = i + 1;
+    }
+    let port = sa_net_addr_port(ah);
+    let t = __psa_tuple_new();
+    __psa_tuple_push(t, host);
+    __psa_tuple_push(t, __psa_box_int(port as i64));
+    return t;
+}
+
+// Materialises a datagram socket's handle on first
+// use (bind to the pending bind address, ephemeral
+// by default -- CPython auto-binds on first send).
+fn __psa_sock_ensure_udp(rec: PsaVal) -> u64 {
+    let h = __psa_sock_handle(rec);
+    if h != 0 { return h; };
+    let host = __psa_dict_get(rec, __psa_sock_lit_bhost());
+    let port = __psa_sock_get_i(rec, __psa_sock_lit_bport());
+    let buf = [0u8; 256];
+    let sni = __psa_str_bytes_len(host);
+    if sni > 256 { panic(77180); };
+    let si: i64 = 0;
+    while si < sni {
+        let __ix = si as u64;
+        buf[__ix] = __psa_bytes_get_h(host.ipay as ptr, si);
+        si = si + 1;
+    }
+    let n = sni as u64;
+    let out = [0u64; 1];
+    let st = sa_std_net_udp_bind(PTR_BYTE_ADD(&buf, 0), n, port as u32, &out[0]);
+    if st != 0 { __psa_sock_raise(st); };
+    let nh = out[0];
+    __psa_dict_set(rec, __psa_sock_lit_handle(), __psa_box_int(nh as i64));
+    __psa_sock_apply_timeout(rec, nh);
+    return nh;
+}
+
+// Writes all of data over a stream handle in staged
+// chunks; returns the number of bytes written (the
+// full length -- a short write is retried, an error
+// raises; CPython send() may return short, psa send
+// is write-all, registered in the README).
+fn __psa_sock_write_all(h: u64, data: PsaVal) -> i64 {
+    let total = __psa_str_bytes_len(data);
+    let buf = [0u8; 4096];
+    let off: i64 = 0;
+    while off < total {
+        let chunk = total - off;
+        if chunk > 4096 { chunk = 4096; };
+        let i: i64 = 0;
+        while i < chunk {
+            let __ix = i as u64;
+            buf[__ix] = __psa_bytes_get_h(data.ipay as ptr, off + i);
+            i = i + 1;
+        }
+        let woff: u64 = 0;
+        while woff < chunk as u64 {
+            let outw = [0u64; 1];
+            let st = sa_std_net_tcp_stream_write(h, PTR_BYTE_ADD(&buf, woff), chunk as u64 - woff, &outw[0]);
+            if st != 0 { __psa_sock_raise(st); };
+            if outw[0] == 0 { panic(77182); };
+            woff = woff + outw[0];
+        }
+        off = off + chunk;
+    }
+    return total;
+}
+
+
+// ---- constants (zero-arg call forms) ----
+
+fn psa_socket_af_inet() -> PsaVal {
+    return __psa_box_int(2);
+}
+
+fn psa_socket_af_inet6() -> PsaVal {
+    return __psa_box_int(10);
+}
+
+fn psa_socket_sock_stream() -> PsaVal {
+    return __psa_box_int(1);
+}
+
+fn psa_socket_sock_dgram() -> PsaVal {
+    return __psa_box_int(2);
+}
+
+fn psa_socket_sol_socket() -> PsaVal {
+    return __psa_box_int(1);
+}
+
+// ---- construction ----
+
+fn psa_socket_new_default() -> PsaVal {
+    return __psa_sock_new_rec(2, 1);
+}
+
+// family: 2 (AF_INET) or 10 (AF_INET6); type: 1
+// (SOCK_STREAM) or 2 (SOCK_DGRAM). AF_INET6 sockets
+// run over the same base calls (the base resolves
+// and connects by family from the address itself).
+fn psa_socket_new(family: PsaVal, typ: PsaVal) -> PsaVal {
+    if family.tag != 0 { panic(77180); };
+    if typ.tag != 0 { panic(77180); };
+    if family.ipay != 2 {
+        if family.ipay != 10 { panic(77180); };
+    };
+    if typ.ipay != 1 {
+        if typ.ipay != 2 { panic(77180); };
+    };
+    return __psa_sock_new_rec(family.ipay, typ.ipay);
+}
+
+fn psa_socket_create_connection_addr(addr: PsaVal) -> PsaVal {
+    let rec = __psa_sock_new_rec(2, 1);
+    let r = psa_socket_connect(rec, addr);
+    return rec;
+}
+
+fn psa_socket_create_connection_addr_timeout(addr: PsaVal, timeout: PsaVal) -> PsaVal {
+    let rec = __psa_sock_new_rec(2, 1);
+    let r1 = psa_socket_settimeout(rec, timeout);
+    let host = __psa_sock_addr_host(addr);
+    let port = __psa_sock_addr_port(addr);
+    let buf = [0u8; 256];
+    let sni = __psa_str_bytes_len(host);
+    if sni > 256 { panic(77180); };
+    let si: i64 = 0;
+    while si < sni {
+        let __ix = si as u64;
+        buf[__ix] = __psa_bytes_get_h(host.ipay as ptr, si);
+        si = si + 1;
+    }
+    let n = sni as u64;
+    let out = [0u64; 1];
+    let mode = __psa_sock_timeout_mode(rec);
+    if mode == 2 { panic(77184); };
+    if mode == 1 {
+        let ns = (__psa_sock_timeout_secs(rec) * 1000000000.0) as u64;
+        let st = sa_std_net_tcp_connect_timeout_all(PTR_BYTE_ADD(&buf, 0), n, port as u32, ns, &out[0]);
+        if st != 0 { __psa_sock_raise(st); };
+    } else {
+        let st = sa_std_net_tcp_connect(PTR_BYTE_ADD(&buf, 0), n, port as u32, &out[0]);
+        if st != 0 { __psa_sock_raise(st); };
+    };
+    let h = out[0];
+    __psa_dict_set(rec, __psa_sock_lit_handle(), __psa_box_int(h as i64));
+    __psa_sock_apply_timeout(rec, h);
+    return rec;
+}
+
+// ---- stream client / server ----
+
+fn psa_socket_connect(sock: PsaVal, addr: PsaVal) -> PsaVal {
+    let rec = __psa_sock_rec(sock);
+    __psa_sock_check_open(rec);
+    let kind = __psa_sock_get_i(rec, __psa_sock_lit_kind());
+    let host = __psa_sock_addr_host(addr);
+    let port = __psa_sock_addr_port(addr);
+    let buf = [0u8; 256];
+    let sni = __psa_str_bytes_len(host);
+    if sni > 256 { panic(77180); };
+    let si: i64 = 0;
+    while si < sni {
+        let __ix = si as u64;
+        buf[__ix] = __psa_bytes_get_h(host.ipay as ptr, si);
+        si = si + 1;
+    }
+    let n = sni as u64;
+    if kind == 2 {
+        let h = __psa_sock_ensure_udp(rec);
+        let st = sa_std_net_udp_connect(h, PTR_BYTE_ADD(&buf, 0), n, port as u32);
+        if st != 0 { __psa_sock_raise(st); };
+        return __psa_m_none();
+    };
+    if __psa_sock_handle(rec) != 0 { panic(77182); };
+    let out = [0u64; 1];
+    let mode = __psa_sock_timeout_mode(rec);
+    if mode == 2 { panic(77184); };
+    if mode == 1 {
+        let ns = (__psa_sock_timeout_secs(rec) * 1000000000.0) as u64;
+        let st = sa_std_net_tcp_connect_timeout(PTR_BYTE_ADD(&buf, 0), n, port as u32, ns, &out[0]);
+        if st != 0 { __psa_sock_raise(st); };
+    } else {
+        let st = sa_std_net_tcp_connect(PTR_BYTE_ADD(&buf, 0), n, port as u32, &out[0]);
+        if st != 0 { __psa_sock_raise(st); };
+    };
+    let h = out[0];
+    __psa_dict_set(rec, __psa_sock_lit_handle(), __psa_box_int(h as i64));
+    __psa_sock_apply_timeout(rec, h);
+    return __psa_m_none();
+}
+
+fn psa_socket_bind(sock: PsaVal, addr: PsaVal) -> PsaVal {
+    let rec = __psa_sock_rec(sock);
+    __psa_sock_check_open(rec);
+    let host = __psa_sock_addr_host(addr);
+    let port = __psa_sock_addr_port(addr);
+    __psa_dict_set(rec, __psa_sock_lit_bhost(), host);
+    __psa_dict_set(rec, __psa_sock_lit_bport(), __psa_box_int(port));
+    let kind = __psa_sock_get_i(rec, __psa_sock_lit_kind());
+    if kind == 2 {
+        // Datagram sockets bind eagerly (the base
+        // creates the handle at bind).
+        if __psa_sock_handle(rec) == 0 {
+            __psa_sock_ensure_udp(rec);
+        }
+    };
+    return __psa_m_none();
+}
+
+// backlog is accepted for CPython shape; the base
+// listen call takes no backlog (registered).
+fn psa_socket_listen(sock: PsaVal, backlog: PsaVal) -> PsaVal {
+    let rec = __psa_sock_rec(sock);
+    __psa_sock_check_open(rec);
+    let kind = __psa_sock_get_i(rec, __psa_sock_lit_kind());
+    if kind != 1 { panic(77180); };
+    if backlog.tag != 0 { panic(77180); };
+    if __psa_sock_handle(rec) != 0 { panic(77182); };
+    let host = __psa_dict_get(rec, __psa_sock_lit_bhost());
+    let port = __psa_sock_get_i(rec, __psa_sock_lit_bport());
+    let buf = [0u8; 256];
+    let sni = __psa_str_bytes_len(host);
+    if sni > 256 { panic(77180); };
+    let si: i64 = 0;
+    while si < sni {
+        let __ix = si as u64;
+        buf[__ix] = __psa_bytes_get_h(host.ipay as ptr, si);
+        si = si + 1;
+    }
+    let n = sni as u64;
+    let out = [0u64; 1];
+    let outp = [0u64; 1];
+    let st = sa_std_net_tcp_listen(PTR_BYTE_ADD(&buf, 0), n, port as u32, &out[0], &outp[0]);
+    if st != 0 { __psa_sock_raise(st); };
+    __psa_dict_set(rec, __psa_sock_lit_handle(), __psa_box_int(out[0] as i64));
+    __psa_dict_set(rec, __psa_sock_lit_role(), __psa_box_int(1));
+    __psa_dict_set(rec, __psa_sock_lit_bport(), __psa_box_int(outp[0] as i64));
+    return __psa_m_none();
+}
+
+// Returns a 2-tuple (connected socket record,
+// (host, port) address tuple).
+fn psa_socket_accept(sock: PsaVal) -> PsaVal {
+    let rec = __psa_sock_rec(sock);
+    __psa_sock_check_open(rec);
+    if __psa_sock_get_i(rec, __psa_sock_lit_role()) != 1 { panic(77182); };
+    let lh = __psa_sock_handle(rec);
+    let outs = [0u64; 1];
+    let outa = [0u64; 1];
+    let st = sa_std_net_tcp_accept_addr(lh, &outs[0], &outa[0]);
+    if st != 0 { __psa_sock_raise(st); };
+    let conn = __psa_sock_new_rec(__psa_sock_get_i(rec, __psa_sock_lit_family()), 1);
+    __psa_dict_set(conn, __psa_sock_lit_handle(), __psa_box_int(outs[0] as i64));
+    __psa_dict_set(conn, __psa_sock_lit_timeout(), __psa_dict_get(rec, __psa_sock_lit_timeout()));
+    __psa_sock_apply_timeout(conn, outs[0]);
+    let at = __psa_sock_addr_tuple(outa[0]);
+    let fr = sa_net_addr_free(outa[0]);
+    let t = __psa_tuple_new();
+    __psa_tuple_push(t, conn);
+    __psa_tuple_push(t, at);
+    return t;
+}
+
+// ---- data transfer ----
+
+fn psa_socket_send(sock: PsaVal, data: PsaVal) -> PsaVal {
+    let rec = __psa_sock_rec(sock);
+    __psa_sock_check_open(rec);
+    if data.tag != 6 { panic(77180); };
+    let kind = __psa_sock_get_i(rec, __psa_sock_lit_kind());
+    if kind == 2 {
+        let h = __psa_sock_ensure_udp(rec);
+        let sent = __psa_sock_send_udp(h, data);
+        return __psa_box_int(sent);
+    };
+    let h = __psa_sock_handle(rec);
+    if h == 0 { panic(77182); };
+    let n = __psa_sock_write_all(h, data);
+    return __psa_box_int(n);
+}
+
+fn psa_socket_sendall(sock: PsaVal, data: PsaVal) -> PsaVal {
+    let r = psa_socket_send(sock, data);
+    return __psa_m_none();
+}
+
+// One datagram, staged whole: datagrams longer
+// than the 4096-byte staging buffer panic (77180)
+// instead of being split (registered cap).
+fn __psa_sock_send_udp(h: u64, data: PsaVal) -> i64 {
+    let total = __psa_str_bytes_len(data);
+    if total > 4096 { panic(77180); };
+    let buf = [0u8; 4096];
+    let i: i64 = 0;
+    while i < total {
+        let __ix = i as u64;
+        buf[__ix] = __psa_bytes_get_h(data.ipay as ptr, i);
+        i = i + 1;
+    }
+    let outs = [0u64; 1];
+    let st = sa_std_net_udp_send(h, PTR_BYTE_ADD(&buf, 0), total as u64, &outs[0]);
+    if st != 0 { __psa_sock_raise(st); };
+    return outs[0] as i64;
+}
+
+fn psa_socket_sendto(sock: PsaVal, data: PsaVal, addr: PsaVal) -> PsaVal {
+    let rec = __psa_sock_rec(sock);
+    __psa_sock_check_open(rec);
+    if data.tag != 6 { panic(77180); };
+    let kind = __psa_sock_get_i(rec, __psa_sock_lit_kind());
+    if kind == 1 {
+        // CPython allows sendto on a connected
+        // stream socket; it behaves like send.
+        let r = psa_socket_send(rec, data);
+        return r;
+    };
+    let host = __psa_sock_addr_host(addr);
+    let port = __psa_sock_addr_port(addr);
+    let total = __psa_str_bytes_len(data);
+    if total > 4096 { panic(77180); };
+    let h = __psa_sock_ensure_udp(rec);
+    let buf = [0u8; 4096];
+    let i: i64 = 0;
+    while i < total {
+        let __ix = i as u64;
+        buf[__ix] = __psa_bytes_get_h(data.ipay as ptr, i);
+        i = i + 1;
+    }
+    let hb = [0u8; 256];
+    let sni = __psa_str_bytes_len(host);
+    if sni > 256 { panic(77180); };
+    let si: i64 = 0;
+    while si < sni {
+        let __ix = si as u64;
+        hb[__ix] = __psa_bytes_get_h(host.ipay as ptr, si);
+        si = si + 1;
+    }
+    let hn = sni as u64;
+    let outs = [0u64; 1];
+    let st = sa_std_net_udp_send_to(h, PTR_BYTE_ADD(&buf, 0), total as u64, PTR_BYTE_ADD(&hb, 0), hn, port as u32, &outs[0]);
+    if st != 0 { __psa_sock_raise(st); };
+    return __psa_box_int(outs[0] as i64);
+}
+
+fn psa_socket_recv(sock: PsaVal, bufsize: PsaVal) -> PsaVal {
+    let rec = __psa_sock_rec(sock);
+    __psa_sock_check_open(rec);
+    if bufsize.tag != 0 { panic(77180); };
+    if bufsize.ipay < 0 { panic(77180); };
+    if bufsize.ipay == 0 { return __psa_str_new(); };
+    let kind = __psa_sock_get_i(rec, __psa_sock_lit_kind());
+    let cap = bufsize.ipay;
+    if cap > 4096 { cap = 4096; };
+    let buf = [0u8; 4096];
+    let outn = [0u64; 1];
+    if kind == 2 {
+        let h = __psa_sock_ensure_udp(rec);
+        let st = sa_std_net_udp_recv(h, PTR_BYTE_ADD(&buf, 0), cap as u64, &outn[0]);
+        if st != 0 { __psa_sock_raise(st); };
+    } else {
+        let h = __psa_sock_handle(rec);
+        if h == 0 { panic(77182); };
+        let st = sa_std_net_tcp_stream_read(h, PTR_BYTE_ADD(&buf, 0), cap as u64, &outn[0]);
+        if st != 0 { __psa_sock_raise(st); };
+    };
+    let out = __psa_str_new();
+    let ri: u64 = 0;
+    while ri < outn[0] {
+        out = __psa_str_push(out, buf[ri]);
+        ri = ri + 1;
+    }
+    return out;
+}
+
+// Returns a 2-tuple (data, (host, port)). Datagram
+// sockets only; on a stream socket CPython returns
+// the peer address too, a form the psa record does
+// not carry -- loud refusal (77185, registered).
+fn psa_socket_recvfrom(sock: PsaVal, bufsize: PsaVal) -> PsaVal {
+    let rec = __psa_sock_rec(sock);
+    __psa_sock_check_open(rec);
+    let kind = __psa_sock_get_i(rec, __psa_sock_lit_kind());
+    if kind != 2 { panic(77185); };
+    if bufsize.tag != 0 { panic(77180); };
+    if bufsize.ipay < 0 { panic(77180); };
+    if bufsize.ipay == 0 {
+        let t = __psa_tuple_new();
+        __psa_tuple_push(t, __psa_str_new());
+        __psa_tuple_push(t, psa_socket_getpeername(rec));
+        return t;
+    };
+    let cap = bufsize.ipay;
+    if cap > 4096 { cap = 4096; };
+    let h = __psa_sock_ensure_udp(rec);
+    let buf = [0u8; 4096];
+    let outn = [0u64; 1];
+    let outa = [0u64; 1];
+    let st = sa_std_net_udp_recv_from(h, PTR_BYTE_ADD(&buf, 0), cap as u64, &outn[0], &outa[0]);
+    if st != 0 { __psa_sock_raise(st); };
+    let data = __psa_str_new();
+    let ri: u64 = 0;
+    while ri < outn[0] {
+        data = __psa_str_push(data, buf[ri]);
+        ri = ri + 1;
+    }
+    let at = __psa_sock_addr_tuple(outa[0]);
+    let fr = sa_net_addr_free(outa[0]);
+    let t = __psa_tuple_new();
+    __psa_tuple_push(t, data);
+    __psa_tuple_push(t, at);
+    return t;
+}
+
+// ---- lifecycle / options ----
+
+fn psa_socket_close(sock: PsaVal) -> PsaVal {
+    let rec = __psa_sock_rec(sock);
+    if __psa_sock_is_closed(rec) { return __psa_m_none(); };
+    __psa_dict_set(rec, __psa_sock_lit_closed(), __psa_box_int(1));
+    let h = __psa_sock_handle(rec);
+    if h != 0 {
+        let kind = __psa_sock_get_i(rec, __psa_sock_lit_kind());
+        let role = __psa_sock_get_i(rec, __psa_sock_lit_role());
+        if kind == 2 {
+            let _ = sa_net_udp_close(h);
+        };
+        if kind == 1 {
+            if role == 1 {
+                let _ = sa_net_tcp_listener_close(h);
+            } else {
+                let _ = sa_net_tcp_stream_close(h);
+            }
+        };
+        __psa_dict_set(rec, __psa_sock_lit_handle(), __psa_box_int(0));
+    };
+    return __psa_m_none();
+}
+
+// how: 0 = read half, 1 = write half, 2 = both
+// (CPython SHUT_RD / SHUT_WR / SHUT_RDWR).
+fn psa_socket_shutdown(sock: PsaVal, how: PsaVal) -> PsaVal {
+    let rec = __psa_sock_rec(sock);
+    __psa_sock_check_open(rec);
+    if how.tag != 0 { panic(77180); };
+    if how.ipay < 0 { panic(77180); };
+    if how.ipay > 2 { panic(77180); };
+    let kind = __psa_sock_get_i(rec, __psa_sock_lit_kind());
+    if kind != 1 { panic(77182); };
+    let h = __psa_sock_handle(rec);
+    if h == 0 { panic(77182); };
+    let rc = sa_net_tcp_stream_shutdown(h, how.ipay as i32);
+    return __psa_m_none();
+}
+
+fn psa_socket_settimeout(sock: PsaVal, val: PsaVal) -> PsaVal {
+    let rec = __psa_sock_rec(sock);
+    if val.tag == 3 {
+        __psa_dict_set(rec, __psa_sock_lit_timeout(), __psa_m_none());
+    } else {
+        if val.tag == 0 {
+            if val.ipay < 0 { panic(77180); };
+            __psa_dict_set(rec, __psa_sock_lit_timeout(), __psa_box_float(val.ipay as f64));
+        } else {
+            if val.tag != 1 { panic(77180); };
+            if val.fpay < 0.0 { panic(77180); };
+            __psa_dict_set(rec, __psa_sock_lit_timeout(), val);
+        }
+    };
+    let h = __psa_sock_handle(rec);
+    if h != 0 { __psa_sock_apply_timeout(rec, h); };
+    return __psa_m_none();
+}
+
+fn psa_socket_gettimeout(sock: PsaVal) -> PsaVal {
+    let rec = __psa_sock_rec(sock);
+    return __psa_dict_get(rec, __psa_sock_lit_timeout());
+}
+
+fn psa_socket_setblocking(sock: PsaVal, flag: PsaVal) -> PsaVal {
+    let rec = __psa_sock_rec(sock);
+    let truthy = __psa_dyn_truthy(flag);
+    if truthy {
+        return psa_socket_settimeout(rec, __psa_m_none());
+    };
+    return psa_socket_settimeout(rec, __psa_box_float(0.0));
+}
+
+fn psa_socket_getpeername(sock: PsaVal) -> PsaVal {
+    let rec = __psa_sock_rec(sock);
+    __psa_sock_check_open(rec);
+    let kind = __psa_sock_get_i(rec, __psa_sock_lit_kind());
+    let role = __psa_sock_get_i(rec, __psa_sock_lit_role());
+    let h = __psa_sock_handle(rec);
+    if h == 0 { panic(77182); };
+    let outa = [0u64; 1];
+    if kind == 2 {
+        let st = sa_std_net_udp_peer_addr(h, &outa[0]);
+        if st != 0 { __psa_sock_raise(st); };
+    } else {
+        if role == 1 { panic(77182); };
+        let st = sa_std_net_tcp_stream_peer_addr(h, &outa[0]);
+        if st != 0 { __psa_sock_raise(st); };
+    };
+    let t = __psa_sock_addr_tuple(outa[0]);
+    let fr = sa_net_addr_free(outa[0]);
+    return t;
+}
+
+fn psa_socket_getsockname(sock: PsaVal) -> PsaVal {
+    let rec = __psa_sock_rec(sock);
+    __psa_sock_check_open(rec);
+    let kind = __psa_sock_get_i(rec, __psa_sock_lit_kind());
+    let role = __psa_sock_get_i(rec, __psa_sock_lit_role());
+    let h = __psa_sock_handle(rec);
+    if h == 0 {
+        // Not materialised: the pending bind is the
+        // only honest answer a stream record has.
+        if kind == 1 {
+            let t = __psa_tuple_new();
+            __psa_tuple_push(t, __psa_dict_get(rec, __psa_sock_lit_bhost()));
+            __psa_tuple_push(t, __psa_box_int(__psa_sock_get_i(rec, __psa_sock_lit_bport())));
+            return t;
+        };
+        let hh = __psa_sock_ensure_udp(rec);
+        let outa2 = [0u64; 1];
+        let st2 = sa_std_net_udp_local_addr(hh, &outa2[0]);
+        if st2 != 0 { __psa_sock_raise(st2); };
+        let t2 = __psa_sock_addr_tuple(outa2[0]);
+        let fr2 = sa_net_addr_free(outa2[0]);
+        return t2;
+    };
+    let outa = [0u64; 1];
+    if kind == 2 {
+        let st = sa_std_net_udp_local_addr(h, &outa[0]);
+        if st != 0 { __psa_sock_raise(st); };
+    } else {
+        if role == 1 {
+            let st = sa_std_net_tcp_listener_local_addr(h, &outa[0]);
+            if st != 0 { __psa_sock_raise(st); };
+        } else {
+            let st = sa_std_net_tcp_stream_local_addr(h, &outa[0]);
+            if st != 0 { __psa_sock_raise(st); };
+        }
+    };
+    let t = __psa_sock_addr_tuple(outa[0]);
+    let fr = sa_net_addr_free(outa[0]);
+    return t;
+}
+
+// ---- name services ----
+
+fn psa_socket_gethostname() -> PsaVal {
+    let buf = [0u8; 256];
+    let outl = [0u64; 1];
+    let st = sa_std_net_hostname(PTR_BYTE_ADD(&buf, 0), 256, &outl[0]);
+    if st != 0 { __psa_sock_raise(st); };
+    let out = __psa_str_new();
+    let i: u64 = 0;
+    while i < outl[0] {
+        out = __psa_str_push(out, buf[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn psa_socket_gethostbyname(name: PsaVal) -> PsaVal {
+    if name.tag != 6 { panic(77180); };
+    let buf = [0u8; 256];
+    let sni = __psa_str_bytes_len(name);
+    if sni > 256 { panic(77180); };
+    let si: i64 = 0;
+    while si < sni {
+        let __ix = si as u64;
+        buf[__ix] = __psa_bytes_get_h(name.ipay as ptr, si);
+        si = si + 1;
+    }
+    let n = sni as u64;
+    // CPython's gethostbyname is IPv4-only: walk the
+    // resolver list and take the first AF_INET entry
+    // (family 2); no v4 entry is a gaierror (77181).
+    let outl = [0u64; 1];
+    let st = sa_std_net_to_socket_addr_list(PTR_BYTE_ADD(&buf, 0), n, 0, &outl[0]);
+    if st != 0 { __psa_sock_raise(st); };
+    let list = outl[0];
+    let found: u64 = 0;
+    let done: bool = false;
+    while done == false {
+        let outok = [0u64; 1];
+        let outa = [0u64; 1];
+        let stn = sa_std_net_addr_list_next(list, &outok[0], &outa[0]);
+        if stn != 0 { let fl = sa_std_net_addr_list_free(list); __psa_sock_raise(stn); };
+        if outok[0] == 0 { done = true; } else {
+            let ah = outa[0];
+            if sa_net_addr_family(ah) == 2 {
+                found = ah;
+                done = true;
+            } else {
+                let fa = sa_net_addr_free(ah);
+            }
+        }
+    }
+    let fl2 = sa_std_net_addr_list_free(list);
+    if found == 0 { panic(77181); };
+    let hp = sa_net_addr_host(found);
+    let hl = sa_net_addr_host_len(found);
+    let out = __psa_str_new();
+    let i: u64 = 0;
+    while i < hl {
+        out = __psa_str_push(out, PTR_BYTE_AT(hp, i));
+        i = i + 1;
+    }
+    let fr = sa_net_addr_free(found);
+    return out;
+}
+
+// ---- inet_* (pure byte logic, IPv4) ----
+
+// Full CPython inet_aton grammar: 1-4 dot-separated
+// parts, each decimal / octal (leading 0) / hex
+// (leading 0x); the last part spans the remaining
+// bytes. Returns the 4 packed bytes as a dyn str;
+// malformed input panics 77182 (CPython raises
+// OSError for inet_aton).
+fn psa_socket_inet_aton(text: PsaVal) -> PsaVal {
+    if text.tag != 6 { panic(77180); };
+    let n = __psa_str_bytes_len(text);
+    if n == 0 { panic(77182); };
+    let parts = [0u64; 4];
+    let nparts: i64 = 0;
+    let cur: u64 = 0;
+    let have: bool = false;
+    let base: u64 = 10;
+    let skipx: bool = false;
+    let i: i64 = 0;
+    while i <= n {
+        let b: u8 = 46;
+        if i < n { b = __psa_bytes_get_h(text.ipay as ptr, i); };
+        if b == 46 {
+            if have == false { panic(77182); };
+            if nparts >= 4 { panic(77182); };
+            let __ixp = nparts as u64;
+            parts[__ixp] = cur;
+            nparts = nparts + 1;
+            cur = 0; have = false; base = 10; skipx = false;
+        } else {
+            if have == false {
+                if b == 48 {
+                    // peek: '0x' -> hex, else octal
+                    let b2: u8 = 0;
+                    if i + 1 < n { b2 = __psa_bytes_get_h(text.ipay as ptr, i + 1); };
+                    if b2 == 120 { base = 16; skipx = true; };
+                    if b2 == 88 { base = 16; skipx = true; };
+                    if base != 16 { base = 8; };
+                }
+            };
+            have = true;
+            let d: i64 = -1;
+            if b >= 48 {
+                if b <= 57 { d = b as i64 - 48; };
+            };
+            if b >= 97 {
+                if b <= 102 { d = b as i64 - 87; };
+            };
+            if b >= 65 {
+                if b <= 70 { d = b as i64 - 55; };
+            };
+            if b == 120 { d = -2; };
+            if b == 88 { d = -2; };
+            if d == -1 { panic(77182); };
+            if d == -2 {
+                if skipx == false { panic(77182); };
+                skipx = false;
+            };
+            if d >= 0 {
+                if d as u64 >= base {
+                    if base != 16 { panic(77182); };
+                    if d as u64 >= 16 { panic(77182); };
+                };
+                cur = cur * base + d as u64;
+                if cur > 4294967295 { panic(77182); };
+            }
+        };
+        i = i + 1;
+    }
+    // Width checks per CPython: all parts but the
+    // last are single bytes; the last spans the rest.
+    let k: i64 = 0;
+    while k < nparts - 1 {
+        let __ixk = k as u64;
+        if parts[__ixk] > 255 { panic(77182); };
+        k = k + 1;
+    }
+    // Remaining bytes spanned by the last part.
+    let rem: u64 = (5 - nparts) as u64;
+    let lmax: u64 = 1;
+    let j: u64 = 0;
+    while j < rem {
+        lmax = lmax * 256;
+        j = j + 1;
+    }
+    let __ixb = (nparts - 1) as u64;
+    if parts[__ixb] >= lmax { panic(77182); };
+    let out = __psa_str_new();
+    let q: i64 = 0;
+    while q < nparts - 1 {
+        let __ixq = q as u64;
+        out = __psa_str_push(out, parts[__ixq] as u8);
+        q = q + 1;
+    }
+    let __ixc = (nparts - 1) as u64;
+    let last = parts[__ixc];
+    let sh: u64 = rem - 1;
+    let done: bool = false;
+    while done == false {
+        let byte = (last >> (sh * 8)) as u8;
+        out = __psa_str_push(out, byte);
+        if sh == 0 { done = true; } else { sh = sh - 1; };
+    }
+    return out;
+}
+
+fn psa_socket_inet_ntoa(packed: PsaVal) -> PsaVal {
+    if packed.tag != 6 { panic(77180); };
+    if __psa_str_bytes_len(packed) != 4 { panic(77182); };
+    let out = __psa_str_new();
+    let i: i64 = 0;
+    while i < 4 {
+        let b = __psa_bytes_get_h(packed.ipay as ptr, i);
+        out = __psa_str_append_str(out, __psa_str_from_i64(b as i64));
+        if i < 3 { out = __psa_str_push(out, 46u8); };
+        i = i + 1;
+    }
+    return out;
+}
+
+// inet_pton(AF_INET, s): strict dotted quad only
+// (CPython's pton rejects the short forms aton
+// accepts). AF_INET6 panics 77185 (registered:
+// the base's v6 parse/format externs do not expose
+// a verified packed-byte form).
+fn psa_socket_inet_pton(family: PsaVal, text: PsaVal) -> PsaVal {
+    if family.tag != 0 { panic(77180); };
+    if family.ipay == 10 { panic(77185); };
+    if family.ipay != 2 { panic(77180); };
+    if text.tag != 6 { panic(77180); };
+    let n = __psa_str_bytes_len(text);
+    let out = __psa_str_new();
+    let cur: i64 = -1;
+    let nparts: i64 = 0;
+    let i: i64 = 0;
+    while i <= n {
+        let b: u8 = 46;
+        if i < n { b = __psa_bytes_get_h(text.ipay as ptr, i); };
+        if b == 46 {
+            if cur < 0 { panic(77182); };
+            if nparts >= 4 { panic(77182); };
+            out = __psa_str_push(out, cur as u8);
+            nparts = nparts + 1;
+            cur = -1;
+        } else {
+            if b < 48 { panic(77182); };
+            if b > 57 { panic(77182); };
+            if cur < 0 { cur = 0; };
+            cur = cur * 10 + (b as i64 - 48);
+            if cur > 255 { panic(77182); };
+        };
+        i = i + 1;
+    }
+    if nparts != 4 { panic(77182); };
+    return out;
+}
+
+fn psa_socket_inet_ntop(family: PsaVal, packed: PsaVal) -> PsaVal {
+    if family.tag != 0 { panic(77180); };
+    if family.ipay == 10 { panic(77185); };
+    if family.ipay != 2 { panic(77180); };
+    return psa_socket_inet_ntoa(packed);
+}
+
+// ---- loud-refusal stubs (77185) ----
+// Each exists so the name resolves and fails
+// loudly; the README registers why the base cannot
+// carry the CPython semantics.
+
+fn psa_socket_recv_into(sock: PsaVal, buf: PsaVal) -> PsaVal {
+    panic(77185);
+}
+
+fn psa_socket_socketpair() -> PsaVal {
+    panic(77185);
+}
+
+fn psa_socket_fromfd(fd: PsaVal) -> PsaVal {
+    panic(77185);
+}
+
+fn psa_socket_dup(sock: PsaVal) -> PsaVal {
+    panic(77185);
+}
+
+fn psa_socket_getaddrinfo(host: PsaVal, port: PsaVal) -> PsaVal {
+    panic(77185);
+}
+
+fn psa_socket_gethostbyname_ex(name: PsaVal) -> PsaVal {
+    panic(77185);
+}
+
+fn psa_socket_gethostbyaddr(addr: PsaVal) -> PsaVal {
+    panic(77185);
+}
+
+fn psa_socket_getnameinfo(addr: PsaVal, flags: PsaVal) -> PsaVal {
+    panic(77185);
+}
+
+fn psa_socket_sendmsg(sock: PsaVal, data: PsaVal) -> PsaVal {
+    panic(77185);
+}
+
+fn psa_socket_fileno(sock: PsaVal) -> PsaVal {
+    panic(77185);
+}

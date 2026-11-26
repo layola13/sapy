@@ -1,0 +1,1822 @@
+// psa_std re (L3): a byte-level backtracking regular
+// expression engine over PsaVal, implementing the
+// honest subset of CPython's re module. See
+// README-re.md for the module contract, the semantic
+// divergences and the not-covered list. Panic codes
+// (7717x block, this module only):
+//   77170 argument of the wrong type (TypeError)
+//   77171 bad pattern syntax (re.error at compile)
+//   77172 unsupported pattern / replacement construct
+//         (lookahead, lookbehind, named groups,
+//         backreferences, conditionals, atomic
+//         groups, possessive quantifiers, \g<name>,
+//         verbose flag) -- refused loudly, never
+//         approximated
+//   77173 backtrack step limit exceeded
+//   77174 bad escape in a sub replacement string
+//   77175 invalid flags value
+//   77176 bad group reference in a sub replacement
+//   77177-77179 reserved, unassigned.
+//
+// The engine is BYTE-oriented: patterns and subjects
+// are the UTF-8 bytes of psa strs, character classes
+// and \d \w \s are the ASCII definitions (CPython's
+// re.ASCII behaviour), '.' matches one byte, and
+// case folding is ASCII-only -- the runtime's
+// registered ASCII stance, same as string's. A
+// multi-byte character in a pattern compiles to one
+// CHAR node per byte, so literal non-ASCII text
+// still matches byte-exactly (which for valid UTF-8
+// is code-point-exact); classes and '.' see bytes,
+// not code points (registered divergence).
+//
+// A compiled pattern is a dyn list [root_seq,
+// ngroups, flags]. A node is a dyn list whose first
+// element is an int type tag:
+//   0 CHAR  [0, byte, fold]      one byte; fold != 0
+//                                folds ASCII case
+//   1 ANY   [1, dotall]          any byte (not \n
+//                                unless dotall)
+//   2 CLASS [2, ranges]          ranges = list of
+//                                [lo, hi] byte pairs,
+//                                negation and case
+//                                folding folded in
+//   3 ALT   [3, branches]        branches = list of
+//                                seqs, tried in order
+//   4 GROUP [4, gidx, child]     gidx -1 = non-
+//                                capturing
+//   5 REP   [5, child, mn, mx, greedy]
+//                                mx -1 = unbounded;
+//                                child is a 1-node seq
+//   6 BOL   [6, multiline]       ^
+//   7 EOL   [7, multiline]       $
+//   8 WB    [8]                  \b
+//   9 NWB   [9]                  \B
+//   10 BOS  [10]                 \A
+//   11 EOS  [11]                 \Z (also appended
+//                                for fullmatch)
+// A seq is a list of nodes. Captures live in a caps
+// list of 2*(ngroups+1) ints (-1 = unset). The
+// matcher is a recursive backtracker over an
+// explicit continuation stack (frames: 0 = seq
+// position, 1 = repetition, 2 = group end); choice
+// points snapshot and restore caps. Repetitions of
+// a single CHAR / ANY / CLASS node run iteratively
+// (no recursion per byte). A step counter guards
+// against catastrophic backtracking: past
+// 1,000,000 steps the match panics 77173 instead
+// of running forever. Bounds-guarded reads never
+// ride on && / || (eager in SLA, probe P4).
+
+// ---- small accessors and gates ----
+
+fn __psa_re_at(v: PsaVal, i: i64) -> PsaVal {
+    return __psa_vec_get_h(v.ipay as ptr, i);
+}
+
+fn __psa_re_at_i(v: PsaVal, i: i64) -> i64 {
+    return __psa_vec_get_h(v.ipay as ptr, i).ipay;
+}
+
+fn __psa_re_none() -> PsaVal {
+    return PsaVal { tag: 3, ipay: 0, fpay: 0.0 };
+}
+
+fn __psa_re_gate_str(v: PsaVal) -> void {
+    if v.tag != 6 { panic(77170); };
+    return;
+}
+
+fn __psa_re_gate_int(v: PsaVal) -> i64 {
+    if v.tag == 0 { return v.ipay; };
+    if v.tag == 2 { return v.ipay; };
+    panic(77170);
+}
+
+fn __psa_re_check_flags(f: i64) -> i64 {
+    // Supported bits: IGNORECASE 2, MULTILINE 8,
+    // DOTALL 16, the str-default UNICODE 32 (a no-op
+    // here), ASCII 256 (the engine's native stance,
+    // also a no-op). LOCALE (4), TEMPLATE (1), DEBUG
+    // (128) and anything else is refused.
+    if f < 0 { panic(77175); };
+    if f != (f & 314) { panic(77175); };
+    return f;
+}
+
+// ---- byte predicates (ASCII, re.ASCII stance) ----
+
+fn __psa_re_is_digit(b: i64) -> bool {
+    return b >= 48 && b <= 57;
+}
+
+fn __psa_re_is_word(b: i64) -> bool {
+    if b >= 48 && b <= 57 { return true; };
+    if b >= 65 && b <= 90 { return true; };
+    if b >= 97 && b <= 122 { return true; };
+    return b == 95;
+}
+
+fn __psa_re_fold(b: i64) -> i64 {
+    // ASCII fold to lowercase.
+    if b >= 65 && b <= 90 { return b + 32; };
+    return b;
+}
+
+fn __psa_re_hexval(b: i64) -> i64 {
+    if b >= 48 && b <= 57 { return b - 48; };
+    if b >= 97 && b <= 102 { return b - 87; };
+    if b >= 65 && b <= 70 { return b - 55; };
+    return -1;
+}
+
+// ---- range lists (CLASS payloads) ----
+
+fn __psa_re_pair(lo: i64, hi: i64) -> PsaVal {
+    let p = __psa_list_new();
+    __psa_list_push(p, __psa_box_int(lo));
+    __psa_list_push(p, __psa_box_int(hi));
+    return p;
+}
+
+fn __psa_re_ranges_copy(rs: PsaVal) -> PsaVal {
+    let out = __psa_list_new();
+    let n = __psa_vec_len_h(rs.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        __psa_list_push(out, __psa_re_at(rs, i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn __psa_re_in_ranges(rs: PsaVal, b: i64) -> bool {
+    let n = __psa_vec_len_h(rs.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        let p = __psa_re_at(rs, i);
+        if b >= __psa_re_at_i(p, 0) {
+            if b <= __psa_re_at_i(p, 1) { return true; };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn __psa_re_digit_ranges() -> PsaVal {
+    let rs = __psa_list_new();
+    __psa_list_push(rs, __psa_re_pair(48, 57));
+    return rs;
+}
+
+fn __psa_re_word_ranges() -> PsaVal {
+    let rs = __psa_list_new();
+    __psa_list_push(rs, __psa_re_pair(48, 57));
+    __psa_list_push(rs, __psa_re_pair(65, 90));
+    __psa_list_push(rs, __psa_re_pair(95, 95));
+    __psa_list_push(rs, __psa_re_pair(97, 122));
+    return rs;
+}
+
+fn __psa_re_space_ranges() -> PsaVal {
+    // [ \t\n\r\f\v] == bytes 9..13 and 32.
+    let rs = __psa_list_new();
+    __psa_list_push(rs, __psa_re_pair(9, 13));
+    __psa_list_push(rs, __psa_re_pair(32, 32));
+    return rs;
+}
+
+fn __psa_re_complement(rs: PsaVal) -> PsaVal {
+    // Complement of a range list within [0, 255]:
+    // sort by lo (insertion sort), merge, invert.
+    let xs = __psa_re_ranges_copy(rs);
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    let a: i64 = 1;
+    while a < n {
+        let item = __psa_re_at(xs, a);
+        let ilo = __psa_re_at_i(item, 0);
+        let b = a;
+        while b > 0 {
+            let prev = __psa_re_at(xs, b - 1);
+            if __psa_re_at_i(prev, 0) > ilo {
+                __psa_vec_set_h(xs.ipay as ptr, b, prev);
+                b = b - 1;
+            } else {
+                break;
+            };
+        }
+        __psa_vec_set_h(xs.ipay as ptr, b, item);
+        a = a + 1;
+    }
+    let out = __psa_list_new();
+    let next: i64 = 0;
+    let i: i64 = 0;
+    while i < n {
+        let p = __psa_re_at(xs, i);
+        let lo = __psa_re_at_i(p, 0);
+        let hi = __psa_re_at_i(p, 1);
+        if lo > next {
+            __psa_list_push(out, __psa_re_pair(next, lo - 1));
+        };
+        if hi + 1 > next { next = hi + 1; };
+        i = i + 1;
+    }
+    if next <= 255 {
+        __psa_list_push(out, __psa_re_pair(next, 255));
+    };
+    return out;
+}
+
+fn __psa_re_add_cases(rs: PsaVal) -> PsaVal {
+    // IGNORECASE: add the case counterparts of the
+    // ASCII letter parts of every range.
+    let out = __psa_re_ranges_copy(rs);
+    let n = __psa_vec_len_h(rs.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        let p = __psa_re_at(rs, i);
+        let lo = __psa_re_at_i(p, 0);
+        let hi = __psa_re_at_i(p, 1);
+        let a = lo;
+        if a < 97 { a = 97; };
+        let b = hi;
+        if b > 122 { b = 122; };
+        if a <= b {
+            __psa_list_push(out, __psa_re_pair(a - 32, b - 32));
+        };
+        let c = lo;
+        if c < 65 { c = 65; };
+        let d = hi;
+        if d > 90 { d = 90; };
+        if c <= d {
+            __psa_list_push(out, __psa_re_pair(c + 32, d + 32));
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+fn __psa_re_add_ranges(dst: PsaVal, src: PsaVal) -> void {
+    let n = __psa_vec_len_h(src.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        __psa_list_push(dst, __psa_re_at(src, i));
+        i = i + 1;
+    }
+    return;
+}
+
+// ---- node builders ----
+
+fn __psa_re_n_char(b: i64, fold: i64) -> PsaVal {
+    let n = __psa_list_new();
+    __psa_list_push(n, __psa_box_int(0));
+    __psa_list_push(n, __psa_box_int(b));
+    __psa_list_push(n, __psa_box_int(fold));
+    return n;
+}
+
+fn __psa_re_n_any(dotall: i64) -> PsaVal {
+    let n = __psa_list_new();
+    __psa_list_push(n, __psa_box_int(1));
+    __psa_list_push(n, __psa_box_int(dotall));
+    return n;
+}
+
+fn __psa_re_n_class(rs: PsaVal) -> PsaVal {
+    let n = __psa_list_new();
+    __psa_list_push(n, __psa_box_int(2));
+    __psa_list_push(n, rs);
+    return n;
+}
+
+fn __psa_re_n_anchor(t: i64, ml: i64) -> PsaVal {
+    // BOL (6) / EOL (7) carry the multiline stamp;
+    // WB (8) / NWB (9) / BOS (10) / EOS (11) are bare.
+    let n = __psa_list_new();
+    __psa_list_push(n, __psa_box_int(t));
+    if t == 6 || t == 7 {
+        __psa_list_push(n, __psa_box_int(ml));
+    };
+    return n;
+}
+
+fn __psa_re_n_group(g: i64, child: PsaVal) -> PsaVal {
+    let n = __psa_list_new();
+    __psa_list_push(n, __psa_box_int(4));
+    __psa_list_push(n, __psa_box_int(g));
+    __psa_list_push(n, child);
+    return n;
+}
+
+fn __psa_re_n_rep(child: PsaVal, mn: i64, mx: i64, greedy: i64) -> PsaVal {
+    let n = __psa_list_new();
+    __psa_list_push(n, __psa_box_int(5));
+    __psa_list_push(n, child);
+    __psa_list_push(n, __psa_box_int(mn));
+    __psa_list_push(n, __psa_box_int(mx));
+    __psa_list_push(n, __psa_box_int(greedy));
+    return n;
+}
+
+fn __psa_re_wrap_seq(node: PsaVal) -> PsaVal {
+    // A one-node seq holding node.
+    let s = __psa_list_new();
+    __psa_list_push(s, node);
+    return s;
+}
+
+// ---- caps and continuation stacks ----
+
+fn __psa_re_caps_new(ngroups: i64) -> PsaVal {
+    // 2*(ngroups+1) slots, all -1 (unset).
+    let caps = __psa_list_new();
+    let total = 2 * (ngroups + 1);
+    let i: i64 = 0;
+    while i < total {
+        __psa_list_push(caps, __psa_box_int(-1));
+        i = i + 1;
+    }
+    return caps;
+}
+
+fn __psa_re_caps_copy(caps: PsaVal) -> PsaVal {
+    let out = __psa_list_new();
+    let n = __psa_vec_len_h(caps.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        __psa_list_push(out, __psa_re_at(caps, i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn __psa_re_caps_restore(caps: PsaVal, snap: PsaVal) -> void {
+    let n = __psa_vec_len_h(snap.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        __psa_vec_set_h(caps.ipay as ptr, i, __psa_re_at(snap, i));
+        i = i + 1;
+    }
+    return;
+}
+
+fn __psa_re_cont_push(cont: PsaVal, frame: PsaVal) -> PsaVal {
+    // Continuations are immutable: a push returns a
+    // fresh list, so a failed branch cannot leave
+    // the stack dirty.
+    let out = __psa_list_new();
+    let n = __psa_vec_len_h(cont.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        __psa_list_push(out, __psa_re_at(cont, i));
+        i = i + 1;
+    }
+    __psa_list_push(out, frame);
+    return out;
+}
+
+fn __psa_re_cont_pop(cont: PsaVal) -> PsaVal {
+    let out = __psa_list_new();
+    let n = __psa_vec_len_h(cont.ipay as ptr);
+    let i: i64 = 0;
+    while i < n - 1 {
+        __psa_list_push(out, __psa_re_at(cont, i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn __psa_re_frame_seq(nodes: PsaVal, idx: i64) -> PsaVal {
+    let f = __psa_list_new();
+    __psa_list_push(f, __psa_box_int(0));
+    __psa_list_push(f, nodes);
+    __psa_list_push(f, __psa_box_int(idx));
+    return f;
+}
+
+fn __psa_re_frame_group(g: i64, nodes: PsaVal, idx: i64) -> PsaVal {
+    let f = __psa_list_new();
+    __psa_list_push(f, __psa_box_int(2));
+    __psa_list_push(f, __psa_box_int(g));
+    __psa_list_push(f, nodes);
+    __psa_list_push(f, __psa_box_int(idx));
+    return f;
+}
+
+fn __psa_re_frame_rep(child: PsaVal, mn: i64, mx: i64, greedy: i64, cnt: i64, an: PsaVal, ai: i64, startpos: i64) -> PsaVal {
+    let f = __psa_list_new();
+    __psa_list_push(f, __psa_box_int(1));
+    __psa_list_push(f, child);
+    __psa_list_push(f, __psa_box_int(mn));
+    __psa_list_push(f, __psa_box_int(mx));
+    __psa_list_push(f, __psa_box_int(greedy));
+    __psa_list_push(f, __psa_box_int(cnt));
+    __psa_list_push(f, an);
+    __psa_list_push(f, __psa_box_int(ai));
+    __psa_list_push(f, __psa_box_int(startpos));
+    return f;
+}
+
+// ---- pattern parser ----
+// Parse state is a dyn list [pat, pos, ngroups,
+// depth]; pos and the counters are boxed ints in
+// the list, mutated through the vec surface.
+
+fn __psa_re_ps_new(pat: PsaVal) -> PsaVal {
+    let ps = __psa_list_new();
+    __psa_list_push(ps, pat);
+    __psa_list_push(ps, __psa_box_int(0));
+    __psa_list_push(ps, __psa_box_int(0));
+    __psa_list_push(ps, __psa_box_int(0));
+    return ps;
+}
+
+fn __psa_re_ps_pat(ps: PsaVal) -> PsaVal {
+    return __psa_re_at(ps, 0);
+}
+
+fn __psa_re_ps_pos(ps: PsaVal) -> i64 {
+    return __psa_re_at_i(ps, 1);
+}
+
+fn __psa_re_ps_set_pos(ps: PsaVal, p: i64) -> void {
+    __psa_vec_set_h(ps.ipay as ptr, 1, __psa_box_int(p));
+    return;
+}
+
+fn __psa_re_ps_len(ps: PsaVal) -> i64 {
+    return __psa_bytes_len_h(__psa_re_ps_pat(ps).ipay as ptr);
+}
+
+fn __psa_re_ps_peek(ps: PsaVal) -> i64 {
+    let p = __psa_re_ps_pos(ps);
+    if p < __psa_re_ps_len(ps) {
+        return __psa_bytes_get_h(__psa_re_ps_pat(ps).ipay as ptr, p) as i64;
+    };
+    return -1;
+}
+
+fn __psa_re_ps_peek_at(ps: PsaVal, off: i64) -> i64 {
+    let p = __psa_re_ps_pos(ps) + off;
+    if p < __psa_re_ps_len(ps) {
+        return __psa_bytes_get_h(__psa_re_ps_pat(ps).ipay as ptr, p) as i64;
+    };
+    return -1;
+}
+
+fn __psa_re_ps_adv(ps: PsaVal) -> i64 {
+    let b = __psa_re_ps_peek(ps);
+    if b >= 0 {
+        __psa_re_ps_set_pos(ps, __psa_re_ps_pos(ps) + 1);
+    };
+    return b;
+}
+
+fn __psa_re_ps_groups(ps: PsaVal) -> i64 {
+    return __psa_re_at_i(ps, 2);
+}
+
+fn __psa_re_ps_new_group(ps: PsaVal) -> i64 {
+    let g = __psa_re_ps_groups(ps) + 1;
+    __psa_vec_set_h(ps.ipay as ptr, 2, __psa_box_int(g));
+    return g;
+}
+
+fn __psa_re_ps_depth(ps: PsaVal) -> i64 {
+    return __psa_re_at_i(ps, 3);
+}
+
+fn __psa_re_ps_set_depth(ps: PsaVal, d: i64) -> void {
+    __psa_vec_set_h(ps.ipay as ptr, 3, __psa_box_int(d));
+    return;
+}
+
+fn __psa_re_parse(pat: PsaVal, flags: i64) -> PsaVal {
+    // Compile: returns [root_seq, ngroups, flags].
+    let ps = __psa_re_ps_new(pat);
+    let root = __psa_re_parse_alt(ps, flags);
+    if __psa_re_ps_pos(ps) != __psa_re_ps_len(ps) {
+        // Stopped early: an unmatched ')'.
+        panic(77171);
+    };
+    let prog = __psa_list_new();
+    __psa_list_push(prog, root);
+    __psa_list_push(prog, __psa_box_int(__psa_re_ps_groups(ps)));
+    __psa_list_push(prog, __psa_box_int(flags));
+    return prog;
+}
+
+fn __psa_re_parse_alt(ps: PsaVal, flags: i64) -> PsaVal {
+    // branch ('|' branch)* -- a single branch is
+    // returned bare; several become one ALT node.
+    let branches = __psa_list_new();
+    let done = false;
+    while !(done) {
+        __psa_list_push(branches, __psa_re_parse_seq(ps, flags));
+        if __psa_re_ps_peek(ps) == 124 {
+            __psa_re_ps_adv(ps);
+        } else {
+            done = true;
+        };
+    }
+    if __psa_vec_len_h(branches.ipay as ptr) == 1 {
+        return __psa_re_at(branches, 0);
+    };
+    let alt = __psa_list_new();
+    __psa_list_push(alt, __psa_box_int(3));
+    __psa_list_push(alt, branches);
+    return __psa_re_wrap_seq(alt);
+}
+
+fn __psa_re_parse_seq(ps: PsaVal, flags: i64) -> PsaVal {
+    // Pieces until '|', ')' or end of pattern. A
+    // bare (?flags) piece returns the None sentinel
+    // and only updates the threaded flags.
+    let seq = __psa_list_new();
+    let cur = flags;
+    let done = false;
+    while !(done) {
+        let b = __psa_re_ps_peek(ps);
+        if b == -1 { done = true; };
+        if b == 124 { done = true; };
+        if b == 41 { done = true; };
+        if !(done) {
+            let empty = __psa_vec_len_h(seq.ipay as ptr) == 0;
+            let (node, nf) = __psa_re_parse_piece(ps, cur, empty);
+            cur = nf;
+            if node.tag != 3 {
+                __psa_list_push(seq, node);
+            };
+        };
+    }
+    return seq;
+}
+
+fn __psa_re_parse_piece(ps: PsaVal, flags: i64, seq_empty: bool) -> (PsaVal, i64) {
+    let (atom, nf) = __psa_re_parse_atom(ps, flags, seq_empty);
+    if atom.tag == 3 {
+        // A bare (?flags) piece: no quantifier may
+        // follow (a following '*'/'+'/'?' is parsed
+        // as the next piece's atom and errors there).
+        return (atom, nf);
+    };
+    // One optional quantifier, CPython forms.
+    let mn: i64 = 0;
+    let mx: i64 = 0;
+    let has_q = false;
+    let b = __psa_re_ps_peek(ps);
+    if b == 42 { __psa_re_ps_adv(ps); mn = 0; mx = -1; has_q = true; };
+    if b == 43 { __psa_re_ps_adv(ps); mn = 1; mx = -1; has_q = true; };
+    if b == 63 { __psa_re_ps_adv(ps); mn = 0; mx = 1; has_q = true; };
+    if b == 123 {
+        let (ok, qmn, qmx) = __psa_re_parse_brace(ps);
+        if ok { mn = qmn; mx = qmx; has_q = true; };
+    };
+    if !(has_q) {
+        return (atom, nf);
+    };
+    let greedy: i64 = 1;
+    let nb = __psa_re_ps_peek(ps);
+    if nb == 63 {
+        __psa_re_ps_adv(ps);
+        greedy = 0;
+    } else {
+        if nb == 43 {
+            // Possessive quantifier (CPython 3.11+):
+            // not implemented, refused loudly.
+            panic(77172);
+        };
+    };
+    let ab = __psa_re_ps_peek(ps);
+    if ab == 42 || ab == 43 || ab == 63 || ab == 123 {
+        // A second quantifier: CPython's "multiple
+        // repeat" error (a '{' that does not open a
+        // valid form is still an error here when it
+        // directly follows a quantifier in CPython
+        // 3.12; the unquantified-literal reading of
+        // '{' applies only after an atom).
+        panic(77171);
+    };
+    return (__psa_re_n_rep(__psa_re_wrap_seq(atom), mn, mx, greedy), nf);
+}
+
+fn __psa_re_parse_brace(ps: PsaVal) -> (bool, i64, i64) {
+    // At a '{': try {m}, {m,}, {m,n}, {,n}. On any
+    // malformation the position is restored and the
+    // '{' is left to be read as a literal atom
+    // (CPython's rule). {m,n} with n < m and repeat
+    // bounds above 10000 are hard errors.
+    let save = __psa_re_ps_pos(ps);
+    __psa_re_ps_adv(ps);
+    let m: i64 = 0;
+    let has_m = false;
+    let d = __psa_re_ps_peek(ps);
+    while __psa_re_is_digit(d) {
+        m = m * 10 + (d - 48);
+        has_m = true;
+        __psa_re_ps_adv(ps);
+        d = __psa_re_ps_peek(ps);
+    }
+    let has_comma = false;
+    let n: i64 = -1;
+    if d == 44 {
+        has_comma = true;
+        __psa_re_ps_adv(ps);
+        let has_n = false;
+        let d2 = __psa_re_ps_peek(ps);
+        while __psa_re_is_digit(d2) {
+            if n < 0 { n = 0; };
+            n = n * 10 + (d2 - 48);
+            has_n = true;
+            __psa_re_ps_adv(ps);
+            d2 = __psa_re_ps_peek(ps);
+        }
+        if !(has_n) { n = -1; };
+    };
+    if __psa_re_ps_peek(ps) != 125 {
+        __psa_re_ps_set_pos(ps, save);
+        return (false, 0, 0);
+    };
+    if !(has_m) {
+        if !(has_comma) {
+            __psa_re_ps_set_pos(ps, save);
+            return (false, 0, 0);
+        };
+    };
+    __psa_re_ps_adv(ps);
+    // Valid form consumed.
+    if has_comma {
+        if n >= 0 {
+            if n < m { panic(77171); };
+            if n > 10000 { panic(77171); };
+            return (true, m, n);
+        };
+        if m > 10000 { panic(77171); };
+        return (true, m, -1);
+    };
+    if m > 10000 { panic(77171); };
+    return (true, m, m);
+}
+
+fn __psa_re_parse_atom(ps: PsaVal, flags: i64, seq_empty: bool) -> (PsaVal, i64) {
+    let fold: i64 = 0;
+    if (flags & 2) != 0 { fold = 1; };
+    let b = __psa_re_ps_adv(ps);
+    if b == 40 {
+        return __psa_re_parse_group(ps, flags, seq_empty);
+    };
+    if b == 91 {
+        return (__psa_re_parse_class(ps, flags), flags);
+    };
+    if b == 46 {
+        let da: i64 = 0;
+        if (flags & 16) != 0 { da = 1; };
+        return (__psa_re_n_any(da), flags);
+    };
+    if b == 94 {
+        let ml: i64 = 0;
+        if (flags & 8) != 0 { ml = 1; };
+        return (__psa_re_n_anchor(6, ml), flags);
+    };
+    if b == 36 {
+        let ml: i64 = 0;
+        if (flags & 8) != 0 { ml = 1; };
+        return (__psa_re_n_anchor(7, ml), flags);
+    };
+    if b == 92 {
+        return __psa_re_parse_escape(ps, flags);
+    };
+    if b == 42 || b == 43 || b == 63 {
+        // Quantifier with nothing to repeat.
+        panic(77171);
+    };
+    if b == -1 {
+        panic(77171);
+    };
+    // A literal byte (multi-byte characters arrive
+    // one byte at a time and match byte-exactly).
+    return (__psa_re_n_char(b, fold), flags);
+}
+
+fn __psa_re_parse_group(ps: PsaVal, flags: i64, seq_empty: bool) -> (PsaVal, i64) {
+    // '(' already consumed.
+    let depth = __psa_re_ps_depth(ps);
+    if depth > 500 { panic(77171); };
+    if __psa_re_ps_peek(ps) == 63 {
+        __psa_re_ps_adv(ps);
+        let c = __psa_re_ps_peek(ps);
+        if c == 58 {
+            // (?:...) non-capturing.
+            __psa_re_ps_adv(ps);
+            __psa_re_ps_set_depth(ps, depth + 1);
+            let child = __psa_re_parse_alt(ps, flags);
+            __psa_re_ps_set_depth(ps, depth);
+            if __psa_re_ps_adv(ps) != 41 { panic(77171); };
+            return (__psa_re_n_group(-1, child), flags);
+        };
+        if c == 61 || c == 33 || c == 60 || c == 80 {
+            // (?= (?! (?<= (?<! (?P<name> (?P=name
+            panic(77172);
+        };
+        if c == 40 {
+            // (?(cond)...) conditional.
+            panic(77172);
+        };
+        if c == 35 {
+            // (?#comment): skip to the first ')'.
+            __psa_re_ps_adv(ps);
+            let done = false;
+            while !(done) {
+                let x = __psa_re_ps_adv(ps);
+                if x == -1 { panic(77171); };
+                if x == 41 { done = true; };
+            }
+            return (__psa_re_n_group(-1, __psa_list_new()), flags);
+        };
+        if c == 62 {
+            // (?>...) atomic group (CPython 3.11+).
+            panic(77172);
+        };
+        // Inline flags: letters, optional -letters,
+        // then ':' (scoped) or ')' (bare global).
+        let (nf, scoped) = __psa_re_parse_flags(ps, flags);
+        if scoped {
+            __psa_re_ps_set_depth(ps, depth + 1);
+            let child = __psa_re_parse_alt(ps, nf);
+            __psa_re_ps_set_depth(ps, depth);
+            if __psa_re_ps_adv(ps) != 41 { panic(77171); };
+            return (__psa_re_n_group(-1, child), flags);
+        };
+        if !(seq_empty) {
+            // CPython 3.11+: global flags not at the
+            // start of the expression are an error.
+            panic(77171);
+        };
+        return (__psa_re_none(), nf);
+    };
+    // Capturing group.
+    let g = __psa_re_ps_new_group(ps);
+    __psa_re_ps_set_depth(ps, depth + 1);
+    let child = __psa_re_parse_alt(ps, flags);
+    __psa_re_ps_set_depth(ps, depth);
+    if __psa_re_ps_adv(ps) != 41 { panic(77171); };
+    return (__psa_re_n_group(g, child), flags);
+}
+
+fn __psa_re_parse_flags(ps: PsaVal, flags: i64) -> (i64, bool) {
+    // Parse [imsxauL]* (-[imsx]* )? and the ':' or
+    // ')' terminator. Returns (new flags, scoped?).
+    // x and L are refused (77172); a and u are the
+    // engine's native stance and pass as no-ops. A
+    // '-' part in the bare (unscoped) form is an
+    // error, as in CPython 3.12.
+    let nf = flags;
+    let neg = false;
+    let done = false;
+    while !(done) {
+        let c = __psa_re_ps_peek(ps);
+        if c == 58 {
+            __psa_re_ps_adv(ps);
+            return (nf, true);
+        };
+        if c == 41 {
+            __psa_re_ps_adv(ps);
+            if neg { panic(77171); };
+            return (nf, false);
+        };
+        if c == 45 {
+            if neg { panic(77171); };
+            neg = true;
+            __psa_re_ps_adv(ps);
+        };
+        if c != 45 {
+            if c == 105 || c == 109 || c == 115 {
+                let bit: i64 = 16;
+                if c == 105 { bit = 2; };
+                if c == 109 { bit = 8; };
+                if neg {
+                    nf = nf - (nf & bit);
+                } else {
+                    nf = nf | bit;
+                };
+                __psa_re_ps_adv(ps);
+            };
+            if c != 105 && c != 109 && c != 115 {
+                if c == 120 || c == 76 {
+                    // x (verbose) / L (locale).
+                    panic(77172);
+                };
+                if c == 97 || c == 117 {
+                    // a (ascii) / u (unicode): no-ops.
+                    __psa_re_ps_adv(ps);
+                };
+                if c != 97 && c != 117 { panic(77171); };
+            };
+        };
+    }
+    panic(77171);
+}
+
+fn __psa_re_utf8_node(cp: i64, fold: i64) -> PsaVal {
+    // A \u / \U escape as CHAR nodes: one node for
+    // ASCII, else a transparent group of the UTF-8
+    // bytes (byte-exact matching).
+    if cp < 0 { panic(77171); };
+    if cp > 1114111 { panic(77171); };
+    if cp >= 55296 {
+        if cp <= 57343 { panic(77171); };
+    };
+    if cp < 128 {
+        return __psa_re_n_char(cp, fold);
+    };
+    let bytes = __psa_list_new();
+    if cp < 2048 {
+        __psa_list_push(bytes, __psa_box_int(192 + (cp >> 6)));
+        __psa_list_push(bytes, __psa_box_int(128 + (cp & 63)));
+    } else {
+        if cp < 65536 {
+            __psa_list_push(bytes, __psa_box_int(224 + (cp >> 12)));
+            __psa_list_push(bytes, __psa_box_int(128 + ((cp >> 6) & 63)));
+            __psa_list_push(bytes, __psa_box_int(128 + (cp & 63)));
+        } else {
+            __psa_list_push(bytes, __psa_box_int(240 + (cp >> 18)));
+            __psa_list_push(bytes, __psa_box_int(128 + ((cp >> 12) & 63)));
+            __psa_list_push(bytes, __psa_box_int(128 + ((cp >> 6) & 63)));
+            __psa_list_push(bytes, __psa_box_int(128 + (cp & 63)));
+        };
+    };
+    let seq = __psa_list_new();
+    let n = __psa_vec_len_h(bytes.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        __psa_list_push(seq, __psa_re_n_char(__psa_re_at_i(bytes, i), 0));
+        i = i + 1;
+    }
+    return __psa_re_n_group(-1, seq);
+}
+
+fn __psa_re_hex_n(ps: PsaVal, count: i64) -> i64 {
+    // Exactly count hex digits, else 77171.
+    let v: i64 = 0;
+    let i: i64 = 0;
+    while i < count {
+        let d = __psa_re_hexval(__psa_re_ps_adv(ps));
+        if d < 0 { panic(77171); };
+        v = v * 16 + d;
+        i = i + 1;
+    }
+    return v;
+}
+
+fn __psa_re_parse_escape(ps: PsaVal, flags: i64) -> (PsaVal, i64) {
+    // The backslash is consumed; read the escape.
+    let fold: i64 = 0;
+    if (flags & 2) != 0 { fold = 1; };
+    let c = __psa_re_ps_adv(ps);
+    if c == -1 { panic(77171); };
+    if c == 100 { return (__psa_re_n_class(__psa_re_digit_ranges()), flags); };
+    if c == 68 { return (__psa_re_n_class(__psa_re_complement(__psa_re_digit_ranges())), flags); };
+    if c == 115 { return (__psa_re_n_class(__psa_re_space_ranges()), flags); };
+    if c == 83 { return (__psa_re_n_class(__psa_re_complement(__psa_re_space_ranges())), flags); };
+    if c == 119 { return (__psa_re_n_class(__psa_re_word_ranges()), flags); };
+    if c == 87 { return (__psa_re_n_class(__psa_re_complement(__psa_re_word_ranges())), flags); };
+    if c == 98 { return (__psa_re_n_anchor(8, 0), flags); };
+    if c == 66 { return (__psa_re_n_anchor(9, 0), flags); };
+    if c == 65 { return (__psa_re_n_anchor(10, 0), flags); };
+    if c == 90 { return (__psa_re_n_anchor(11, 0), flags); };
+    if c == 110 { return (__psa_re_n_char(10, 0), flags); };
+    if c == 114 { return (__psa_re_n_char(13, 0), flags); };
+    if c == 116 { return (__psa_re_n_char(9, 0), flags); };
+    if c == 102 { return (__psa_re_n_char(12, 0), flags); };
+    if c == 118 { return (__psa_re_n_char(11, 0), flags); };
+    if c == 97 { return (__psa_re_n_char(7, 0), flags); };
+    if c == 120 { return (__psa_re_n_char(__psa_re_hex_n(ps, 2), fold), flags); };
+    if c == 117 { return (__psa_re_utf8_node(__psa_re_hex_n(ps, 4), fold), flags); };
+    if c == 85 { return (__psa_re_utf8_node(__psa_re_hex_n(ps, 8), fold), flags); };
+    if c >= 48 && c <= 57 {
+        if c == 48 {
+            // \0oo: an octal escape, up to 3 digits
+            // in total (the leading 0 counts).
+            let v: i64 = 0;
+            let cnt: i64 = 1;
+            let d = __psa_re_ps_peek(ps);
+            while cnt < 3 {
+                if d >= 48 && d <= 55 {
+                    v = v * 8 + (d - 48);
+                    __psa_re_ps_adv(ps);
+                    cnt = cnt + 1;
+                    d = __psa_re_ps_peek(ps);
+                } else {
+                    break;
+                };
+            }
+            return (__psa_re_n_char(v, 0), flags);
+        };
+        // \1 .. \9 outside a class: a backreference.
+        panic(77172);
+    };
+    if (c >= 65 && c <= 90) || (c >= 97 && c <= 122) {
+        // An unknown letter escape: CPython error.
+        panic(77171);
+    };
+    // Escaped punctuation / symbol: the byte itself.
+    return (__psa_re_n_char(c, fold), flags);
+}
+
+// ---- character class parser ----
+
+fn __psa_re_class_escape(ps: PsaVal, ranges: PsaVal) -> (i64, i64) {
+    // One escape inside [...]; the backslash is
+    // consumed. Returns (kind, byte): kind 1 = a
+    // set was added to ranges (\d \w \s and their
+    // complements), kind 0 = a single byte value.
+    // Inside a class \b is backspace (CPython) and
+    // \1..\7 start octal escapes, not backrefs.
+    let c = __psa_re_ps_adv(ps);
+    if c == -1 { panic(77171); };
+    if c == 100 { __psa_re_add_ranges(ranges, __psa_re_digit_ranges()); return (1, 0); };
+    if c == 68 { __psa_re_add_ranges(ranges, __psa_re_complement(__psa_re_digit_ranges())); return (1, 0); };
+    if c == 115 { __psa_re_add_ranges(ranges, __psa_re_space_ranges()); return (1, 0); };
+    if c == 83 { __psa_re_add_ranges(ranges, __psa_re_complement(__psa_re_space_ranges())); return (1, 0); };
+    if c == 119 { __psa_re_add_ranges(ranges, __psa_re_word_ranges()); return (1, 0); };
+    if c == 87 { __psa_re_add_ranges(ranges, __psa_re_complement(__psa_re_word_ranges())); return (1, 0); };
+    if c == 98 { return (0, 8); };
+    if c == 110 { return (0, 10); };
+    if c == 114 { return (0, 13); };
+    if c == 116 { return (0, 9); };
+    if c == 102 { return (0, 12); };
+    if c == 118 { return (0, 11); };
+    if c == 97 { return (0, 7); };
+    if c == 120 { return (0, __psa_re_hex_n(ps, 2)); };
+    if c == 117 {
+        let cp = __psa_re_hex_n(ps, 4);
+        if cp > 127 { panic(77172); };
+        return (0, cp);
+    };
+    if c == 85 {
+        let cp = __psa_re_hex_n(ps, 8);
+        if cp > 127 { panic(77172); };
+        return (0, cp);
+    };
+    if c >= 48 && c <= 55 {
+        // Octal escape: up to 3 digits in total.
+        let v: i64 = c - 48;
+        let cnt: i64 = 1;
+        let d = __psa_re_ps_peek(ps);
+        while cnt < 3 {
+            if d >= 48 && d <= 55 {
+                v = v * 8 + (d - 48);
+                __psa_re_ps_adv(ps);
+                cnt = cnt + 1;
+                d = __psa_re_ps_peek(ps);
+            } else {
+                break;
+            };
+        }
+        if v > 255 { panic(77171); };
+        return (0, v);
+    };
+    if (c >= 65 && c <= 90) || (c >= 97 && c <= 122) {
+        panic(77171);
+    };
+    return (0, c);
+}
+
+fn __psa_re_class_hi(ps: PsaVal) -> i64 {
+    // The high end of a range: one byte (an escape
+    // is allowed, a set escape is an error).
+    if __psa_re_ps_peek(ps) == 92 {
+        __psa_re_ps_adv(ps);
+        let scratch = __psa_list_new();
+        let (kind, val) = __psa_re_class_escape(ps, scratch);
+        if kind != 0 { panic(77171); };
+        return val;
+    };
+    return __psa_re_ps_adv(ps);
+}
+
+fn __psa_re_parse_class(ps: PsaVal, flags: i64) -> PsaVal {
+    // '[' already consumed. A ']' as the very
+    // first character is a literal; '-' is a range
+    // operator only between two bytes, a literal
+    // at the edges.
+    let neg = false;
+    if __psa_re_ps_peek(ps) == 94 {
+        __psa_re_ps_adv(ps);
+        neg = true;
+    };
+    let ranges = __psa_list_new();
+    let first = true;
+    let closed = false;
+    while !(closed) {
+        let b = __psa_re_ps_peek(ps);
+        if b == -1 { panic(77171); };
+        if b == 93 {
+            if !(first) {
+                __psa_re_ps_adv(ps);
+                closed = true;
+            };
+        };
+        if !(closed) {
+            first = false;
+            let is_set = false;
+            let lo: i64 = 0;
+            if b == 92 {
+                __psa_re_ps_adv(ps);
+                let (kind, val) = __psa_re_class_escape(ps, ranges);
+                if kind == 1 {
+                    is_set = true;
+                } else {
+                    lo = val;
+                };
+            } else {
+                lo = __psa_re_ps_adv(ps);
+            };
+            if is_set {
+                // A '-' right after a set escape
+                // cannot open a range (CPython:
+                // bad character range) unless it is
+                // the trailing literal '-'.
+                if __psa_re_ps_peek(ps) == 45 {
+                    let after = __psa_re_ps_peek_at(ps, 1);
+                    if after != 93 {
+                        if after != -1 { panic(77171); };
+                    };
+                };
+            } else {
+                let ranged = false;
+                if __psa_re_ps_peek(ps) == 45 {
+                    let after = __psa_re_ps_peek_at(ps, 1);
+                    if after != 93 {
+                        if after != -1 {
+                            __psa_re_ps_adv(ps);
+                            let hi = __psa_re_class_hi(ps);
+                            if hi < lo { panic(77171); };
+                            __psa_list_push(ranges, __psa_re_pair(lo, hi));
+                            ranged = true;
+                        };
+                    };
+                };
+                if !(ranged) {
+                    __psa_list_push(ranges, __psa_re_pair(lo, lo));
+                };
+            };
+        };
+    }
+    let rs = ranges;
+    if (flags & 2) != 0 {
+        rs = __psa_re_add_cases(rs);
+    };
+    if neg {
+        rs = __psa_re_complement(rs);
+    };
+    return __psa_re_n_class(rs);
+}
+
+// ---- matcher ----
+// The match context is a dyn list [steps, forbid,
+// start]: steps is the backtrack guard counter,
+// forbid is the position at which an empty overall
+// match is rejected (the findall / split / sub
+// empty-match rule), start is this attempt's start.
+
+fn __psa_re_step(ctx: PsaVal) -> void {
+    let n = __psa_re_at_i(ctx, 0) + 1;
+    __psa_vec_set_h(ctx.ipay as ptr, 0, __psa_box_int(n));
+    if n > 1000000 { panic(77173); };
+    return;
+}
+
+fn __psa_re_byte(s: PsaVal, i: i64) -> i64 {
+    return __psa_bytes_get_h(s.ipay as ptr, i) as i64;
+}
+
+fn __psa_re_simple_match(node: PsaVal, s: PsaVal, pos: i64) -> bool {
+    // CHAR / ANY / CLASS at pos; caller guarantees
+    // pos < len(s).
+    let t = __psa_re_at_i(node, 0);
+    let b = __psa_re_byte(s, pos);
+    if t == 0 {
+        if __psa_re_at_i(node, 2) != 0 {
+            return __psa_re_fold(b) == __psa_re_fold(__psa_re_at_i(node, 1));
+        };
+        return b == __psa_re_at_i(node, 1);
+    };
+    if t == 1 {
+        if __psa_re_at_i(node, 1) != 0 { return true; };
+        return b != 10;
+    };
+    return __psa_re_in_ranges(__psa_re_at(node, 1), b);
+}
+
+fn __psa_re_m(nodes_in: PsaVal, i_in: i64, s: PsaVal, pos_in: i64, caps: PsaVal, cont_in: PsaVal, ctx: PsaVal) -> i64 {
+    // Match the seq `nodes` from index i at pos,
+    // with continuation stack cont. Returns the end
+    // position of the overall match, or -1. The
+    // accept step rejects an empty overall match
+    // whose start is ctx's forbid position: the
+    // rejection flows back into the nearest choice
+    // point, which then tries its next alternative
+    // (CPython's post-3.7 empty-match rule).
+    let nodes = nodes_in;
+    let i = i_in;
+    let pos = pos_in;
+    let cont = cont_in;
+    let outer = false;
+    while !(outer) {
+        while i < __psa_vec_len_h(nodes.ipay as ptr) {
+            __psa_re_step(ctx);
+            let node = __psa_re_at(nodes, i);
+            let t = __psa_re_at_i(node, 0);
+            if t == 0 || t == 1 || t == 2 {
+                if pos >= __psa_bytes_len_h(s.ipay as ptr) { return -1; };
+                if !(__psa_re_simple_match(node, s, pos)) { return -1; };
+                pos = pos + 1;
+                i = i + 1;
+            };
+            if t == 6 {
+                let ok = false;
+                if pos == 0 {
+                    ok = true;
+                } else {
+                    if __psa_re_at_i(node, 1) != 0 {
+                        if __psa_re_byte(s, pos - 1) == 10 { ok = true; };
+                    };
+                };
+                if !(ok) { return -1; };
+                i = i + 1;
+            };
+            if t == 7 {
+                let n = __psa_bytes_len_h(s.ipay as ptr);
+                let ok = false;
+                if pos == n {
+                    ok = true;
+                } else {
+                    if __psa_re_byte(s, pos) == 10 {
+                        if __psa_re_at_i(node, 1) != 0 { ok = true; };
+                        if pos == n - 1 { ok = true; };
+                    };
+                };
+                if !(ok) { return -1; };
+                i = i + 1;
+            };
+            if t == 8 || t == 9 {
+                let left = false;
+                if pos > 0 {
+                    if __psa_re_is_word(__psa_re_byte(s, pos - 1)) { left = true; };
+                };
+                let right = false;
+                if pos < __psa_bytes_len_h(s.ipay as ptr) {
+                    if __psa_re_is_word(__psa_re_byte(s, pos)) { right = true; };
+                };
+                let boundary = left != right;
+                if t == 8 {
+                    if !(boundary) { return -1; };
+                } else {
+                    if boundary { return -1; };
+                };
+                i = i + 1;
+            };
+            if t == 10 {
+                if pos != 0 { return -1; };
+                i = i + 1;
+            };
+            if t == 11 {
+                if pos != __psa_bytes_len_h(s.ipay as ptr) { return -1; };
+                i = i + 1;
+            };
+            if t == 3 {
+                // Alternation: every branch but the
+                // last is a recursive try with caps
+                // snapshot/restore; the last branch
+                // is a tail descent.
+                let branches = __psa_re_at(node, 1);
+                let nb = __psa_vec_len_h(branches.ipay as ptr);
+                let j: i64 = 0;
+                while j < nb - 1 {
+                    let snap = __psa_re_caps_copy(caps);
+                    let cont2 = __psa_re_cont_push(cont, __psa_re_frame_seq(nodes, i + 1));
+                    let r = __psa_re_m(__psa_re_at(branches, j), 0, s, pos, caps, cont2, ctx);
+                    if r >= 0 { return r; };
+                    __psa_re_caps_restore(caps, snap);
+                    j = j + 1;
+                }
+                cont = __psa_re_cont_push(cont, __psa_re_frame_seq(nodes, i + 1));
+                nodes = __psa_re_at(branches, nb - 1);
+                i = 0;
+            };
+            if t == 4 {
+                let g = __psa_re_at_i(node, 1);
+                if g >= 0 {
+                    __psa_vec_set_h(caps.ipay as ptr, 2 * g, __psa_box_int(pos));
+                    cont = __psa_re_cont_push(cont, __psa_re_frame_group(g, nodes, i + 1));
+                } else {
+                    cont = __psa_re_cont_push(cont, __psa_re_frame_seq(nodes, i + 1));
+                };
+                nodes = __psa_re_at(node, 2);
+                i = 0;
+            };
+            if t == 5 {
+                return __psa_re_rep(__psa_re_at(node, 1), __psa_re_at_i(node, 2), __psa_re_at_i(node, 3), __psa_re_at_i(node, 4), 0, s, pos, caps, nodes, i + 1, cont, ctx, false);
+            };
+        }
+        // The current seq is exhausted: pop a frame.
+        if __psa_vec_len_h(cont.ipay as ptr) == 0 {
+            if pos == __psa_re_at_i(ctx, 2) {
+                if __psa_re_at_i(ctx, 2) == __psa_re_at_i(ctx, 1) {
+                    return -1;
+                };
+            };
+            return pos;
+        };
+        let frame = __psa_re_at(cont, __psa_vec_len_h(cont.ipay as ptr) - 1);
+        cont = __psa_re_cont_pop(cont);
+        let ft = __psa_re_at_i(frame, 0);
+        if ft == 0 {
+            nodes = __psa_re_at(frame, 1);
+            i = __psa_re_at_i(frame, 2);
+        };
+        if ft == 2 {
+            let g = __psa_re_at_i(frame, 1);
+            __psa_vec_set_h(caps.ipay as ptr, 2 * g + 1, __psa_box_int(pos));
+            nodes = __psa_re_at(frame, 2);
+            i = __psa_re_at_i(frame, 3);
+        };
+        if ft == 1 {
+            return __psa_re_rep(__psa_re_at(frame, 1), __psa_re_at_i(frame, 2), __psa_re_at_i(frame, 3), __psa_re_at_i(frame, 4), __psa_re_at_i(frame, 5), s, pos, caps, __psa_re_at(frame, 6), __psa_re_at_i(frame, 7), cont, ctx, pos == __psa_re_at_i(frame, 8));
+        };
+    }
+    return -1;
+}
+
+fn __psa_re_rep(child: PsaVal, mn: i64, mx: i64, greedy: i64, cnt: i64, s: PsaVal, pos: i64, caps: PsaVal, an: PsaVal, ai: i64, cont: PsaVal, ctx: PsaVal, blocked: bool) -> i64 {
+    // Repetition state: cnt iterations are done,
+    // the continuation after the quantifier is the
+    // seq (an, ai) with stack cont. `blocked` says
+    // the iteration that just finished matched the
+    // empty string: no further iteration may be
+    // tried (it could not advance), the quantifier
+    // finishes with what it has.
+    __psa_re_step(ctx);
+    // Fast path: a single CHAR / ANY / CLASS child
+    // consumes deterministically, one byte per
+    // iteration, with no captures -- run it
+    // iteratively and try the continuation at each
+    // reachable count.
+    if __psa_vec_len_h(child.ipay as ptr) == 1 {
+        let only = __psa_re_at(child, 0);
+        let ot = __psa_re_at_i(only, 0);
+        if ot == 0 || ot == 1 || ot == 2 {
+            let start = pos;
+            let c: i64 = 0;
+            let n = __psa_bytes_len_h(s.ipay as ptr);
+            let consuming = true;
+            while consuming {
+                if mx >= 0 {
+                    if c >= mx { consuming = false; };
+                };
+                if pos >= n { consuming = false; };
+                if consuming {
+                    __psa_re_step(ctx);
+                    if __psa_re_simple_match(only, s, pos) {
+                        pos = pos + 1;
+                        c = c + 1;
+                    } else {
+                        consuming = false;
+                    };
+                };
+            }
+            if c < mn { return -1; };
+            if greedy != 0 {
+                let k = c;
+                while k >= mn {
+                    let r = __psa_re_m(an, ai, s, start + k, caps, cont, ctx);
+                    if r >= 0 { return r; };
+                    k = k - 1;
+                }
+                return -1;
+            };
+            let k = mn;
+            while k <= c {
+                let r = __psa_re_m(an, ai, s, start + k, caps, cont, ctx);
+                if r >= 0 { return r; };
+                k = k + 1;
+            }
+            return -1;
+        };
+    };
+    if cnt < mn {
+        // Mandatory iterations: match the child once
+        // more, with this repetition (advanced) as
+        // the continuation.
+        let cont2 = __psa_re_cont_push(cont, __psa_re_frame_rep(child, mn, mx, greedy, cnt + 1, an, ai, pos));
+        return __psa_re_m(child, 0, s, pos, caps, cont2, ctx);
+    };
+    let can = false;
+    if !(blocked) {
+        if mx < 0 { can = true; };
+        if cnt < mx { can = true; };
+    };
+    if greedy != 0 {
+        if can {
+            let snap = __psa_re_caps_copy(caps);
+            let cont2 = __psa_re_cont_push(cont, __psa_re_frame_rep(child, mn, mx, greedy, cnt + 1, an, ai, pos));
+            let r = __psa_re_m(child, 0, s, pos, caps, cont2, ctx);
+            if r >= 0 { return r; };
+            __psa_re_caps_restore(caps, snap);
+        };
+        return __psa_re_m(an, ai, s, pos, caps, cont, ctx);
+    };
+    let snap2 = __psa_re_caps_copy(caps);
+    let r2 = __psa_re_m(an, ai, s, pos, caps, cont, ctx);
+    if r2 >= 0 { return r2; };
+    __psa_re_caps_restore(caps, snap2);
+    if can {
+        let cont3 = __psa_re_cont_push(cont, __psa_re_frame_rep(child, mn, mx, greedy, cnt + 1, an, ai, pos));
+        return __psa_re_m(child, 0, s, pos, caps, cont3, ctx);
+    };
+    return -1;
+}
+
+fn __psa_re_root_with_eos(root: PsaVal) -> PsaVal {
+    // A copy of the root sequence with an EOS
+    // anchor appended (fullmatch). A helper so the
+    // replacement flows through a call, like the
+    // add_cases / complement replacements above:
+    // a block-local list assigned to an outer
+    // variable leaves the block register live at
+    // the merge (SA referee MemoryLeak).
+    let out = __psa_list_new();
+    let n = __psa_vec_len_h(root.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        __psa_list_push(out, __psa_re_at(root, i));
+        i = i + 1;
+    }
+    __psa_list_push(out, __psa_re_n_anchor(11, 0));
+    return out;
+}
+
+fn __psa_re_try(prog: PsaVal, s: PsaVal, start: i64, forbid: i64, full: bool) -> PsaVal {
+    // One anchored attempt at `start`. Returns the
+    // filled caps list, or None. `full` appends an
+    // EOS node (fullmatch).
+    let root = __psa_re_at(prog, 0);
+    if full {
+        root = __psa_re_root_with_eos(root);
+    };
+    let ngroups = __psa_re_at_i(prog, 1);
+    let caps = __psa_re_caps_new(ngroups);
+    __psa_vec_set_h(caps.ipay as ptr, 0, __psa_box_int(start));
+    let ctx = __psa_list_new();
+    __psa_list_push(ctx, __psa_box_int(0));
+    __psa_list_push(ctx, __psa_box_int(forbid));
+    __psa_list_push(ctx, __psa_box_int(start));
+    let r = __psa_re_m(root, 0, s, start, caps, __psa_list_new(), ctx);
+    if r < 0 { return __psa_re_none(); };
+    __psa_vec_set_h(caps.ipay as ptr, 1, __psa_box_int(r));
+    return caps;
+}
+
+fn __psa_re_search(prog: PsaVal, s: PsaVal, from: i64, forbid: i64) -> PsaVal {
+    // Leftmost match at or after `from`: returns
+    // [start, end, caps] or None.
+    let n = __psa_bytes_len_h(s.ipay as ptr);
+    let st = from;
+    while st <= n {
+        let caps = __psa_re_try(prog, s, st, forbid, false);
+        if caps.tag != 3 {
+            let out = __psa_list_new();
+            __psa_list_push(out, __psa_box_int(st));
+            __psa_list_push(out, __psa_box_int(__psa_re_at_i(caps, 1)));
+            __psa_list_push(out, caps);
+            return out;
+        };
+        st = st + 1;
+    }
+    return __psa_re_none();
+}
+
+// ---- match results ----
+
+fn __psa_re_group_str(s: PsaVal, caps: PsaVal, g: i64) -> PsaVal {
+    // A group's matched text, or None when the
+    // group did not participate (CPython group()).
+    let lo = __psa_re_at_i(caps, 2 * g);
+    if lo < 0 { return __psa_re_none(); };
+    return __psa_str_sub_bytes(s, lo, __psa_re_at_i(caps, 2 * g + 1));
+}
+
+fn __psa_re_result(s: PsaVal, caps: PsaVal, ngroups: i64) -> PsaVal {
+    // The match-object replacement: [whole, g1,
+    // ..., gN], None for non-participating groups.
+    let out = __psa_list_new();
+    let g: i64 = 0;
+    while g <= ngroups {
+        __psa_list_push(out, __psa_re_group_str(s, caps, g));
+        g = g + 1;
+    }
+    return out;
+}
+
+fn __psa_re_compile(pat: PsaVal, flagsv: PsaVal) -> PsaVal {
+    __psa_re_gate_str(pat);
+    let flags = __psa_re_check_flags(__psa_re_gate_int(flagsv));
+    return __psa_re_parse(pat, flags);
+}
+
+// ---- module entry points ----
+// CPython argument order (pattern, string, flags).
+// Match results are dyn lists [whole, g1, ..., gN]
+// with None for non-participating groups; there is
+// no match object (see WIRING-re.md for the group()
+// spelling over this list form).
+
+fn psa_re_match(pat: PsaVal, s: PsaVal, flagsv: PsaVal) -> PsaVal {
+    __psa_re_gate_str(s);
+    let prog = __psa_re_compile(pat, flagsv);
+    let caps = __psa_re_try(prog, s, 0, -1, false);
+    if caps.tag == 3 { return __psa_re_none(); };
+    return __psa_re_result(s, caps, __psa_re_at_i(prog, 1));
+}
+
+fn psa_re_search(pat: PsaVal, s: PsaVal, flagsv: PsaVal) -> PsaVal {
+    __psa_re_gate_str(s);
+    let prog = __psa_re_compile(pat, flagsv);
+    let r = __psa_re_search(prog, s, 0, -1);
+    if r.tag == 3 { return __psa_re_none(); };
+    return __psa_re_result(s, __psa_re_at(r, 2), __psa_re_at_i(prog, 1));
+}
+
+fn psa_re_fullmatch(pat: PsaVal, s: PsaVal, flagsv: PsaVal) -> PsaVal {
+    __psa_re_gate_str(s);
+    let prog = __psa_re_compile(pat, flagsv);
+    let caps = __psa_re_try(prog, s, 0, -1, true);
+    if caps.tag == 3 { return __psa_re_none(); };
+    return __psa_re_result(s, caps, __psa_re_at_i(prog, 1));
+}
+
+fn psa_re_findall(pat: PsaVal, s: PsaVal, flagsv: PsaVal) -> PsaVal {
+    // CPython shapes: no groups -> list of whole
+    // strings; one group -> list of that group's
+    // strings; more -> list of tuples. A group that
+    // did not participate reads as '' here (where
+    // match results read None -- both CPython's).
+    __psa_re_gate_str(s);
+    let prog = __psa_re_compile(pat, flagsv);
+    let ngroups = __psa_re_at_i(prog, 1);
+    let n = __psa_bytes_len_h(s.ipay as ptr);
+    let out = __psa_list_new();
+    let pos: i64 = 0;
+    let forbid: i64 = -1;
+    while pos <= n {
+        let r = __psa_re_search(prog, s, pos, forbid);
+        if r.tag == 3 {
+            pos = n + 1;
+        } else {
+            let ms = __psa_re_at_i(r, 0);
+            let me = __psa_re_at_i(r, 1);
+            let caps = __psa_re_at(r, 2);
+            if ngroups == 0 {
+                __psa_list_push(out, __psa_str_sub_bytes(s, ms, me));
+            } else {
+                if ngroups == 1 {
+                    let g = __psa_re_group_str(s, caps, 1);
+                    if g.tag == 3 {
+                        __psa_list_push(out, __psa_str_new());
+                    } else {
+                        __psa_list_push(out, g);
+                    };
+                } else {
+                    let t = __psa_tuple_new();
+                    let gi: i64 = 1;
+                    while gi <= ngroups {
+                        let g = __psa_re_group_str(s, caps, gi);
+                        if g.tag == 3 {
+                            __psa_tuple_push(t, __psa_str_new());
+                        } else {
+                            __psa_tuple_push(t, g);
+                        };
+                        gi = gi + 1;
+                    }
+                    __psa_list_push(out, t);
+                };
+            };
+            if me == ms {
+                forbid = me;
+                pos = me;
+            } else {
+                forbid = -1;
+                pos = me;
+            };
+        };
+    }
+    return out;
+}
+
+fn __psa_re_split_impl(pat: PsaVal, s: PsaVal, maxsplit: i64, flagsv: PsaVal) -> PsaVal {
+    // Pieces of s between matches, with each
+    // match's groups interleaved (None kept, as
+    // CPython's split does). maxsplit <= 0 means
+    // no limit (CPython's 0; a negative value is
+    // also read as 0 there).
+    __psa_re_gate_str(s);
+    let prog = __psa_re_compile(pat, flagsv);
+    let ngroups = __psa_re_at_i(prog, 1);
+    let n = __psa_bytes_len_h(s.ipay as ptr);
+    let out = __psa_list_new();
+    let last: i64 = 0;
+    let cnt: i64 = 0;
+    let pos: i64 = 0;
+    let forbid: i64 = -1;
+    let scanning = true;
+    while scanning {
+        if pos > n { scanning = false; };
+        if maxsplit > 0 {
+            if cnt >= maxsplit { scanning = false; };
+        };
+        if scanning {
+            let r = __psa_re_search(prog, s, pos, forbid);
+            if r.tag == 3 {
+                scanning = false;
+            } else {
+                let ms = __psa_re_at_i(r, 0);
+                let me = __psa_re_at_i(r, 1);
+                let caps = __psa_re_at(r, 2);
+                __psa_list_push(out, __psa_str_sub_bytes(s, last, ms));
+                let gi: i64 = 1;
+                while gi <= ngroups {
+                    __psa_list_push(out, __psa_re_group_str(s, caps, gi));
+                    gi = gi + 1;
+                }
+                last = me;
+                cnt = cnt + 1;
+                if me == ms {
+                    forbid = me;
+                    pos = me;
+                } else {
+                    forbid = -1;
+                    pos = me;
+                };
+            };
+        };
+    }
+    __psa_list_push(out, __psa_str_sub_bytes(s, last, n));
+    return out;
+}
+
+fn psa_re_split(pat: PsaVal, s: PsaVal, flagsv: PsaVal) -> PsaVal {
+    return __psa_re_split_impl(pat, s, 0, flagsv);
+}
+
+fn psa_re_split_maxsplit(pat: PsaVal, s: PsaVal, maxv: PsaVal, flagsv: PsaVal) -> PsaVal {
+    let m = __psa_re_gate_int(maxv);
+    return __psa_re_split_impl(pat, s, m, flagsv);
+}
+
+fn __psa_re_expand(repl: PsaVal, s: PsaVal, caps: PsaVal, ngroups: i64) -> PsaVal {
+    // A sub replacement template: \1..\99 and
+    // \g<n> group references (an unmatched group
+    // expands to nothing), \\ and the control
+    // escapes \a \b \f \n \r \t \v, \0oo octal.
+    // \g<name> is refused (77172: no named groups);
+    // a reference past the group count is 77176;
+    // any other letter escape is 77174 (CPython's
+    // "bad escape" error).
+    let out = __psa_str_new();
+    let rn = __psa_bytes_len_h(repl.ipay as ptr);
+    let i: i64 = 0;
+    while i < rn {
+        let b = __psa_re_byte(repl, i);
+        if b != 92 {
+            out = __psa_str_push(out, b as u8);
+            i = i + 1;
+        } else {
+            i = i + 1;
+            if i >= rn { panic(77174); };
+            let c = __psa_re_byte(repl, i);
+            if c == 103 {
+                // \g<...>
+                i = i + 1;
+                if i >= rn { panic(77174); };
+                if __psa_re_byte(repl, i) != 60 { panic(77174); };
+                i = i + 1;
+                if i >= rn { panic(77174); };
+                let d0 = __psa_re_byte(repl, i);
+                if !(__psa_re_is_digit(d0)) { panic(77172); };
+                let num: i64 = 0;
+                let reading = true;
+                while reading {
+                    if i < rn {
+                        let d = __psa_re_byte(repl, i);
+                        if __psa_re_is_digit(d) {
+                            num = num * 10 + (d - 48);
+                            i = i + 1;
+                        } else {
+                            reading = false;
+                        };
+                    } else {
+                        reading = false;
+                    };
+                }
+                if i >= rn { panic(77174); };
+                if __psa_re_byte(repl, i) != 62 { panic(77174); };
+                i = i + 1;
+                if num > ngroups { panic(77176); };
+                let g = __psa_re_group_str(s, caps, num);
+                if g.tag != 3 {
+                    out = __psa_str_append_str(out, g);
+                };
+            } else {
+                if __psa_re_is_digit(c) {
+                    if c == 48 {
+                        // \0oo octal, up to 3 digits.
+                        let v: i64 = 0;
+                        let cnt: i64 = 0;
+                        let reading = true;
+                        while reading {
+                            if cnt < 3 {
+                                if i < rn {
+                                    let d = __psa_re_byte(repl, i);
+                                    if d >= 48 && d <= 55 {
+                                        v = v * 8 + (d - 48);
+                                        cnt = cnt + 1;
+                                        i = i + 1;
+                                    } else {
+                                        reading = false;
+                                    };
+                                } else {
+                                    reading = false;
+                                };
+                            } else {
+                                reading = false;
+                            };
+                        }
+                        out = __psa_str_push(out, v as u8);
+                    } else {
+                        // \1..\99: a second digit is
+                        // taken when present; the
+                        // two-digit number must name
+                        // an existing group (CPython
+                        // 3.12 errors otherwise).
+                        let num: i64 = c - 48;
+                        i = i + 1;
+                        if i < rn {
+                            let d = __psa_re_byte(repl, i);
+                            if __psa_re_is_digit(d) {
+                                num = num * 10 + (d - 48);
+                                i = i + 1;
+                            };
+                        };
+                        if num > ngroups { panic(77176); };
+                        let g = __psa_re_group_str(s, caps, num);
+                        if g.tag != 3 {
+                            out = __psa_str_append_str(out, g);
+                        };
+                    };
+                } else {
+                    if c == 92 { out = __psa_str_push(out, 92u8); i = i + 1; };
+                    if c == 110 { out = __psa_str_push(out, 10u8); i = i + 1; };
+                    if c == 116 { out = __psa_str_push(out, 9u8); i = i + 1; };
+                    if c == 114 { out = __psa_str_push(out, 13u8); i = i + 1; };
+                    if c == 102 { out = __psa_str_push(out, 12u8); i = i + 1; };
+                    if c == 118 { out = __psa_str_push(out, 11u8); i = i + 1; };
+                    if c == 97 { out = __psa_str_push(out, 7u8); i = i + 1; };
+                    if c == 98 { out = __psa_str_push(out, 8u8); i = i + 1; };
+                    if !(c == 92 || c == 110 || c == 116 || c == 114 || c == 102 || c == 118 || c == 97 || c == 98) {
+                        panic(77174);
+                    };
+                };
+            };
+        };
+    }
+    return out;
+}
+
+fn __psa_re_sub_impl(pat: PsaVal, repl: PsaVal, s: PsaVal, count: i64, flagsv: PsaVal) -> (PsaVal, i64) {
+    __psa_re_gate_str(s);
+    __psa_re_gate_str(repl);
+    let prog = __psa_re_compile(pat, flagsv);
+    let ngroups = __psa_re_at_i(prog, 1);
+    let n = __psa_bytes_len_h(s.ipay as ptr);
+    let out = __psa_str_new();
+    let last: i64 = 0;
+    let nsub: i64 = 0;
+    let pos: i64 = 0;
+    let forbid: i64 = -1;
+    let scanning = true;
+    while scanning {
+        if pos > n { scanning = false; };
+        if count > 0 {
+            if nsub >= count { scanning = false; };
+        };
+        if scanning {
+            let r = __psa_re_search(prog, s, pos, forbid);
+            if r.tag == 3 {
+                scanning = false;
+            } else {
+                let ms = __psa_re_at_i(r, 0);
+                let me = __psa_re_at_i(r, 1);
+                let caps = __psa_re_at(r, 2);
+                out = __psa_str_append_str(out, __psa_str_sub_bytes(s, last, ms));
+                out = __psa_str_append_str(out, __psa_re_expand(repl, s, caps, ngroups));
+                last = me;
+                nsub = nsub + 1;
+                if me == ms {
+                    forbid = me;
+                    pos = me;
+                } else {
+                    forbid = -1;
+                    pos = me;
+                };
+            };
+        };
+    }
+    out = __psa_str_append_str(out, __psa_str_sub_bytes(s, last, n));
+    return (out, nsub);
+}
+
+fn psa_re_sub(pat: PsaVal, repl: PsaVal, s: PsaVal, flagsv: PsaVal) -> PsaVal {
+    let (out, cnt) = __psa_re_sub_impl(pat, repl, s, 0, flagsv);
+    return out;
+}
+
+fn psa_re_sub_count(pat: PsaVal, repl: PsaVal, s: PsaVal, countv: PsaVal, flagsv: PsaVal) -> PsaVal {
+    let c = __psa_re_gate_int(countv);
+    let (out, cnt) = __psa_re_sub_impl(pat, repl, s, c, flagsv);
+    return out;
+}
+
+fn psa_re_subn(pat: PsaVal, repl: PsaVal, s: PsaVal, flagsv: PsaVal) -> PsaVal {
+    let (out, cnt) = __psa_re_sub_impl(pat, repl, s, 0, flagsv);
+    let t = __psa_tuple_new();
+    __psa_tuple_push(t, out);
+    __psa_tuple_push(t, __psa_box_int(cnt));
+    return t;
+}
+
+fn psa_re_subn_count(pat: PsaVal, repl: PsaVal, s: PsaVal, countv: PsaVal, flagsv: PsaVal) -> PsaVal {
+    let c = __psa_re_gate_int(countv);
+    let (out, cnt) = __psa_re_sub_impl(pat, repl, s, c, flagsv);
+    let t = __psa_tuple_new();
+    __psa_tuple_push(t, out);
+    __psa_tuple_push(t, __psa_box_int(cnt));
+    return t;
+}
+
+fn __psa_re_is_special(b: i64) -> bool {
+    // re.escape's set (CPython 3.7+):
+    // ()[]{}?*+-|^$\.&~# and space, \t\n\r\v\f.
+    if b == 40 || b == 41 || b == 91 || b == 93 || b == 123 || b == 125 { return true; };
+    if b == 63 || b == 42 || b == 43 || b == 45 || b == 124 || b == 94 { return true; };
+    if b == 36 || b == 92 || b == 46 || b == 38 || b == 126 || b == 35 { return true; };
+    if b == 32 || b == 9 || b == 10 || b == 13 || b == 11 || b == 12 { return true; };
+    return false;
+}
+
+fn psa_re_escape(s: PsaVal) -> PsaVal {
+    __psa_re_gate_str(s);
+    let out = __psa_str_new();
+    let n = __psa_bytes_len_h(s.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        let b = __psa_re_byte(s, i);
+        if __psa_re_is_special(b) {
+            out = __psa_str_push(out, 92u8);
+        };
+        out = __psa_str_push(out, b as u8);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---- flag constants (zero-arg producers, the
+// string-module stance: std-module attribute
+// reads are not wired in the emitter yet) ----
+
+fn psa_re_ignorecase() -> PsaVal {
+    return __psa_box_int(2);
+}
+
+fn psa_re_multiline() -> PsaVal {
+    return __psa_box_int(8);
+}
+
+fn psa_re_dotall() -> PsaVal {
+    return __psa_box_int(16);
+}
+
+fn psa_re_ascii() -> PsaVal {
+    return __psa_box_int(256);
+}
+
+fn psa_re_verbose() -> PsaVal {
+    // The value exists (CPython's 32), but a
+    // pattern compiled with it is refused at
+    // parse time only in its (?x) spelling; the
+    // numeric bit 32 is also UNICODE for str
+    // patterns and passes as a no-op (see
+    // README-re.md).
+    return __psa_box_int(32);
+}

@@ -1,0 +1,3 @@
+import argparse
+p = argparse.ArgumentParser("demo", "a demo program")
+print("parser-ok")

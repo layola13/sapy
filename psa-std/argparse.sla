@@ -1,0 +1,2429 @@
+@import "sa_std/io.sai"
+@import "sa_std/env.sai"
+
+// psa_std argparse (L1): the honest minimum surface
+// of CPython's argparse over PsaVal. See
+// README-argparse.md for the module contract and
+// the registered divergences. Panic codes: 77160
+// argument of the wrong type (CPython TypeError at
+// the API boundary), 77161 a parse error (usage +
+// "prog: error: ..." have already been written to
+// stderr, exactly as CPython writes them before
+// exiting with status 2 -- psa has no SystemExit
+// surface, so the exit itself is this panic),
+// 77162 -h / --help was given (the full help text
+// has already been written to stdout, as CPython
+// writes it before exiting with status 0),
+// 77169 a definition error at add_argument time
+// (CPython ArgumentError / TypeError / ValueError:
+// an unknown option key, action or type name, an
+// invalid nargs, a conflicting option string).
+//
+// Class-surface assessment: ArgumentParser is a
+// class in CPython, but psa's D4 class surface
+// cannot host stdlib classes -- class ids are
+// assigned by the emitter from 0 in user-program
+// declaration order with no stdlib reservation,
+// per-class method dispatch is generated only for
+// user classes, and callable ids are
+// emitter-assigned, so a spliced module's
+// functions can never be bound as methods. The
+// parser is therefore a tag-5 dict record with a
+// marker key (it prints, compares and stores like
+// any dyn dict), and the surface is the function
+// set below; the method-call syntax is specified
+// in WIRING-argparse.md as emitter work.
+//
+// The parser covers, with CPython's semantics and
+// error texts (verified against CPython before
+// writing): positionals and options, long-option
+// abbreviation matching, --opt=value and -ovalue
+// forms, short-option clusters, the "--"
+// separator, negative-number values, type
+// conversion for "str" / "int" / "float", default,
+// choices, required, actions store / store_true /
+// store_false / append / count, and nargs None /
+// int / "?" / "*" / "+".
+
+fn __psa_argparse_none() -> PsaVal {
+    return PsaVal { tag: 3, ipay: 0, fpay: 0.0 };
+}
+
+fn __psa_argparse_str(v: PsaVal) -> void {
+    if v.tag != 6 { panic(77160); };
+    return;
+}
+
+fn __psa_argparse_byte(s: PsaVal, i: i64) -> i64 {
+    return __psa_bytes_get_h(s.ipay as ptr, i) as i64;
+}
+
+fn __psa_argparse_gate(v: PsaVal) -> void {
+    if v.tag != 5 { panic(77160); };
+    if !(__psa_dict_contains(v, __psa_argparse_lit_marker_parser())) { panic(77160); };
+    return;
+}
+
+fn __psa_argparse_dget(d: PsaVal, key: PsaVal, fallback: PsaVal) -> PsaVal {
+    if __psa_dict_contains(d, key) { return __psa_dict_get(d, key); };
+    return fallback;
+}
+
+fn __psa_argparse_join(xs: PsaVal, sep: PsaVal) -> PsaVal {
+    let out = __psa_str_new();
+    let n = __psa_list_len(xs);
+    let i: i64 = 0;
+    while i < n {
+        if i > 0 { out = __psa_str_append_str(out, sep); };
+        out = __psa_str_append_str(out, __psa_list_get(xs, i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn __psa_argparse_upper(s: PsaVal) -> PsaVal {
+    let out = __psa_str_new();
+    let n = __psa_str_bytes_len(s);
+    let i: i64 = 0;
+    while i < n {
+        let b = __psa_argparse_byte(s, i);
+        if b >= 97 {
+            if b <= 122 {
+                out = __psa_str_push(out, (b - 32) as u8);
+                i = i + 1;
+                continue;
+            };
+        };
+        out = __psa_str_push(out, b as u8);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn __psa_argparse_is_negnum(tok: PsaVal) -> bool {
+    // CPython's negative-number matcher:
+    // ^-\d+$ or ^-\d*\.\d+$ .
+    let n = __psa_str_bytes_len(tok);
+    if n < 2 { return false; };
+    if __psa_argparse_byte(tok, 0) != 45 { return false; };
+    let digits = false;
+    let dot = false;
+    let i: i64 = 1;
+    while i < n {
+        let b = __psa_argparse_byte(tok, i);
+        if b >= 48 {
+            if b <= 57 { digits = true; i = i + 1; continue; };
+        };
+        if b == 46 {
+            if dot { return false; };
+            dot = true;
+            i = i + 1;
+            continue;
+        };
+        return false;
+    }
+    if dot {
+        // A trailing dot ("-1.") is not a number
+        // for CPython's matcher.
+        if __psa_argparse_byte(tok, n - 1) == 46 { return false; };
+    };
+    return digits;
+}
+
+fn __psa_argparse_write_stderr(text: PsaVal) -> void {
+    let h = sa_io_stderr();
+    let n = __psa_str_bytes_len(text);
+    let buf = [0u8; 256];
+    let base: i64 = 0;
+    while base < n {
+        let chunk = n - base;
+        if chunk > 256 { chunk = 256; };
+        let k: i64 = 0;
+        while k < chunk { buf[k] = __psa_bytes_get_h(text.ipay as ptr, base + k); k = k + 1; }
+        let rc: i32 = sa_io_write_all(h, PTR_BYTE_ADD(&buf, 0), chunk as u64);
+        base = base + chunk;
+    }
+    return;
+}
+
+// ---- action record accessors ----
+
+fn __psa_argparse_actions(parser: PsaVal) -> PsaVal {
+    return __psa_dict_get(parser, __psa_argparse_lit_actions());
+}
+
+fn __psa_argparse_aflags(a: PsaVal) -> PsaVal {
+    return __psa_dict_get(a, __psa_argparse_lit_flags());
+}
+
+fn __psa_argparse_is_positional(a: PsaVal) -> bool {
+    return __psa_dict_get(a, __psa_argparse_lit_positional()).ipay != 0;
+}
+
+fn __psa_argparse_nargs(a: PsaVal) -> i64 {
+    // Encoded: -1 = None (exactly one), -2 = "?",
+    // -3 = "*", -4 = "+", n >= 0 = exactly n.
+    return __psa_dict_get(a, __psa_argparse_lit_nargs()).ipay;
+}
+
+fn __psa_argparse_disp(a: PsaVal) -> PsaVal {
+    // The name CPython uses for an action in error
+    // messages: flags joined with "/" for an
+    // optional, the dest for a positional.
+    if __psa_argparse_is_positional(a) {
+        return __psa_dict_get(a, __psa_argparse_lit_dest());
+    };
+    return __psa_argparse_join(__psa_argparse_aflags(a), __psa_argparse_lit_slash());
+}
+
+fn __psa_argparse_metavar(a: PsaVal) -> PsaVal {
+    let mv = __psa_dict_get(a, __psa_argparse_lit_metavar());
+    if mv.tag == 6 { return mv; };
+    let ch = __psa_dict_get(a, __psa_argparse_lit_choices());
+    if ch.tag == 4 {
+        // CPython: an action with choices renders
+        // {c1,c2,...} as its metavar, in usage and
+        // help alike. String and int choices are
+        // rendered; any other choice type keeps the
+        // default metavar below.
+        let out = __psa_str_new();
+        out = __psa_str_push(out, 123u8);
+        let ci: i64 = 0;
+        let cn = __psa_list_len(ch);
+        while ci < cn {
+            if ci > 0 { out = __psa_str_push(out, 44u8); };
+            let cv = __psa_list_get(ch, ci);
+            if cv.tag == 6 { out = __psa_str_append_str(out, cv); } else {
+                if cv.tag == 0 { out = __psa_str_append_str(out, __psa_str_from_i64(cv.ipay)); } else {
+                    if __psa_argparse_is_positional(a) {
+                        return __psa_dict_get(a, __psa_argparse_lit_dest());
+                    };
+                    return __psa_argparse_upper(__psa_dict_get(a, __psa_argparse_lit_dest()));
+                };
+            };
+            ci = ci + 1;
+        }
+        out = __psa_str_push(out, 125u8);
+        return out;
+    };
+    if __psa_argparse_is_positional(a) {
+        return __psa_dict_get(a, __psa_argparse_lit_dest());
+    };
+    return __psa_argparse_upper(__psa_dict_get(a, __psa_argparse_lit_dest()));
+}
+
+fn __psa_argparse_takes_value(a: PsaVal) -> bool {
+    let act = __psa_dict_get(a, __psa_argparse_lit_action());
+    if __psa_str_eq(act, __psa_argparse_lit_store()) { return true; };
+    if __psa_str_eq(act, __psa_argparse_lit_append()) { return true; };
+    return false;
+}
+
+fn __psa_argparse_min_vals(a: PsaVal) -> i64 {
+    let ng = __psa_argparse_nargs(a);
+    if ng == -1 { return 1; };
+    if ng == -4 { return 1; };
+    if ng >= 0 { return ng; };
+    return 0;
+}
+
+fn __psa_argparse_max_vals(a: PsaVal) -> i64 {
+    // -5 stands for "unbounded" internally.
+    let ng = __psa_argparse_nargs(a);
+    if ng == -1 { return 1; };
+    if ng == -2 { return 1; };
+    if ng == -3 { return -5; };
+    if ng == -4 { return -5; };
+    return ng;
+}
+
+// ---- usage and help ----
+
+fn __psa_argparse_value_part(a: PsaVal) -> PsaVal {
+    // The metavar part of a valued action in usage.
+    let met = __psa_argparse_metavar(a);
+    let ng = __psa_argparse_nargs(a);
+    if ng == -1 { return met; };
+    if ng == -2 {
+        let s = __psa_argparse_lit_lbrack();
+        s = __psa_str_append_str(s, met);
+        s = __psa_str_append_str(s, __psa_argparse_lit_rbrack());
+        return s;
+    };
+    if ng == -3 {
+        let s = __psa_argparse_lit_lbrack();
+        s = __psa_str_append_str(s, met);
+        s = __psa_str_append_str(s, __psa_argparse_lit_ellipsis());
+        s = __psa_str_append_str(s, __psa_argparse_lit_rbrack());
+        return s;
+    };
+    if ng == -4 {
+        let s = __psa_str_new();
+        s = __psa_str_append_str(s, met);
+        s = __psa_str_append_str(s, __psa_argparse_lit_space());
+        s = __psa_str_append_str(s, __psa_argparse_lit_lbrack());
+        s = __psa_str_append_str(s, met);
+        s = __psa_str_append_str(s, __psa_argparse_lit_ellipsis());
+        s = __psa_str_append_str(s, __psa_argparse_lit_rbrack());
+        return s;
+    };
+    let s = __psa_str_new();
+    let i: i64 = 0;
+    while i < ng {
+        if i > 0 { s = __psa_str_append_str(s, __psa_argparse_lit_space()); };
+        s = __psa_str_append_str(s, met);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn psa_argparse_format_usage(parser: PsaVal) -> PsaVal {
+    // parser.format_usage(): "usage: prog [-h]
+    // [--opt MET] [-f] name ..." -- required
+    // optionals are not bracketed. (CPython also
+    // wraps at the terminal width; this surface
+    // never wraps -- registered divergence.)
+    __psa_argparse_gate(parser);
+    let out = __psa_argparse_lit_usage();
+    out = __psa_str_append_str(out, __psa_dict_get(parser, __psa_argparse_lit_prog()));
+    let opt = __psa_argparse_lit_space();
+    opt = __psa_str_append_str(opt, __psa_argparse_lit_lbrack());
+    opt = __psa_str_append_str(opt, __psa_argparse_lit_dash_h());
+    opt = __psa_str_append_str(opt, __psa_argparse_lit_rbrack());
+    out = __psa_str_append_str(out, opt);
+    let acts = __psa_argparse_actions(parser);
+    let na = __psa_list_len(acts);
+    let i: i64 = 0;
+    while i < na {
+        let a = __psa_list_get(acts, i);
+        if !(__psa_argparse_is_positional(a)) {
+            let flags = __psa_argparse_aflags(a);
+            let inner = __psa_str_new();
+            inner = __psa_str_append_str(inner, __psa_list_get(flags, 0));
+            if __psa_argparse_takes_value(a) {
+                inner = __psa_str_append_str(inner, __psa_argparse_lit_space());
+                inner = __psa_str_append_str(inner, __psa_argparse_value_part(a));
+            };
+            let part = __psa_argparse_lit_space();
+            if __psa_dict_get(a, __psa_argparse_lit_required()).ipay != 0 {
+                part = __psa_str_append_str(part, inner);
+            } else {
+                part = __psa_str_append_str(part, __psa_argparse_lit_lbrack());
+                part = __psa_str_append_str(part, inner);
+                part = __psa_str_append_str(part, __psa_argparse_lit_rbrack());
+            };
+            out = __psa_str_append_str(out, part);
+        };
+        i = i + 1;
+    }
+    let j: i64 = 0;
+    while j < na {
+        let a = __psa_list_get(acts, j);
+        if __psa_argparse_is_positional(a) {
+            let met = __psa_argparse_metavar(a);
+            let ng = __psa_argparse_nargs(a);
+            let part = __psa_argparse_lit_space();
+            if ng == -1 {
+                part = __psa_str_append_str(part, met);
+            };
+            if ng == -2 {
+                part = __psa_str_append_str(part, __psa_argparse_lit_lbrack());
+                part = __psa_str_append_str(part, met);
+                part = __psa_str_append_str(part, __psa_argparse_lit_rbrack());
+            };
+            if ng == -3 {
+                part = __psa_str_append_str(part, __psa_argparse_lit_lbrack());
+                part = __psa_str_append_str(part, met);
+                part = __psa_str_append_str(part, __psa_argparse_lit_ellipsis());
+                part = __psa_str_append_str(part, __psa_argparse_lit_rbrack());
+            };
+            if ng == -4 {
+                part = __psa_str_append_str(part, met);
+                part = __psa_str_append_str(part, __psa_argparse_lit_space());
+                part = __psa_str_append_str(part, __psa_argparse_lit_lbrack());
+                part = __psa_str_append_str(part, met);
+                part = __psa_str_append_str(part, __psa_argparse_lit_ellipsis());
+                part = __psa_str_append_str(part, __psa_argparse_lit_rbrack());
+            };
+            if ng >= 0 {
+                part = __psa_str_new();
+                let k: i64 = 0;
+                while k < ng {
+                    part = __psa_str_append_str(part, __psa_argparse_lit_space());
+                    part = __psa_str_append_str(part, met);
+                    k = k + 1;
+                }
+            };
+            out = __psa_str_append_str(out, part);
+        };
+        j = j + 1;
+    }
+    out = __psa_str_append_str(out, __psa_argparse_lit_newline());
+    return out;
+}
+
+fn __psa_argparse_invocation(a: PsaVal) -> PsaVal {
+    // The help-text invocation of one action:
+    // "-v, --verbose" / "--num N" / "name".
+    if __psa_argparse_is_positional(a) {
+        return __psa_argparse_metavar(a);
+    };
+    let flags = __psa_argparse_aflags(a);
+    let out = __psa_str_new();
+    let n = __psa_list_len(flags);
+    let i: i64 = 0;
+    while i < n {
+        if i > 0 { out = __psa_str_append_str(out, __psa_argparse_lit_comma()); };
+        out = __psa_str_append_str(out, __psa_list_get(flags, i));
+        if __psa_argparse_takes_value(a) {
+            out = __psa_str_append_str(out, __psa_argparse_lit_space());
+            out = __psa_str_append_str(out, __psa_argparse_metavar(a));
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+fn psa_argparse_format_help(parser: PsaVal) -> PsaVal {
+    // parser.format_help(): usage, description,
+    // positional arguments and options sections.
+    // (CPython aligns the help column to the
+    // widest invocation; this surface uses a fixed
+    // two-space gap -- registered divergence.)
+    __psa_argparse_gate(parser);
+    let out = psa_argparse_format_usage(parser);
+    let desc = __psa_dict_get(parser, __psa_argparse_lit_desc());
+    if desc.tag == 6 {
+        out = __psa_str_append_str(out, __psa_argparse_lit_newline());
+        out = __psa_str_append_str(out, desc);
+        out = __psa_str_append_str(out, __psa_argparse_lit_newline());
+    };
+    let acts = __psa_argparse_actions(parser);
+    let na = __psa_list_len(acts);
+    let has_pos = false;
+    let i: i64 = 0;
+    while i < na {
+        if __psa_argparse_is_positional(__psa_list_get(acts, i)) { has_pos = true; };
+        i = i + 1;
+    }
+    if has_pos {
+        out = __psa_str_append_str(out, __psa_argparse_lit_newline());
+        out = __psa_str_append_str(out, __psa_argparse_lit_positional_args());
+        out = __psa_str_append_str(out, __psa_argparse_lit_newline());
+        let j: i64 = 0;
+        while j < na {
+            let a = __psa_list_get(acts, j);
+            if __psa_argparse_is_positional(a) {
+                out = __psa_str_append_str(out, __psa_argparse_lit_two_spaces());
+                out = __psa_str_append_str(out, __psa_argparse_invocation(a));
+                let h = __psa_dict_get(a, __psa_argparse_lit_help());
+                if h.tag == 6 {
+                    out = __psa_str_append_str(out, __psa_argparse_lit_two_spaces());
+                    out = __psa_str_append_str(out, h);
+                };
+                out = __psa_str_append_str(out, __psa_argparse_lit_newline());
+            };
+            j = j + 1;
+        }
+    };
+    out = __psa_str_append_str(out, __psa_argparse_lit_newline());
+    out = __psa_str_append_str(out, __psa_argparse_lit_options());
+    out = __psa_str_append_str(out, __psa_argparse_lit_newline());
+    out = __psa_str_append_str(out, __psa_argparse_lit_two_spaces());
+    out = __psa_str_append_str(out, __psa_argparse_lit_dash_h());
+    out = __psa_str_append_str(out, __psa_argparse_lit_comma());
+    out = __psa_str_append_str(out, __psa_argparse_lit_dashdash_help());
+    out = __psa_str_append_str(out, __psa_argparse_lit_two_spaces());
+    out = __psa_str_append_str(out, __psa_argparse_lit_help_help());
+    out = __psa_str_append_str(out, __psa_argparse_lit_newline());
+    let k: i64 = 0;
+    while k < na {
+        let a = __psa_list_get(acts, k);
+        if !(__psa_argparse_is_positional(a)) {
+            out = __psa_str_append_str(out, __psa_argparse_lit_two_spaces());
+            out = __psa_str_append_str(out, __psa_argparse_invocation(a));
+            let h = __psa_dict_get(a, __psa_argparse_lit_help());
+            if h.tag == 6 {
+                out = __psa_str_append_str(out, __psa_argparse_lit_two_spaces());
+                out = __psa_str_append_str(out, h);
+            };
+            out = __psa_str_append_str(out, __psa_argparse_lit_newline());
+        };
+        k = k + 1;
+    }
+    return out;
+}
+
+fn __psa_argparse_error(parser: PsaVal, msg: PsaVal) -> PsaVal {
+    // parser.error(msg): usage + "prog: error:
+    // msg" to stderr, then CPython exits 2. psa
+    // has no SystemExit: the exit is panic 77161,
+    // after the identical bytes were written.
+    let text = psa_argparse_format_usage(parser);
+    text = __psa_str_append_str(text, __psa_dict_get(parser, __psa_argparse_lit_prog()));
+    text = __psa_str_append_str(text, __psa_argparse_lit_error_infix());
+    text = __psa_str_append_str(text, msg);
+    text = __psa_str_append_str(text, __psa_argparse_lit_newline());
+    __psa_argparse_write_stderr(text);
+    panic(77161);
+}
+
+fn __psa_argparse_help_exit(parser: PsaVal) -> PsaVal {
+    // -h / --help: print the help to stdout, then
+    // CPython exits 0; here panic 77162 after the
+    // identical bytes were written.
+    let text = psa_argparse_format_help(parser);
+    __psa_print_str(text);
+    panic(77162);
+}
+
+// ---- construction ----
+
+fn __psa_argparse_sys_argv() -> PsaVal {
+    // sys.argv as a tag-4 list of strs, from the
+    // host's argv JSON. (Written, not verified: the
+    // batch must confirm element 0 is the program
+    // path, as std.process argv provides.)
+    let out = __psa_list_new();
+    let h = sa_env_args_json();
+    if h == 0 { return out; };
+    let n = sa_env_buffer_len(h) as i64;
+    if n > 100000 { panic(77160); };
+    let p = sa_env_buffer_data(h);
+    let text = __psa_str_new();
+    let i: i64 = 0;
+    while i < n { text = __psa_str_push(text, PTR_BYTE_AT(p, i)); i = i + 1; }
+    sa_env_buffer_free(h);
+    let parsed = psa_json_parse(text);
+    if parsed.tag != 4 { return out; };
+    let m = __psa_list_len(parsed);
+    let j: i64 = 0;
+    while j < m {
+        let el = __psa_list_get(parsed, j);
+        if el.tag == 6 { __psa_list_push(out, el); };
+        j = j + 1;
+    }
+    return out;
+}
+
+fn __psa_argparse_basename(path: PsaVal) -> PsaVal {
+    let n = __psa_str_bytes_len(path);
+    let start: i64 = 0;
+    let i: i64 = 0;
+    while i < n {
+        if __psa_argparse_byte(path, i) == 47 { start = i + 1; };
+        i = i + 1;
+    }
+    return __psa_str_sub_bytes(path, start, n);
+}
+
+fn psa_argparse_new_parser(prog: PsaVal, desc: PsaVal) -> PsaVal {
+    // argparse.ArgumentParser(prog=None,
+    // description=None). prog None -> the basename
+    // of sys.argv[0], as CPython does.
+    let p = __psa_dict_new();
+    __psa_dict_set(p, __psa_argparse_lit_marker_parser(), __psa_box_bool(true));
+    if prog.tag == 3 {
+        let argv = __psa_argparse_sys_argv();
+        if __psa_list_len(argv) > 0 {
+            prog = __psa_argparse_basename(__psa_list_get(argv, 0));
+        } else {
+            prog = __psa_str_new();
+        };
+    };
+    if prog.tag != 6 { panic(77160); };
+    if desc.tag != 3 {
+        if desc.tag != 6 { panic(77160); };
+    };
+    __psa_dict_set(p, __psa_argparse_lit_prog(), prog);
+    __psa_dict_set(p, __psa_argparse_lit_desc(), desc);
+    __psa_dict_set(p, __psa_argparse_lit_actions(), __psa_list_new());
+    return p;
+}
+
+fn __psa_argparse_derive_dest(flag: PsaVal) -> PsaVal {
+    // "--foo-bar" -> "foo_bar"; "-v" -> "v".
+    let n = __psa_str_bytes_len(flag);
+    let start: i64 = 0;
+    while start < n {
+        if __psa_argparse_byte(flag, start) != 45 { break; };
+        start = start + 1;
+    }
+    let out = __psa_str_new();
+    let i: i64 = start;
+    while i < n {
+        let b = __psa_argparse_byte(flag, i);
+        if b == 45 { out = __psa_str_push(out, 95u8); } else { out = __psa_str_push(out, b as u8); };
+        i = i + 1;
+    }
+    return out;
+}
+
+fn __psa_argparse_opt_key_ok(key: PsaVal) -> bool {
+    if __psa_str_eq(key, __psa_argparse_lit_dest()) { return true; };
+    if __psa_str_eq(key, __psa_argparse_lit_type()) { return true; };
+    if __psa_str_eq(key, __psa_argparse_lit_default()) { return true; };
+    if __psa_str_eq(key, __psa_argparse_lit_choices()) { return true; };
+    if __psa_str_eq(key, __psa_argparse_lit_action()) { return true; };
+    if __psa_str_eq(key, __psa_argparse_lit_nargs()) { return true; };
+    if __psa_str_eq(key, __psa_argparse_lit_required()) { return true; };
+    if __psa_str_eq(key, __psa_argparse_lit_help()) { return true; };
+    if __psa_str_eq(key, __psa_argparse_lit_metavar()) { return true; };
+    if __psa_str_eq(key, __psa_argparse_lit_const()) { return true; };
+    return false;
+}
+
+fn psa_argparse_add_argument(parser: PsaVal, flags: PsaVal, opts: PsaVal) -> PsaVal {
+    // parser.add_argument(*flags, **opts) in
+    // function form: flags is one str or a list of
+    // strs; opts is a dict (or None) with the
+    // CPython keyword set dest / type / default /
+    // choices / action / nargs / required / help /
+    // metavar / const. Definition errors panic
+    // 77169 (CPython raises at add time).
+    __psa_argparse_gate(parser);
+    let flag_list = __psa_list_new();
+    if flags.tag == 6 {
+        __psa_list_push(flag_list, flags);
+    } else {
+        if flags.tag != 4 { panic(77160); };
+        let nf = __psa_list_len(flags);
+        let i: i64 = 0;
+        while i < nf {
+            let f = __psa_list_get(flags, i);
+            if f.tag != 6 { panic(77160); };
+            __psa_list_push(flag_list, f);
+            i = i + 1;
+        }
+    };
+    if __psa_list_len(flag_list) == 0 { panic(77169); };
+    let o = __psa_dict_new();
+    if opts.tag == 5 { o = opts; } else {
+        if opts.tag != 3 { panic(77160); };
+    };
+    let nk = __psa_dict_len(o);
+    let ki: i64 = 0;
+    while ki < nk {
+        if !(__psa_argparse_opt_key_ok(__psa_dict_key_at(o, ki))) { panic(77169); };
+        ki = ki + 1;
+    }
+    let first = __psa_list_get(flag_list, 0);
+    let positional = true;
+    if __psa_str_bytes_len(first) > 1 {
+        if __psa_argparse_byte(first, 0) == 45 { positional = false; };
+    };
+    if __psa_str_eq(first, __psa_argparse_lit_dashdash()) { panic(77169); };
+    if positional {
+        if __psa_list_len(flag_list) != 1 { panic(77169); };
+    };
+    let action_name = __psa_argparse_dget(o, __psa_argparse_lit_action(), __psa_argparse_lit_store());
+    if action_name.tag != 6 { panic(77169); };
+    let action_ok = false;
+    if __psa_str_eq(action_name, __psa_argparse_lit_store()) { action_ok = true; };
+    if __psa_str_eq(action_name, __psa_argparse_lit_store_true()) { action_ok = true; };
+    if __psa_str_eq(action_name, __psa_argparse_lit_store_false()) { action_ok = true; };
+    if __psa_str_eq(action_name, __psa_argparse_lit_append()) { action_ok = true; };
+    if __psa_str_eq(action_name, __psa_argparse_lit_count()) { action_ok = true; };
+    if !action_ok { panic(77169); };
+    let flag_action = false;
+    if __psa_str_eq(action_name, __psa_argparse_lit_store_true()) { flag_action = true; };
+    if __psa_str_eq(action_name, __psa_argparse_lit_store_false()) { flag_action = true; };
+    if __psa_str_eq(action_name, __psa_argparse_lit_count()) { flag_action = true; };
+    if flag_action {
+        // CPython: type / nargs / choices make no
+        // sense with a flag action and raise.
+        if __psa_dict_contains(o, __psa_argparse_lit_type()) { panic(77169); };
+        if __psa_dict_contains(o, __psa_argparse_lit_nargs()) { panic(77169); };
+    };
+    let type_name = __psa_argparse_dget(o, __psa_argparse_lit_type(), __psa_argparse_lit_str_name());
+    if type_name.tag != 6 { panic(77169); };
+    let type_ok = false;
+    if __psa_str_eq(type_name, __psa_argparse_lit_str_name()) { type_ok = true; };
+    if __psa_str_eq(type_name, __psa_argparse_lit_int_name()) { type_ok = true; };
+    if __psa_str_eq(type_name, __psa_argparse_lit_float_name()) { type_ok = true; };
+    if !type_ok { panic(77169); };
+    let nargs_enc: i64 = -1;
+    if __psa_dict_contains(o, __psa_argparse_lit_nargs()) {
+        let nv = __psa_dict_get(o, __psa_argparse_lit_nargs());
+        if nv.tag == 0 {
+            if nv.ipay < 0 { panic(77169); };
+            nargs_enc = nv.ipay;
+        } else {
+            if nv.tag != 6 { panic(77169); };
+            if __psa_str_eq(nv, __psa_argparse_lit_qmark()) { nargs_enc = -2; } else {
+                if __psa_str_eq(nv, __psa_argparse_lit_star()) { nargs_enc = -3; } else {
+                    if __psa_str_eq(nv, __psa_argparse_lit_plus()) { nargs_enc = -4; } else { panic(77169); };
+                };
+            };
+        };
+    };
+    let dest = __psa_argparse_dget(o, __psa_argparse_lit_dest(), __psa_argparse_none());
+    if dest.tag == 3 {
+        if positional { dest = first; } else {
+            // CPython derives dest from the first long
+            // option when one exists, else the first
+            // option string.
+            let dsrc = first;
+            let di: i64 = 0;
+            let dn = __psa_list_len(flag_list);
+            while di < dn {
+                let df = __psa_list_get(flag_list, di);
+                if __psa_str_bytes_len(df) > 2 {
+                    if __psa_argparse_byte(df, 1) == 45 { dsrc = df; break; };
+                };
+                di = di + 1;
+            }
+            dest = __psa_argparse_derive_dest(dsrc);
+        };
+    };
+    if dest.tag != 6 { panic(77169); };
+    let has_default = __psa_dict_contains(o, __psa_argparse_lit_default());
+    let default = __psa_argparse_dget(o, __psa_argparse_lit_default(), __psa_argparse_none());
+    if !has_default {
+        if __psa_str_eq(action_name, __psa_argparse_lit_store_true()) { default = __psa_box_bool(false); };
+        if __psa_str_eq(action_name, __psa_argparse_lit_store_false()) { default = __psa_box_bool(true); };
+    };
+    let choices = __psa_argparse_dget(o, __psa_argparse_lit_choices(), __psa_argparse_none());
+    if choices.tag != 3 {
+        if choices.tag != 4 { panic(77169); };
+    };
+    let required = __psa_argparse_dget(o, __psa_argparse_lit_required(), __psa_box_bool(false));
+    if required.tag != 2 { panic(77169); };
+    if positional { required = __psa_box_bool(false); };
+    let help = __psa_argparse_dget(o, __psa_argparse_lit_help(), __psa_argparse_none());
+    if help.tag != 3 {
+        if help.tag != 6 { panic(77169); };
+    };
+    let metavar = __psa_argparse_dget(o, __psa_argparse_lit_metavar(), __psa_argparse_none());
+    if metavar.tag != 3 {
+        if metavar.tag != 6 { panic(77169); };
+    };
+    let konst = __psa_argparse_dget(o, __psa_argparse_lit_const(), __psa_argparse_none());
+    // Conflicting option strings: CPython raises
+    // ArgumentError; -h / --help are taken by the
+    // implicit help action.
+    let acts = __psa_argparse_actions(parser);
+    let na = __psa_list_len(acts);
+    let fi: i64 = 0;
+    while fi < __psa_list_len(flag_list) {
+        let f = __psa_list_get(flag_list, fi);
+        if __psa_str_eq(f, __psa_argparse_lit_dash_h()) { panic(77169); };
+        if __psa_str_eq(f, __psa_argparse_lit_dashdash_help()) { panic(77169); };
+        let ai: i64 = 0;
+        while ai < na {
+            let other = __psa_list_get(acts, ai);
+            if !(__psa_argparse_is_positional(other)) {
+                let oflags = __psa_argparse_aflags(other);
+                let oi: i64 = 0;
+                while oi < __psa_list_len(oflags) {
+                    if __psa_str_eq(f, __psa_list_get(oflags, oi)) { panic(77169); };
+                    oi = oi + 1;
+                }
+            };
+            ai = ai + 1;
+        }
+        fi = fi + 1;
+    }
+    let a = __psa_dict_new();
+    __psa_dict_set(a, __psa_argparse_lit_marker_action(), __psa_box_bool(true));
+    __psa_dict_set(a, __psa_argparse_lit_flags(), flag_list);
+    __psa_dict_set(a, __psa_argparse_lit_positional(), __psa_box_bool(positional));
+    __psa_dict_set(a, __psa_argparse_lit_dest(), dest);
+    __psa_dict_set(a, __psa_argparse_lit_action(), action_name);
+    __psa_dict_set(a, __psa_argparse_lit_type(), type_name);
+    __psa_dict_set(a, __psa_argparse_lit_nargs(), __psa_box_int(nargs_enc));
+    __psa_dict_set(a, __psa_argparse_lit_default(), default);
+    __psa_dict_set(a, __psa_argparse_lit_choices(), choices);
+    __psa_dict_set(a, __psa_argparse_lit_required(), required);
+    __psa_dict_set(a, __psa_argparse_lit_help(), help);
+    __psa_dict_set(a, __psa_argparse_lit_metavar(), metavar);
+    __psa_dict_set(a, __psa_argparse_lit_const(), konst);
+    __psa_list_push(acts, a);
+    return parser;
+}
+
+// ---- value conversion ----
+
+fn __psa_argparse_clean_number(raw: PsaVal, is_float: bool) -> PsaVal {
+    // Validates CPython's int() / float() token
+    // grammar (the decimal core) and returns the
+    // cleaned token (surrounding whitespace and
+    // single underscores between digits removed),
+    // or None when the token is not a number.
+    // float() also takes inf / infinity / nan
+    // (case-insensitive, optional sign); those are
+    // handled by the caller. Hex / octal literal
+    // forms are NOT accepted by int(str) / float(
+    // str) either, so they fail here too.
+    let n = __psa_str_bytes_len(raw);
+    let lo: i64 = 0;
+    let hi: i64 = n;
+    while lo < hi {
+        let b = __psa_argparse_byte(raw, lo);
+        if b == 32 { lo = lo + 1; continue; };
+        if b == 9 { lo = lo + 1; continue; };
+        if b == 10 { lo = lo + 1; continue; };
+        if b == 13 { lo = lo + 1; continue; };
+        break;
+    }
+    while hi > lo {
+        let b = __psa_argparse_byte(raw, hi - 1);
+        if b == 32 { hi = hi - 1; continue; };
+        if b == 9 { hi = hi - 1; continue; };
+        if b == 10 { hi = hi - 1; continue; };
+        if b == 13 { hi = hi - 1; continue; };
+        break;
+    }
+    let out = __psa_str_new();
+    let i: i64 = lo;
+    if i < hi {
+        let b0 = __psa_argparse_byte(raw, i);
+        if b0 == 43 { i = i + 1; } else {
+            if b0 == 45 { out = __psa_str_push(out, 45u8); i = i + 1; };
+        };
+    };
+    let mant: i64 = 0;
+    let expd: i64 = 0;
+    let dot = false;
+    let exp = false;
+    let prev_digit = false;
+    let prev_us = false;
+    while i < hi {
+        let b = __psa_argparse_byte(raw, i);
+        if b >= 48 {
+            if b <= 57 {
+                out = __psa_str_push(out, b as u8);
+                if exp { expd = expd + 1; } else { mant = mant + 1; };
+                prev_digit = true;
+                prev_us = false;
+                i = i + 1;
+                continue;
+            };
+        };
+        if b == 95 {
+            // An underscore must sit between two
+            // digits.
+            if !prev_digit { return __psa_argparse_none(); };
+            if i + 1 >= hi { return __psa_argparse_none(); };
+            let nb = __psa_argparse_byte(raw, i + 1);
+            if nb < 48 { return __psa_argparse_none(); };
+            if nb > 57 { return __psa_argparse_none(); };
+            prev_digit = false;
+            prev_us = true;
+            i = i + 1;
+            continue;
+        };
+        if is_float {
+            if b == 46 {
+                if dot { return __psa_argparse_none(); };
+                if exp { return __psa_argparse_none(); };
+                dot = true;
+                out = __psa_str_push(out, b as u8);
+                prev_digit = false;
+                prev_us = false;
+                i = i + 1;
+                continue;
+            };
+            if b == 101 {
+                if mant == 0 { return __psa_argparse_none(); };
+                if exp { return __psa_argparse_none(); };
+                exp = true;
+                out = __psa_str_push(out, b as u8);
+                i = i + 1;
+                if i < hi {
+                    let sb = __psa_argparse_byte(raw, i);
+                    if sb == 43 { i = i + 1; } else {
+                        if sb == 45 { out = __psa_str_push(out, 45u8); i = i + 1; };
+                    };
+                };
+                prev_digit = false;
+                prev_us = false;
+                continue;
+            };
+            if b == 69 {
+                if mant == 0 { return __psa_argparse_none(); };
+                if exp { return __psa_argparse_none(); };
+                exp = true;
+                out = __psa_str_push(out, 101u8);
+                i = i + 1;
+                if i < hi {
+                    let sb = __psa_argparse_byte(raw, i);
+                    if sb == 43 { i = i + 1; } else {
+                        if sb == 45 { out = __psa_str_push(out, 45u8); i = i + 1; };
+                    };
+                };
+                prev_digit = false;
+                prev_us = false;
+                continue;
+            };
+        };
+        return __psa_argparse_none();
+    }
+    if mant == 0 { return __psa_argparse_none(); };
+    if exp {
+        if expd == 0 { return __psa_argparse_none(); };
+    };
+    if prev_us { return __psa_argparse_none(); };
+    return out;
+}
+
+fn __psa_argparse_lower_eq(raw: PsaVal, word: PsaVal) -> bool {
+    // raw, stripped of whitespace and an optional
+    // sign, equals word case-insensitively.
+    let n = __psa_str_bytes_len(raw);
+    let lo: i64 = 0;
+    let hi: i64 = n;
+    while lo < hi {
+        let b = __psa_argparse_byte(raw, lo);
+        if b == 32 { lo = lo + 1; continue; };
+        if b == 9 { lo = lo + 1; continue; };
+        break;
+    }
+    while hi > lo {
+        let b = __psa_argparse_byte(raw, hi - 1);
+        if b == 32 { hi = hi - 1; continue; };
+        if b == 9 { hi = hi - 1; continue; };
+        break;
+    }
+    if lo < hi {
+        let b0 = __psa_argparse_byte(raw, lo);
+        if b0 == 43 { lo = lo + 1; } else {
+            if b0 == 45 { lo = lo + 1; };
+        };
+    };
+    if hi - lo != __psa_str_bytes_len(word) { return false; };
+    let i: i64 = 0;
+    while i < __psa_str_bytes_len(word) {
+        let b = __psa_argparse_byte(raw, lo + i);
+        if b >= 65 {
+            if b <= 90 { b = b + 32; };
+        };
+        if b != __psa_argparse_byte(word, i) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn __psa_argparse_is_negative(raw: PsaVal) -> bool {
+    let n = __psa_str_bytes_len(raw);
+    let i: i64 = 0;
+    while i < n {
+        let b = __psa_argparse_byte(raw, i);
+        if b == 32 { i = i + 1; continue; };
+        if b == 9 { i = i + 1; continue; };
+        if b == 45 { return true; };
+        return false;
+    }
+    return false;
+}
+
+fn __psa_argparse_check_choices(parser: PsaVal, a: PsaVal, value: PsaVal, raw: PsaVal) -> void {
+    let choices = __psa_dict_get(a, __psa_argparse_lit_choices());
+    if choices.tag != 4 { return; };
+    let n = __psa_list_len(choices);
+    let i: i64 = 0;
+    while i < n {
+        if __psa_dyn_eq(value, __psa_list_get(choices, i)) { return; };
+        i = i + 1;
+    }
+    let msg = __psa_argparse_lit_argument();
+    msg = __psa_str_append_str(msg, __psa_argparse_disp(a));
+    msg = __psa_str_append_str(msg, __psa_argparse_lit_invalid_choice());
+    msg = __psa_str_append_str(msg, raw);
+    msg = __psa_str_append_str(msg, __psa_argparse_lit_choose_from());
+    let j: i64 = 0;
+    while j < n {
+        if j > 0 { msg = __psa_str_append_str(msg, __psa_argparse_lit_comma()); };
+        msg = __psa_str_append_str(msg, __psa_repr_of(__psa_list_get(choices, j)));
+        j = j + 1;
+    }
+    msg = __psa_str_append_str(msg, __psa_argparse_lit_rparen());
+    __psa_argparse_error(parser, msg);
+    return;
+}
+
+fn __psa_argparse_convert(parser: PsaVal, a: PsaVal, raw: PsaVal) -> PsaVal {
+    // One raw token -> its typed value, with
+    // CPython's "invalid int value" / "invalid
+    // float value" error on failure, then the
+    // choices check.
+    let type_name = __psa_dict_get(a, __psa_argparse_lit_type());
+    let value = raw;
+    if __psa_str_eq(type_name, __psa_argparse_lit_int_name()) {
+        let cleaned = __psa_argparse_clean_number(raw, false);
+        if cleaned.tag == 3 {
+            let msg = __psa_argparse_lit_argument();
+            msg = __psa_str_append_str(msg, __psa_argparse_disp(a));
+            msg = __psa_str_append_str(msg, __psa_argparse_lit_invalid_int());
+            msg = __psa_str_append_str(msg, raw);
+            msg = __psa_str_append_str(msg, __psa_argparse_lit_quote());
+            __psa_argparse_error(parser, msg);
+        };
+        value = __psa_box_int(__psa_str_to_int(cleaned));
+    };
+    if __psa_str_eq(type_name, __psa_argparse_lit_float_name()) {
+        let fv = 0.0;
+        let done = false;
+        if __psa_argparse_lower_eq(raw, __psa_argparse_lit_nan_word()) {
+            fv = 0.0 / 0.0;
+            done = true;
+        };
+        if !done {
+            if __psa_argparse_lower_eq(raw, __psa_argparse_lit_inf_word()) {
+                fv = 1.0 / 0.0;
+                if __psa_argparse_is_negative(raw) { fv = 0.0 - fv; };
+                done = true;
+            } else {
+                if __psa_argparse_lower_eq(raw, __psa_argparse_lit_infinity_word()) {
+                    fv = 1.0 / 0.0;
+                    if __psa_argparse_is_negative(raw) { fv = 0.0 - fv; };
+                    done = true;
+                };
+            };
+        };
+        if !done {
+            let cleaned = __psa_argparse_clean_number(raw, true);
+            if cleaned.tag == 3 {
+                let msg = __psa_argparse_lit_argument();
+                msg = __psa_str_append_str(msg, __psa_argparse_disp(a));
+                msg = __psa_str_append_str(msg, __psa_argparse_lit_invalid_float());
+                msg = __psa_str_append_str(msg, raw);
+                msg = __psa_str_append_str(msg, __psa_argparse_lit_quote());
+                __psa_argparse_error(parser, msg);
+            };
+            fv = __psa_str_to_float(cleaned);
+        };
+        value = __psa_box_float(fv);
+    };
+    __psa_argparse_check_choices(parser, a, value, raw);
+    return value;
+}
+
+fn __psa_argparse_shape(parser: PsaVal, a: PsaVal, raws: PsaVal) -> PsaVal {
+    // The value one occurrence of an action
+    // contributes: nargs None / "?" -> a single
+    // converted value (or const for "?" with no
+    // token), "*" / "+" / int -> a list.
+    let ng = __psa_argparse_nargs(a);
+    if ng == -1 {
+        return __psa_argparse_convert(parser, a, __psa_list_get(raws, 0));
+    };
+    if ng == -2 {
+        if __psa_list_len(raws) == 0 {
+            let konst = __psa_dict_get(a, __psa_argparse_lit_const());
+            __psa_argparse_check_choices(parser, a, konst, __psa_repr_of(konst));
+            return konst;
+        };
+        return __psa_argparse_convert(parser, a, __psa_list_get(raws, 0));
+    };
+    let out = __psa_list_new();
+    let n = __psa_list_len(raws);
+    let i: i64 = 0;
+    while i < n {
+        __psa_list_push(out, __psa_argparse_convert(parser, a, __psa_list_get(raws, i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---- parsing ----
+
+fn __psa_argparse_find_exact(parser: PsaVal, flag: PsaVal) -> i64 {
+    // -2 = the implicit help action, -1 = no
+    // match, >= 0 = an action index.
+    if __psa_str_eq(flag, __psa_argparse_lit_dash_h()) { return -2; };
+    if __psa_str_eq(flag, __psa_argparse_lit_dashdash_help()) { return -2; };
+    let acts = __psa_argparse_actions(parser);
+    let na = __psa_list_len(acts);
+    let i: i64 = 0;
+    while i < na {
+        let a = __psa_list_get(acts, i);
+        if !(__psa_argparse_is_positional(a)) {
+            let flags = __psa_argparse_aflags(a);
+            let j: i64 = 0;
+            while j < __psa_list_len(flags) {
+                if __psa_str_eq(flag, __psa_list_get(flags, j)) { return i; };
+                j = j + 1;
+            }
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn __psa_argparse_abbrev(parser: PsaVal, name: PsaVal) -> (i64, i64, PsaVal) {
+    // Long-option abbreviation matching: returns
+    // (first matching action index or -2 for help,
+    // number of distinct matching actions, the
+    // matching flags in definition order).
+    let matches = __psa_list_new();
+    let first: i64 = -1;
+    let count: i64 = 0;
+    let help_flag = __psa_argparse_lit_dashdash_help();
+    if __psa_str_bytes_len(help_flag) > __psa_str_bytes_len(name) {
+        if __psa_str_match_at(help_flag, name, 0) {
+            __psa_list_push(matches, help_flag);
+            first = -2;
+            count = 1;
+        };
+    };
+    let acts = __psa_argparse_actions(parser);
+    let na = __psa_list_len(acts);
+    let i: i64 = 0;
+    while i < na {
+        let a = __psa_list_get(acts, i);
+        if !(__psa_argparse_is_positional(a)) {
+            let flags = __psa_argparse_aflags(a);
+            let action_matched = false;
+            let j: i64 = 0;
+            while j < __psa_list_len(flags) {
+                let f = __psa_list_get(flags, j);
+                if __psa_str_bytes_len(f) > 2 {
+                    if __psa_argparse_byte(f, 1) == 45 {
+                        if __psa_str_bytes_len(f) > __psa_str_bytes_len(name) {
+                            if __psa_str_match_at(f, name, 0) {
+                                __psa_list_push(matches, f);
+                                action_matched = true;
+                            };
+                        };
+                    };
+                };
+                j = j + 1;
+            }
+            if action_matched {
+                if first == -1 { first = i; } else {
+                    if first != i { count = count + 1; };
+                };
+                if count == 0 { count = 1; };
+            };
+        };
+        i = i + 1;
+    }
+    return (first, count, matches);
+}
+
+fn __psa_argparse_has_neg_options(parser: PsaVal) -> bool {
+    let acts = __psa_argparse_actions(parser);
+    let na = __psa_list_len(acts);
+    let i: i64 = 0;
+    while i < na {
+        let a = __psa_list_get(acts, i);
+        if !(__psa_argparse_is_positional(a)) {
+            let flags = __psa_argparse_aflags(a);
+            let j: i64 = 0;
+            while j < __psa_list_len(flags) {
+                if __psa_argparse_is_negnum(__psa_list_get(flags, j)) { return true; };
+                j = j + 1;
+            }
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn __psa_argparse_tok_is_option(tok: PsaVal, has_neg: bool) -> bool {
+    let n = __psa_str_bytes_len(tok);
+    if n < 2 { return false; };
+    if __psa_argparse_byte(tok, 0) != 45 { return false; };
+    if __psa_str_eq(tok, __psa_argparse_lit_dashdash()) { return false; };
+    if __psa_argparse_is_negnum(tok) {
+        if !has_neg { return false; };
+    };
+    return true;
+}
+
+fn __psa_argparse_consumable(tok: PsaVal, has_neg: bool) -> bool {
+    if __psa_str_eq(tok, __psa_argparse_lit_dashdash()) { return false; };
+    if __psa_argparse_tok_is_option(tok, has_neg) { return false; };
+    return true;
+}
+
+fn __psa_argparse_consume(parser: PsaVal, a: PsaVal, attached: PsaVal, tokens: PsaVal, i: i64, has_neg: bool) -> (PsaVal, i64) {
+    // Collects the raw tokens one occurrence of a
+    // valued action takes: the attached value (or
+    // None) plus following consumable tokens per
+    // nargs. Shortage is a parse error with
+    // CPython's text.
+    let raws = __psa_list_new();
+    let ng = __psa_argparse_nargs(a);
+    let ntok = __psa_list_len(tokens);
+    if attached.tag == 6 { __psa_list_push(raws, attached); };
+    if ng == -1 {
+        if attached.tag == 6 { return (raws, i); };
+        if i < ntok {
+            if __psa_argparse_consumable(__psa_list_get(tokens, i), has_neg) {
+                __psa_list_push(raws, __psa_list_get(tokens, i));
+                return (raws, i + 1);
+            };
+        };
+        let msg = __psa_argparse_lit_argument();
+        msg = __psa_str_append_str(msg, __psa_argparse_disp(a));
+        msg = __psa_str_append_str(msg, __psa_argparse_lit_expected_one());
+        __psa_argparse_error(parser, msg);
+        return (raws, i);
+    };
+    if ng == -2 {
+        if attached.tag == 6 { return (raws, i); };
+        if i < ntok {
+            if __psa_argparse_consumable(__psa_list_get(tokens, i), has_neg) {
+                __psa_list_push(raws, __psa_list_get(tokens, i));
+                return (raws, i + 1);
+            };
+        };
+        return (raws, i);
+    };
+    if ng == -3 {
+        while i < ntok {
+            if !(__psa_argparse_consumable(__psa_list_get(tokens, i), has_neg)) { break; };
+            __psa_list_push(raws, __psa_list_get(tokens, i));
+            i = i + 1;
+        }
+        return (raws, i);
+    };
+    if ng == -4 {
+        while i < ntok {
+            if !(__psa_argparse_consumable(__psa_list_get(tokens, i), has_neg)) { break; };
+            __psa_list_push(raws, __psa_list_get(tokens, i));
+            i = i + 1;
+        }
+        if __psa_list_len(raws) == 0 {
+            let msg = __psa_argparse_lit_argument();
+            msg = __psa_str_append_str(msg, __psa_argparse_disp(a));
+            msg = __psa_str_append_str(msg, __psa_argparse_lit_expected_at_least());
+            __psa_argparse_error(parser, msg);
+        };
+        return (raws, i);
+    };
+    while __psa_list_len(raws) < ng {
+        if i >= ntok { break; };
+        if !(__psa_argparse_consumable(__psa_list_get(tokens, i), has_neg)) { break; };
+        __psa_list_push(raws, __psa_list_get(tokens, i));
+        i = i + 1;
+    }
+    if __psa_list_len(raws) < ng {
+        let msg = __psa_argparse_lit_argument();
+        msg = __psa_str_append_str(msg, __psa_argparse_disp(a));
+        msg = __psa_str_append_str(msg, __psa_argparse_lit_expected_mid());
+        msg = __psa_str_append_str(msg, __psa_str_from_i64(ng));
+        msg = __psa_str_append_str(msg, __psa_argparse_lit_arguments_word());
+        __psa_argparse_error(parser, msg);
+    };
+    return (raws, i);
+}
+
+fn __psa_argparse_apply_flag(collected: PsaVal, seen: PsaVal, ai: i64, a: PsaVal) -> void {
+    // One occurrence of a flag action.
+    let act = __psa_dict_get(a, __psa_argparse_lit_action());
+    let coll = __psa_list_get(collected, ai);
+    if __psa_str_eq(act, __psa_argparse_lit_store_true()) { __psa_list_push(coll, __psa_box_bool(true)); };
+    if __psa_str_eq(act, __psa_argparse_lit_store_false()) { __psa_list_push(coll, __psa_box_bool(false)); };
+    if __psa_str_eq(act, __psa_argparse_lit_count()) { __psa_list_push(coll, __psa_box_int(1)); };
+    __psa_vec_set_h(seen.ipay as ptr, ai, __psa_box_bool(true));
+    return;
+}
+
+fn __psa_argparse_default_value(parser: PsaVal, a: PsaVal) -> PsaVal {
+    // The namespace value of an action that never
+    // appeared: its default, with CPython's parse-
+    // time treatment -- a str default is converted
+    // through type, and a non-None default is
+    // checked against choices.
+    let d = __psa_dict_get(a, __psa_argparse_lit_default());
+    let type_name = __psa_dict_get(a, __psa_argparse_lit_type());
+    if d.tag == 6 {
+        if !(__psa_str_eq(type_name, __psa_argparse_lit_str_name())) {
+            return __psa_argparse_convert(parser, a, d);
+        };
+    };
+    if d.tag != 3 {
+        let choices = __psa_dict_get(a, __psa_argparse_lit_choices());
+        if choices.tag == 4 {
+            __psa_argparse_check_choices(parser, a, d, __psa_repr_of(d));
+        };
+    };
+    return d;
+}
+
+fn psa_argparse_parse_args(parser: PsaVal, args: PsaVal) -> PsaVal {
+    // parser.parse_args(args): args is a list of
+    // strs, or None for sys.argv[1:]. Returns the
+    // namespace as a tag-5 dict (CPython returns a
+    // Namespace object; attribute access on it is
+    // emitter work, see WIRING-argparse.md).
+    __psa_argparse_gate(parser);
+    let tokens = __psa_list_new();
+    if args.tag == 3 {
+        let argv = __psa_argparse_sys_argv();
+        let m = __psa_list_len(argv);
+        let j: i64 = 1;
+        while j < m {
+            __psa_list_push(tokens, __psa_list_get(argv, j));
+            j = j + 1;
+        }
+    } else {
+        if args.tag != 4 { panic(77160); };
+        let m = __psa_list_len(args);
+        let j: i64 = 0;
+        while j < m {
+            let t = __psa_list_get(args, j);
+            if t.tag != 6 { panic(77160); };
+            __psa_list_push(tokens, t);
+            j = j + 1;
+        }
+    };
+    let acts = __psa_argparse_actions(parser);
+    let na = __psa_list_len(acts);
+    let seen = __psa_list_new();
+    let collected = __psa_list_new();
+    let ai0: i64 = 0;
+    while ai0 < na {
+        __psa_list_push(seen, __psa_box_bool(false));
+        __psa_list_push(collected, __psa_list_new());
+        ai0 = ai0 + 1;
+    }
+    let pos_values = __psa_list_new();
+    let extras = __psa_list_new();
+    let has_neg = __psa_argparse_has_neg_options(parser);
+    let after_dd = false;
+    let ntok = __psa_list_len(tokens);
+    let i: i64 = 0;
+    while i < ntok {
+        let tok = __psa_list_get(tokens, i);
+        if after_dd {
+            __psa_list_push(pos_values, tok);
+            i = i + 1;
+            continue;
+        };
+        if __psa_str_eq(tok, __psa_argparse_lit_dashdash()) {
+            after_dd = true;
+            i = i + 1;
+            continue;
+        };
+        if !(__psa_argparse_tok_is_option(tok, has_neg)) {
+            __psa_list_push(pos_values, tok);
+            i = i + 1;
+            continue;
+        };
+        // An option token.
+        let next_i = i + 1;
+        if __psa_str_bytes_len(tok) > 2 {
+            if __psa_argparse_byte(tok, 1) == 45 {
+                // Long option, possibly --name=value.
+                let eq: i64 = -1;
+                let e: i64 = 2;
+                while e < __psa_str_bytes_len(tok) {
+                    if __psa_argparse_byte(tok, e) == 61 { eq = e; break; };
+                    e = e + 1;
+                }
+                let name = tok;
+                let attached = __psa_argparse_none();
+                if eq >= 0 {
+                    name = __psa_str_sub_bytes(tok, 0, eq);
+                    attached = __psa_str_sub_bytes(tok, eq + 1, __psa_str_bytes_len(tok));
+                };
+                let idx = __psa_argparse_find_exact(parser, name);
+                if idx == -1 {
+                    let (midx, mcount, matches) = __psa_argparse_abbrev(parser, name);
+                    if mcount == 0 {
+                        __psa_list_push(extras, tok);
+                        i = next_i;
+                        continue;
+                    };
+                    if mcount > 1 {
+                        let msg = __psa_argparse_lit_ambiguous();
+                        msg = __psa_str_append_str(msg, name);
+                        msg = __psa_str_append_str(msg, __psa_argparse_lit_could_match());
+                        msg = __psa_str_append_str(msg, __psa_argparse_join(matches, __psa_argparse_lit_comma()));
+                        __psa_argparse_error(parser, msg);
+                    };
+                    idx = midx;
+                };
+                if idx == -2 { __psa_argparse_help_exit(parser); };
+                let a = __psa_list_get(acts, idx);
+                if __psa_argparse_takes_value(a) {
+                    let (raws, ni) = __psa_argparse_consume(parser, a, attached, tokens, i + 1, has_neg);
+                    let shaped = __psa_argparse_shape(parser, a, raws);
+                    __psa_list_push(__psa_list_get(collected, idx), shaped);
+                    __psa_vec_set_h(seen.ipay as ptr, idx, __psa_box_bool(true));
+                    i = ni;
+                    continue;
+                };
+                if attached.tag == 6 {
+                    let msg = __psa_argparse_lit_argument();
+                    msg = __psa_str_append_str(msg, __psa_argparse_disp(a));
+                    msg = __psa_str_append_str(msg, __psa_argparse_lit_ignored());
+                    msg = __psa_str_append_str(msg, attached);
+                    msg = __psa_str_append_str(msg, __psa_argparse_lit_quote());
+                    __psa_argparse_error(parser, msg);
+                };
+                __psa_argparse_apply_flag(collected, seen, idx, a);
+                i = next_i;
+                continue;
+            };
+        };
+        // Short option cluster: -abc, -n3, -n=3.
+        let tlen = __psa_str_bytes_len(tok);
+        let j: i64 = 1;
+        let stopped = false;
+        while j < tlen {
+            if stopped { break; };
+            let flag = __psa_str_new();
+            flag = __psa_str_push(flag, 45u8);
+            flag = __psa_str_push(flag, __psa_argparse_byte(tok, j) as u8);
+            let idx = __psa_argparse_find_exact(parser, flag);
+            if idx == -1 {
+                let rest = __psa_str_new();
+                rest = __psa_str_push(rest, 45u8);
+                rest = __psa_str_append_str(rest, __psa_str_sub_bytes(tok, j, tlen));
+                __psa_list_push(extras, rest);
+                stopped = true;
+                break;
+            };
+            if idx == -2 { __psa_argparse_help_exit(parser); };
+            let a = __psa_list_get(acts, idx);
+            if __psa_argparse_takes_value(a) {
+                let rest = __psa_str_sub_bytes(tok, j + 1, tlen);
+                let attached = __psa_argparse_none();
+                if __psa_str_bytes_len(rest) > 0 {
+                    if __psa_argparse_byte(rest, 0) == 61 {
+                        rest = __psa_str_sub_bytes(rest, 1, __psa_str_bytes_len(rest));
+                    };
+                    attached = rest;
+                };
+                let (raws, ni) = __psa_argparse_consume(parser, a, attached, tokens, i + 1, has_neg);
+                let shaped = __psa_argparse_shape(parser, a, raws);
+                __psa_list_push(__psa_list_get(collected, idx), shaped);
+                __psa_vec_set_h(seen.ipay as ptr, idx, __psa_box_bool(true));
+                next_i = ni;
+                stopped = true;
+                break;
+            };
+            __psa_argparse_apply_flag(collected, seen, idx, a);
+            j = j + 1;
+        }
+        i = next_i;
+    }
+    // Match the positional values to the
+    // positional actions, reserving the later
+    // actions' minimums (CPython's greedy match).
+    let npos = __psa_list_len(pos_values);
+    let cursor: i64 = 0;
+    let pi: i64 = 0;
+    while pi < na {
+        let a = __psa_list_get(acts, pi);
+        if __psa_argparse_is_positional(a) {
+            let reserve: i64 = 0;
+            let pj: i64 = pi + 1;
+            while pj < na {
+                let later = __psa_list_get(acts, pj);
+                if __psa_argparse_is_positional(later) {
+                    reserve = reserve + __psa_argparse_min_vals(later);
+                };
+                pj = pj + 1;
+            }
+            let avail = npos - cursor - reserve;
+            if avail < 0 { avail = 0; };
+            let take = avail;
+            let mx = __psa_argparse_max_vals(a);
+            if mx != -5 {
+                if take > mx { take = mx; };
+            };
+            if take > 0 {
+                let raws = __psa_list_new();
+                let k: i64 = 0;
+                while k < take {
+                    __psa_list_push(raws, __psa_list_get(pos_values, cursor + k));
+                    k = k + 1;
+                }
+                let shaped = __psa_argparse_shape(parser, a, raws);
+                __psa_list_push(__psa_list_get(collected, pi), shaped);
+                __psa_vec_set_h(seen.ipay as ptr, pi, __psa_box_bool(true));
+                cursor = cursor + take;
+            };
+        };
+        pi = pi + 1;
+    }
+    while cursor < npos {
+        __psa_list_push(extras, __psa_list_get(pos_values, cursor));
+        cursor = cursor + 1;
+    }
+    // Finalize the namespace; collect what is
+    // missing in definition order.
+    let result = __psa_dict_new();
+    let missing = __psa_list_new();
+    let fi: i64 = 0;
+    while fi < na {
+        let a = __psa_list_get(acts, fi);
+        let was_seen = __psa_vec_get_h(seen.ipay as ptr, fi).ipay != 0;
+        let coll = __psa_list_get(collected, fi);
+        let value = __psa_argparse_none();
+        if __psa_argparse_is_positional(a) {
+            if was_seen {
+                value = __psa_list_get(coll, __psa_list_len(coll) - 1);
+            } else {
+                if __psa_argparse_min_vals(a) > 0 {
+                    __psa_list_push(missing, __psa_argparse_disp(a));
+                    value = __psa_argparse_default_value(parser, a);
+                } else {
+                    if __psa_argparse_nargs(a) == -3 {
+                        let d = __psa_dict_get(a, __psa_argparse_lit_default());
+                        if d.tag == 3 { value = __psa_list_new(); } else { value = __psa_argparse_default_value(parser, a); };
+                    } else {
+                        value = __psa_argparse_default_value(parser, a);
+                    };
+                };
+            };
+        } else {
+            if __psa_dict_get(a, __psa_argparse_lit_required()).ipay != 0 {
+                if !was_seen { __psa_list_push(missing, __psa_argparse_disp(a)); };
+            };
+            if was_seen {
+                let act = __psa_dict_get(a, __psa_argparse_lit_action());
+                if __psa_str_eq(act, __psa_argparse_lit_count()) {
+                    let base: i64 = 0;
+                    let d = __psa_dict_get(a, __psa_argparse_lit_default());
+                    if d.tag == 0 { base = d.ipay; };
+                    value = __psa_box_int(base + __psa_list_len(coll));
+                } else {
+                    if __psa_str_eq(act, __psa_argparse_lit_append()) {
+                        let d = __psa_dict_get(a, __psa_argparse_lit_default());
+                        if d.tag == 4 {
+                            let merged = __psa_list_new();
+                            let di: i64 = 0;
+                            while di < __psa_list_len(d) {
+                                __psa_list_push(merged, __psa_list_get(d, di));
+                                di = di + 1;
+                            }
+                            let ci: i64 = 0;
+                            while ci < __psa_list_len(coll) {
+                                __psa_list_push(merged, __psa_list_get(coll, ci));
+                                ci = ci + 1;
+                            }
+                            value = merged;
+                        } else {
+                            if d.tag == 3 { value = coll; } else { panic(77160); };
+                        };
+                    } else {
+                        value = __psa_list_get(coll, __psa_list_len(coll) - 1);
+                    };
+                };
+            } else {
+                value = __psa_argparse_default_value(parser, a);
+            };
+        };
+        __psa_dict_set(result, __psa_dict_get(a, __psa_argparse_lit_dest()), value);
+        fi = fi + 1;
+    }
+    if __psa_list_len(missing) > 0 {
+        let msg = __psa_argparse_lit_required_prefix();
+        msg = __psa_str_append_str(msg, __psa_argparse_join(missing, __psa_argparse_lit_comma()));
+        __psa_argparse_error(parser, msg);
+    };
+    if __psa_list_len(extras) > 0 {
+        let msg = __psa_argparse_lit_unrecognized_prefix();
+        msg = __psa_str_append_str(msg, __psa_argparse_join(extras, __psa_argparse_lit_space()));
+        __psa_argparse_error(parser, msg);
+    };
+    return result;
+}
+
+// ---- literal builders (byte-wise; spliced
+
+// sources carry no string literals) ----
+
+fn __psa_argparse_lit_marker_parser() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 95u8);
+    v = __psa_str_push(v, 95u8);
+    v = __psa_str_push(v, 112u8);
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 95u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 103u8);
+    v = __psa_str_push(v, 112u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 95u8);
+    v = __psa_str_push(v, 112u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 114u8);
+    return v;
+}
+
+fn __psa_argparse_lit_marker_action() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 95u8);
+    v = __psa_str_push(v, 95u8);
+    v = __psa_str_push(v, 112u8);
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 95u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 103u8);
+    v = __psa_str_push(v, 112u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 95u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 99u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 110u8);
+    return v;
+}
+
+fn __psa_argparse_lit_actions() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 99u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 115u8);
+    return v;
+}
+
+fn __psa_argparse_lit_flags() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 102u8);
+    v = __psa_str_push(v, 108u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 103u8);
+    v = __psa_str_push(v, 115u8);
+    return v;
+}
+
+fn __psa_argparse_lit_positional() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 112u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 108u8);
+    return v;
+}
+
+fn __psa_argparse_lit_dest() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 100u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 116u8);
+    return v;
+}
+
+fn __psa_argparse_lit_action() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 99u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 110u8);
+    return v;
+}
+
+fn __psa_argparse_lit_type() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 121u8);
+    v = __psa_str_push(v, 112u8);
+    v = __psa_str_push(v, 101u8);
+    return v;
+}
+
+fn __psa_argparse_lit_nargs() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 103u8);
+    v = __psa_str_push(v, 115u8);
+    return v;
+}
+
+fn __psa_argparse_lit_default() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 100u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 102u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 117u8);
+    v = __psa_str_push(v, 108u8);
+    v = __psa_str_push(v, 116u8);
+    return v;
+}
+
+fn __psa_argparse_lit_choices() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 99u8);
+    v = __psa_str_push(v, 104u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 99u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 115u8);
+    return v;
+}
+
+fn __psa_argparse_lit_required() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 113u8);
+    v = __psa_str_push(v, 117u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 100u8);
+    return v;
+}
+
+fn __psa_argparse_lit_help() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 104u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 108u8);
+    v = __psa_str_push(v, 112u8);
+    return v;
+}
+
+fn __psa_argparse_lit_metavar() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 109u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 118u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 114u8);
+    return v;
+}
+
+fn __psa_argparse_lit_const() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 99u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 116u8);
+    return v;
+}
+
+fn __psa_argparse_lit_prog() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 112u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 103u8);
+    return v;
+}
+
+fn __psa_argparse_lit_desc() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 100u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 99u8);
+    return v;
+}
+
+fn __psa_argparse_lit_store() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 101u8);
+    return v;
+}
+
+fn __psa_argparse_lit_store_true() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 95u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 117u8);
+    v = __psa_str_push(v, 101u8);
+    return v;
+}
+
+fn __psa_argparse_lit_store_false() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 95u8);
+    v = __psa_str_push(v, 102u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 108u8);
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 101u8);
+    return v;
+}
+
+fn __psa_argparse_lit_append() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 112u8);
+    v = __psa_str_push(v, 112u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 100u8);
+    return v;
+}
+
+fn __psa_argparse_lit_count() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 99u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 117u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 116u8);
+    return v;
+}
+
+fn __psa_argparse_lit_str_name() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 114u8);
+    return v;
+}
+
+fn __psa_argparse_lit_int_name() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 116u8);
+    return v;
+}
+
+fn __psa_argparse_lit_float_name() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 102u8);
+    v = __psa_str_push(v, 108u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 116u8);
+    return v;
+}
+
+fn __psa_argparse_lit_qmark() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 63u8);
+    return v;
+}
+
+fn __psa_argparse_lit_star() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 42u8);
+    return v;
+}
+
+fn __psa_argparse_lit_plus() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 43u8);
+    return v;
+}
+
+fn __psa_argparse_lit_dash_h() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 45u8);
+    v = __psa_str_push(v, 104u8);
+    return v;
+}
+
+fn __psa_argparse_lit_dashdash_help() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 45u8);
+    v = __psa_str_push(v, 45u8);
+    v = __psa_str_push(v, 104u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 108u8);
+    v = __psa_str_push(v, 112u8);
+    return v;
+}
+
+fn __psa_argparse_lit_dashdash() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 45u8);
+    v = __psa_str_push(v, 45u8);
+    return v;
+}
+
+fn __psa_argparse_lit_slash() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 47u8);
+    return v;
+}
+
+fn __psa_argparse_lit_lbrack() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 91u8);
+    return v;
+}
+
+fn __psa_argparse_lit_rbrack() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 93u8);
+    return v;
+}
+
+fn __psa_argparse_lit_ellipsis() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 46u8);
+    v = __psa_str_push(v, 46u8);
+    v = __psa_str_push(v, 46u8);
+    return v;
+}
+
+fn __psa_argparse_lit_space() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 32u8);
+    return v;
+}
+
+fn __psa_argparse_lit_newline() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 10u8);
+    return v;
+}
+
+fn __psa_argparse_lit_comma() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 44u8);
+    v = __psa_str_push(v, 32u8);
+    return v;
+}
+
+fn __psa_argparse_lit_two_spaces() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 32u8);
+    return v;
+}
+
+fn __psa_argparse_lit_usage() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 117u8);
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 103u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 58u8);
+    v = __psa_str_push(v, 32u8);
+    return v;
+}
+
+fn __psa_argparse_lit_positional_args() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 112u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 108u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 103u8);
+    v = __psa_str_push(v, 117u8);
+    v = __psa_str_push(v, 109u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 58u8);
+    return v;
+}
+
+fn __psa_argparse_lit_options() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 112u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 58u8);
+    return v;
+}
+
+fn __psa_argparse_lit_help_help() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 104u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 119u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 104u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 104u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 108u8);
+    v = __psa_str_push(v, 112u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 109u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 103u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 100u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 120u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 116u8);
+    return v;
+}
+
+fn __psa_argparse_lit_error_infix() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 58u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 58u8);
+    v = __psa_str_push(v, 32u8);
+    return v;
+}
+
+fn __psa_argparse_lit_argument() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 103u8);
+    v = __psa_str_push(v, 117u8);
+    v = __psa_str_push(v, 109u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 32u8);
+    return v;
+}
+
+fn __psa_argparse_lit_invalid_int() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 58u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 118u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 108u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 100u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 118u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 108u8);
+    v = __psa_str_push(v, 117u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 58u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 39u8);
+    return v;
+}
+
+fn __psa_argparse_lit_invalid_float() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 58u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 118u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 108u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 100u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 102u8);
+    v = __psa_str_push(v, 108u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 118u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 108u8);
+    v = __psa_str_push(v, 117u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 58u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 39u8);
+    return v;
+}
+
+fn __psa_argparse_lit_quote() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 39u8);
+    return v;
+}
+
+fn __psa_argparse_lit_invalid_choice() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 58u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 118u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 108u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 100u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 99u8);
+    v = __psa_str_push(v, 104u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 99u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 58u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 39u8);
+    return v;
+}
+
+fn __psa_argparse_lit_choose_from() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 39u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 40u8);
+    v = __psa_str_push(v, 99u8);
+    v = __psa_str_push(v, 104u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 102u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 109u8);
+    v = __psa_str_push(v, 32u8);
+    return v;
+}
+
+fn __psa_argparse_lit_rparen() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 41u8);
+    return v;
+}
+
+fn __psa_argparse_lit_nan_word() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 110u8);
+    return v;
+}
+
+fn __psa_argparse_lit_inf_word() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 102u8);
+    return v;
+}
+
+fn __psa_argparse_lit_infinity_word() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 102u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 121u8);
+    return v;
+}
+
+fn __psa_argparse_lit_ambiguous() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 109u8);
+    v = __psa_str_push(v, 98u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 103u8);
+    v = __psa_str_push(v, 117u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 117u8);
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 112u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 58u8);
+    v = __psa_str_push(v, 32u8);
+    return v;
+}
+
+fn __psa_argparse_lit_could_match() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 99u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 117u8);
+    v = __psa_str_push(v, 108u8);
+    v = __psa_str_push(v, 100u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 109u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 99u8);
+    v = __psa_str_push(v, 104u8);
+    v = __psa_str_push(v, 32u8);
+    return v;
+}
+
+fn __psa_argparse_lit_expected_one() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 58u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 120u8);
+    v = __psa_str_push(v, 112u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 99u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 100u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 103u8);
+    v = __psa_str_push(v, 117u8);
+    v = __psa_str_push(v, 109u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 116u8);
+    return v;
+}
+
+fn __psa_argparse_lit_expected_at_least() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 58u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 120u8);
+    v = __psa_str_push(v, 112u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 99u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 100u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 108u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 103u8);
+    v = __psa_str_push(v, 117u8);
+    v = __psa_str_push(v, 109u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 116u8);
+    return v;
+}
+
+fn __psa_argparse_lit_expected_mid() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 58u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 120u8);
+    v = __psa_str_push(v, 112u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 99u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 100u8);
+    v = __psa_str_push(v, 32u8);
+    return v;
+}
+
+fn __psa_argparse_lit_arguments_word() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 103u8);
+    v = __psa_str_push(v, 117u8);
+    v = __psa_str_push(v, 109u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 115u8);
+    return v;
+}
+
+fn __psa_argparse_lit_ignored() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 58u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 103u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 100u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 120u8);
+    v = __psa_str_push(v, 112u8);
+    v = __psa_str_push(v, 108u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 99u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 103u8);
+    v = __psa_str_push(v, 117u8);
+    v = __psa_str_push(v, 109u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 39u8);
+    return v;
+}
+
+fn __psa_argparse_lit_required_prefix() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 104u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 102u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 108u8);
+    v = __psa_str_push(v, 108u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 119u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 103u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 103u8);
+    v = __psa_str_push(v, 117u8);
+    v = __psa_str_push(v, 109u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 113u8);
+    v = __psa_str_push(v, 117u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 100u8);
+    v = __psa_str_push(v, 58u8);
+    v = __psa_str_push(v, 32u8);
+    return v;
+}
+
+fn __psa_argparse_lit_unrecognized_prefix() -> PsaVal {
+    let v = __psa_str_new();
+    v = __psa_str_push(v, 117u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 99u8);
+    v = __psa_str_push(v, 111u8);
+    v = __psa_str_push(v, 103u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 105u8);
+    v = __psa_str_push(v, 122u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 100u8);
+    v = __psa_str_push(v, 32u8);
+    v = __psa_str_push(v, 97u8);
+    v = __psa_str_push(v, 114u8);
+    v = __psa_str_push(v, 103u8);
+    v = __psa_str_push(v, 117u8);
+    v = __psa_str_push(v, 109u8);
+    v = __psa_str_push(v, 101u8);
+    v = __psa_str_push(v, 110u8);
+    v = __psa_str_push(v, 116u8);
+    v = __psa_str_push(v, 115u8);
+    v = __psa_str_push(v, 58u8);
+    v = __psa_str_push(v, 32u8);
+    return v;
+}

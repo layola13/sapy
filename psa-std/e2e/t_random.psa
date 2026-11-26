@@ -1,0 +1,25 @@
+import random
+random.seed(42)
+print(random.random() == 0.6394267984578837)
+print(random.randint(1, 100))
+print(random.getrandbits(32))
+print(random.randrange(5, 50, 3))
+xs = []
+i = 0
+while i < 10:
+    xs.append(i)
+    i = i + 1
+random.shuffle(xs)
+print(xs)
+print(random.sample(xs, 3))
+words = []
+words.append("a")
+words.append("b")
+words.append("c")
+print(random.choice(words))
+print(random.choices(words))
+w = []
+w.append(1)
+w.append(2)
+w.append(3)
+print(random.choices(words, w, 4))

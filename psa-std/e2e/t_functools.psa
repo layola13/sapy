@@ -1,0 +1,10 @@
+import functools
+def add(a, b):
+    return a + b
+xs = []
+xs.append(1)
+xs.append(2)
+xs.append(3)
+xs.append(4)
+print(functools.reduce(add, xs))
+print(functools.reduce(add, xs, 100))

@@ -1,0 +1,633 @@
+// psa_std random (L1): CPython's random module over
+// PsaVal. See README-random.md for the module contract.
+// Panic codes: 77150 argument of the wrong type
+// (CPython TypeError), 77151 bad value (CPython
+// ValueError / IndexError: empty range, empty sequence,
+// sample larger than the population, negative bit
+// count, i64-boundary values CPython's bigint would
+// produce), 77158 the OS CSPRNG draw failed.
+//
+// The generator is CPython's own: MT19937 with
+// init_by_array seeding, replicated operation for
+// operation (all arithmetic kept in the low 32 bits of
+// i64 lanes), so a seeded sequence is bit-for-bit
+// CPython's -- getrandbits, randint, shuffle, sample,
+// choices and the random() floats alike. This was a
+// deliberate choice over a smaller PRNG: a different
+// algorithm would make every seeded program's output
+// silently diverge from CPython, which the psa_std
+// rules forbid.
+//
+// Entropy: sa_std has no general rand/time extern in
+// its .sai surface, but crypto.sai declares
+// sa_crypto_random_bytes, the OS CSPRNG -- the same
+// class of source CPython seeds from when seed() is
+// called with no argument. seed(None) / the first use
+// of an unseeded generator draws 256 bytes from it and
+// runs init_by_array over the words (CPython draws a
+// different byte count from the same OS source; the
+// count is unobservable, since neither sequence is
+// reproducible). The wiring must add the crypto.sai
+// import when this module is used (see
+// WIRING-random.md).
+//
+// State: the 624 MT words plus the draw index, as a
+// dyn list of ints in the sa_std globals cell
+// "psa.random.state" (the __psa_clsreg pattern from
+// the D4 runtime: get, else create + set_once).
+
+fn __psa_random_state() -> PsaVal {
+    let out = [0u64; 1];
+    let rc = sa_global_u64_get(STR_PTR("psa.random.state"), STR_LEN("psa.random.state"), &out[0]);
+    if rc == 0 { return PsaVal { tag: 4, ipay: out[0] as i64, fpay: 0.0 }; };
+    let st = __psa_list_new();
+    let i: i64 = 0;
+    while i < 625 {
+        __psa_list_push(st, __psa_box_int(0));
+        i = i + 1;
+    }
+    let already = [0u64; 1];
+    let rc2 = sa_global_u64_set_once(STR_PTR("psa.random.state"), STR_LEN("psa.random.state"), st.ipay as u64, &already[0]);
+    if rc2 == 0 {
+        if already[0] == 0 {
+            __psa_random_seed_entropy(st);
+            return st;
+        };
+    };
+    let out2 = [0u64; 1];
+    let rc3 = sa_global_u64_get(STR_PTR("psa.random.state"), STR_LEN("psa.random.state"), &out2[0]);
+    if rc3 != 0 {
+        __psa_random_seed_entropy(st);
+        return st;
+    };
+    return PsaVal { tag: 4, ipay: out2[0] as i64, fpay: 0.0 };
+}
+
+fn __psa_random_word(st: PsaVal, i: i64) -> i64 {
+    return __psa_list_get(st, i).ipay;
+}
+
+fn __psa_random_set_word(st: PsaVal, i: i64, w: i64) -> void {
+    __psa_list_set(st, i, __psa_box_int(w & 4294967295));
+    return;
+}
+
+// ---- MT19937 core (N = 624, M = 397) ----
+
+fn __psa_random_init_genrand(st: PsaVal, s: i64) -> void {
+    __psa_random_set_word(st, 0, s);
+    let i: i64 = 1;
+    while i < 624 {
+        let prev = __psa_random_word(st, i - 1);
+        let v = (1812433253 * (prev ^ (prev >> 30)) + i) & 4294967295;
+        __psa_random_set_word(st, i, v);
+        i = i + 1;
+    }
+    __psa_list_set(st, 624, __psa_box_int(624));
+    return;
+}
+
+fn __psa_random_init_by_array(st: PsaVal, key: PsaVal) -> void {
+    // The MT reference init_by_array, as CPython's
+    // _random module runs it for an int seed: key is a
+    // list of u32 words, little-endian (built by the
+    // caller).
+    let keylen = __psa_list_len(key);
+    __psa_random_init_genrand(st, 19650218);
+    let i: i64 = 1;
+    let j: i64 = 0;
+    let k = 624;
+    if keylen > 624 { k = keylen; };
+    while k > 0 {
+        let prev = __psa_random_word(st, i - 1);
+        let t = ((prev ^ (prev >> 30)) * 1664525) & 4294967295;
+        let v = (__psa_random_word(st, i) ^ t) + __psa_list_get(key, j).ipay + j;
+        __psa_random_set_word(st, i, v);
+        i = i + 1;
+        j = j + 1;
+        if i >= 624 {
+            __psa_random_set_word(st, 0, __psa_random_word(st, 623));
+            i = 1;
+        };
+        if j >= keylen { j = 0; };
+        k = k - 1;
+    }
+    let k2 = 623;
+    while k2 > 0 {
+        let prev = __psa_random_word(st, i - 1);
+        let t = ((prev ^ (prev >> 30)) * 1566083941) & 4294967295;
+        let v = (__psa_random_word(st, i) ^ t) - i;
+        __psa_random_set_word(st, i, v);
+        i = i + 1;
+        if i >= 624 {
+            __psa_random_set_word(st, 0, __psa_random_word(st, 623));
+            i = 1;
+        };
+        k2 = k2 - 1;
+    }
+    __psa_random_set_word(st, 0, 2147483648);
+    __psa_list_set(st, 624, __psa_box_int(624));
+    return;
+}
+
+fn __psa_random_seed_entropy(st: PsaVal) -> void {
+    // seed from the OS CSPRNG: 256 bytes -> 64 u32
+    // words, little-endian, through init_by_array.
+    let buf = [0u8; 256];
+    let status = sa_crypto_random_bytes(PTR_BYTE_ADD(&buf, 0), 256);
+    if status != 0 { panic(77158); };
+    let key = __psa_list_new();
+    let i: i64 = 0;
+    while i < 64 {
+        let b0 = buf[4 * i] as i64;
+        let b1 = buf[4 * i + 1] as i64;
+        let b2 = buf[4 * i + 2] as i64;
+        let b3 = buf[4 * i + 3] as i64;
+        __psa_list_push(key, __psa_box_int(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)));
+        i = i + 1;
+    }
+    __psa_random_init_by_array(st, key);
+    return;
+}
+
+fn __psa_random_twist(st: PsaVal) -> void {
+    let kk: i64 = 0;
+    while kk < 227 {
+        let y = (__psa_random_word(st, kk) & 2147483648) | (__psa_random_word(st, kk + 1) & 2147483647);
+        let v = __psa_random_word(st, kk + 397) ^ (y >> 1);
+        if (y & 1) == 1 { v = v ^ 2567483615; };
+        __psa_random_set_word(st, kk, v);
+        kk = kk + 1;
+    }
+    while kk < 623 {
+        let y = (__psa_random_word(st, kk) & 2147483648) | (__psa_random_word(st, kk + 1) & 2147483647);
+        let v = __psa_random_word(st, kk - 227) ^ (y >> 1);
+        if (y & 1) == 1 { v = v ^ 2567483615; };
+        __psa_random_set_word(st, kk, v);
+        kk = kk + 1;
+    }
+    let y = (__psa_random_word(st, 623) & 2147483648) | (__psa_random_word(st, 0) & 2147483647);
+    let v = __psa_random_word(st, 396) ^ (y >> 1);
+    if (y & 1) == 1 { v = v ^ 2567483615; };
+    __psa_random_set_word(st, 623, v);
+    __psa_list_set(st, 624, __psa_box_int(0));
+    return;
+}
+
+fn __psa_random_genrand(st: PsaVal) -> i64 {
+    // One tempered u32 draw.
+    let idx = __psa_random_word(st, 624);
+    if idx >= 624 {
+        __psa_random_twist(st);
+        idx = 0;
+    };
+    let y = __psa_random_word(st, idx);
+    __psa_list_set(st, 624, __psa_box_int(idx + 1));
+    let t = y ^ (y >> 11);
+    let u = t ^ ((t << 7) & 2636928640);
+    let w = u ^ ((u << 15) & 4022730752);
+    return (w ^ (w >> 18)) & 4294967295;
+}
+
+fn __psa_random_double(st: PsaVal) -> f64 {
+    // CPython random_random: a 53-bit double from two
+    // draws, (a * 2^26 + b) * 2^-53.
+    let a = __psa_random_genrand(st) >> 5;
+    let b = __psa_random_genrand(st) >> 6;
+    return (a as f64 * 67108864.0 + b as f64) * (1.0 / 9007199254740992.0);
+}
+
+fn __psa_random_getrandbits(st: PsaVal, k: i64) -> i64 {
+    if k < 0 { panic(77151); };
+    if k == 0 { return 0; };
+    if k > 63 { panic(77151); };
+    if k <= 32 {
+        return __psa_random_genrand(st) >> (32 - k);
+    };
+    // 33..63 bits: words filled little-endian, the
+    // last word right-shifted by the excess, exactly
+    // CPython's layout. (k > 63 would need a bigint:
+    // 77151, registered.)
+    let words = (k - 1) / 32 + 1;
+    let r: i64 = 0;
+    let wi: i64 = 0;
+    while wi < words {
+        let w = __psa_random_genrand(st);
+        if wi == words - 1 {
+            let excess = words * 32 - k;
+            if excess > 0 { w = w >> excess; };
+        };
+        r = r + (w << (32 * wi));
+        wi = wi + 1;
+    }
+    return r;
+}
+
+fn __psa_random_bitlen(n: i64) -> i64 {
+    // Bit length of a positive i64.
+    let k: i64 = 0;
+    let m = n;
+    while m > 0 {
+        m = m >> 1;
+        k = k + 1;
+    }
+    return k;
+}
+
+fn __psa_random_randbelow(st: PsaVal, n: i64) -> i64 {
+    // CPython _randbelow_with_getrandbits.
+    let k = __psa_random_bitlen(n);
+    let r = __psa_random_getrandbits(st, k);
+    while r >= n {
+        r = __psa_random_getrandbits(st, k);
+    }
+    return r;
+}
+
+// ---- argument gates ----
+
+fn __psa_random_int(v: PsaVal) -> i64 {
+    if v.tag == 0 { return v.ipay; };
+    if v.tag == 2 { return v.ipay; };
+    panic(77150);
+}
+
+fn __psa_random_num(v: PsaVal) -> f64 {
+    if v.tag == 1 { return v.fpay; };
+    if v.tag == 0 { return v.ipay as f64; };
+    if v.tag == 2 { return v.ipay as f64; };
+    panic(77150);
+}
+
+fn __psa_random_seq(v: PsaVal) -> i64 {
+    // Length of a sequence argument (list / str /
+    // tuple), CPython TypeError otherwise.
+    if v.tag == 4 { return __psa_dyn_len(v); };
+    if v.tag == 6 { return __psa_dyn_len(v); };
+    if v.tag == 10 { return __psa_dyn_len(v); };
+    panic(77150);
+}
+
+// ---- public surface ----
+
+fn psa_random_seed(v: PsaVal) -> PsaVal {
+    // random.seed(a): a int (its absolute value's
+    // little-endian u32 words through init_by_array,
+    // as CPython) or None (OS entropy). Other seed
+    // types (float / str / bytes, which CPython
+    // converts through hashing) are NOT covered and
+    // are refused 77150 -- see the README fragment.
+    let st = __psa_random_state();
+    if v.tag == 3 {
+        __psa_random_seed_entropy(st);
+        return __psa_m_none();
+    };
+    if v.tag == 0 || v.tag == 2 {
+        let n = v.ipay;
+        if n == -9223372036854775807 - 1 { panic(77151); };
+        if n < 0 { n = -n; };
+        let key = __psa_list_new();
+        if n == 0 {
+            __psa_list_push(key, __psa_box_int(0));
+        } else {
+            while n > 0 {
+                __psa_list_push(key, __psa_box_int(n & 4294967295));
+                n = n >> 32;
+            }
+        };
+        __psa_random_init_by_array(st, key);
+        return __psa_m_none();
+    };
+    panic(77150);
+}
+
+fn psa_random_random() -> PsaVal {
+    let st = __psa_random_state();
+    return __psa_box_float(__psa_random_double(st));
+}
+
+fn psa_random_getrandbits(kv: PsaVal) -> PsaVal {
+    let k = __psa_random_int(kv);
+    let st = __psa_random_state();
+    return __psa_box_int(__psa_random_getrandbits(st, k));
+}
+
+fn psa_random_randbytes(nv: PsaVal) -> PsaVal {
+    // randbytes(n) == getrandbits(n * 8).to_bytes(n,
+    // "little") in CPython -- ONE draw for the whole
+    // count. That is exactly reproducible here only
+    // while the draw fits the i64 getrandbits surface
+    // (n <= 7); chunking the draw into several
+    // getrandbits calls would consume the word stream
+    // in a different pattern and produce different
+    // bytes than CPython's single draw, so n > 7 is
+    // refused 77151 rather than approximated.
+    let n = __psa_random_int(nv);
+    if n < 0 { panic(77151); };
+    if n > 7 { panic(77151); };
+    let st = __psa_random_state();
+    let w = __psa_random_getrandbits(st, n * 8);
+    let out = __psa_str_new();
+    let k: i64 = 0;
+    while k < n {
+        out = __psa_str_push(out, ((w >> (8 * k)) & 255) as u8);
+        k = k + 1;
+    }
+    return out;
+}
+
+fn psa_random_randrange1(av: PsaVal) -> PsaVal {
+    // randrange(stop).
+    let a = __psa_random_int(av);
+    if a <= 0 { panic(77151); };
+    let st = __psa_random_state();
+    return __psa_box_int(__psa_random_randbelow(st, a));
+}
+
+fn __psa_random_width(a: i64, b: i64) -> i64 {
+    // b - a with an overflow gate: a span wider than
+    // i64 is CPython-bigint territory (77151).
+    if b > a {
+        if a < 0 {
+            if b > 9223372036854775807 + a { panic(77151); };
+        };
+    };
+    if a > b {
+        if b < 0 {
+            if a > 9223372036854775807 + b { panic(77151); };
+        };
+    };
+    return b - a;
+}
+
+fn psa_random_randrange2(av: PsaVal, bv: PsaVal) -> PsaVal {
+    // randrange(start, stop) with step 1.
+    let a = __psa_random_int(av);
+    let b = __psa_random_int(bv);
+    let width = __psa_random_width(a, b);
+    if width <= 0 { panic(77151); };
+    let st = __psa_random_state();
+    return __psa_box_int(a + __psa_random_randbelow(st, width));
+}
+
+fn psa_random_randrange3(av: PsaVal, bv: PsaVal, sv: PsaVal) -> PsaVal {
+    // randrange(start, stop, step), CPython's formula:
+    // n = ceil(width / step) in the step's direction.
+    let a = __psa_random_int(av);
+    let b = __psa_random_int(bv);
+    let step = __psa_random_int(sv);
+    if step == 0 { panic(77151); };
+    if step == 1 { return psa_random_randrange2(av, bv); };
+    let width = __psa_random_width(a, b);
+    let n: i64 = 0;
+    if step > 0 {
+        if width <= 0 { panic(77151); };
+        n = width / step;
+        if width % step != 0 { n = n + 1; };
+    } else {
+        if width >= 0 { panic(77151); };
+        n = (width + step + 1) / step;
+        if n <= 0 { panic(77151); };
+    };
+    let st = __psa_random_state();
+    let r = __psa_random_randbelow(st, n);
+    // step * r is bounded by |width| + |step|; guard
+    // the one corner that can leave i64.
+    if step > 0 {
+        if r > 0 {
+            if step > 9223372036854775807 / r { panic(77151); };
+        };
+    } else {
+        if r > 0 {
+            if step < (-9223372036854775807 - 1) / r { panic(77151); };
+        };
+    };
+    return __psa_box_int(a + step * r);
+}
+
+fn psa_random_randint(av: PsaVal, bv: PsaVal) -> PsaVal {
+    // randint(a, b) == randrange(a, b + 1).
+    let a = __psa_random_int(av);
+    let b = __psa_random_int(bv);
+    if b == 9223372036854775807 { panic(77151); };
+    return psa_random_randrange2(__psa_box_int(a), __psa_box_int(b + 1));
+}
+
+fn psa_random_choice(seq: PsaVal) -> PsaVal {
+    // choice(seq): seq[_randbelow(len)] in CPython
+    // (Lib/random.py); the draw is getrandbits-based,
+    // not a random() double -- the draw sequence
+    // depends on it (an earlier draft here used the
+    // floor(random() * len) form, which desynced the
+    // stream for everything after a choice call).
+    let n = __psa_random_seq(seq);
+    if n == 0 { panic(77151); };
+    let st = __psa_random_state();
+    let idx = __psa_random_randbelow(st, n);
+    return __psa_iter_get(seq, idx);
+}
+
+fn psa_random_shuffle(x: PsaVal) -> PsaVal {
+    // shuffle(x): in place, for i from len-1 down to
+    // 1 swap x[i] with x[randbelow(i + 1)] (CPython
+    // 3.11+ form). A mutable list is required.
+    if x.tag != 4 { panic(77150); };
+    let st = __psa_random_state();
+    let i = __psa_list_len(x) - 1;
+    while i >= 1 {
+        let j = __psa_random_randbelow(st, i + 1);
+        let tmp = __psa_list_get(x, i);
+        __psa_list_set(x, i, __psa_list_get(x, j));
+        __psa_list_set(x, j, tmp);
+        i = i - 1;
+    }
+    return __psa_m_none();
+}
+
+fn psa_random_sample(pop: PsaVal, kv: PsaVal) -> PsaVal {
+    // sample(population, k): CPython's two-branch
+    // algorithm, replicated (the branch and its draw
+    // pattern are observable in the result): a pool
+    // shuffle-down for n <= setsize (21, plus
+    // 4**ceil(log4(3k)) when k > 5), a selected-set
+    // rejection loop above it. The set is a plain list
+    // scanned linearly here -- same draws, same
+    // result, only slower.
+    let k = __psa_random_int(kv);
+    let n = __psa_random_seq(pop);
+    if k < 0 { panic(77151); };
+    if k > n { panic(77151); };
+    let st = __psa_random_state();
+    let out = __psa_list_new();
+    let setsize: i64 = 21;
+    if k > 5 {
+        let pw: i64 = 4;
+        while pw < 3 * k {
+            pw = pw * 4;
+        }
+        setsize = 21 + pw;
+    };
+    if n <= setsize {
+        let pool = __psa_list_new();
+        let i: i64 = 0;
+        while i < n {
+            __psa_list_push(pool, __psa_iter_get(pop, i));
+            i = i + 1;
+        }
+        let t: i64 = 0;
+        while t < k {
+            let j = __psa_random_randbelow(st, n - t);
+            __psa_list_push(out, __psa_list_get(pool, j));
+            __psa_list_set(pool, j, __psa_list_get(pool, n - t - 1));
+            t = t + 1;
+        }
+        return out;
+    };
+    let sel = __psa_list_new();
+    let t: i64 = 0;
+    while t < k {
+        let j = __psa_random_randbelow(st, n);
+        let seen = true;
+        while seen {
+            seen = false;
+            let s: i64 = 0;
+            let sn = __psa_list_len(sel);
+            while s < sn {
+                if __psa_list_get(sel, s).ipay == j { seen = true; };
+                s = s + 1;
+            }
+            if seen { j = __psa_random_randbelow(st, n); };
+        }
+        __psa_list_push(sel, __psa_box_int(j));
+        __psa_list_push(out, __psa_iter_get(pop, j));
+        t = t + 1;
+    }
+    return out;
+}
+
+fn psa_random_choices_k(pop: PsaVal, kv: PsaVal) -> PsaVal {
+    // choices(population, k=k) with no weights:
+    // population[floor(random() * n)] per draw.
+    let k = __psa_random_int(kv);
+    let n = __psa_random_seq(pop);
+    if n == 0 { panic(77151); };
+    let st = __psa_random_state();
+    let out = __psa_list_new();
+    let t: i64 = 0;
+    while t < k {
+        let idx = (__psa_random_double(st) * (n as f64)) as i64;
+        __psa_list_push(out, __psa_iter_get(pop, idx));
+        t = t + 1;
+    }
+    return out;
+}
+
+fn __psa_random_bisect_cum(cum: PsaVal, x: PsaVal, hi: i64) -> i64 {
+    // bisect_right over the cumulative weights with
+    // CPython's bounds (lo = 0, hi = len(cum) - 1), as
+    // choices calls it.
+    let lo: i64 = 0;
+    let h = hi;
+    while lo < h {
+        let mid = (lo + h) / 2;
+        if __psa_dyn_lt(x, __psa_list_get(cum, mid)) {
+            h = mid;
+        } else {
+            lo = mid + 1;
+        };
+    }
+    return lo;
+}
+
+fn __psa_random_choices_weighted(pop: PsaVal, cum: PsaVal, k: i64) -> PsaVal {
+    // Shared tail of the weights / cum_weights forms.
+    let n = __psa_random_seq(pop);
+    if __psa_list_len(cum) != n { panic(77151); };
+    if n == 0 { panic(77151); };
+    let total = __psa_random_num(__psa_list_get(cum, n - 1)) + 0.0;
+    if total <= 0.0 { panic(77151); };
+    if !((total - total) == 0.0) { panic(77151); };
+    let st = __psa_random_state();
+    let out = __psa_list_new();
+    let t: i64 = 0;
+    while t < k {
+        let x = __psa_box_float(__psa_random_double(st) * total);
+        let idx = __psa_random_bisect_cum(cum, x, n - 1);
+        __psa_list_push(out, __psa_iter_get(pop, idx));
+        t = t + 1;
+    }
+    return out;
+}
+
+fn psa_random_choices_w(pop: PsaVal, weights: PsaVal, kv: PsaVal) -> PsaVal {
+    // choices(population, weights, k=k): cumulative
+    // sums are accumulated as doubles in order, as
+    // itertools.accumulate does over the numeric
+    // weights.
+    let k = __psa_random_int(kv);
+    if weights.tag != 4 {
+        if weights.tag != 10 { panic(77150); };
+    };
+    let wn = __psa_dyn_len(weights);
+    let cum = __psa_list_new();
+    let acc: f64 = 0.0;
+    let i: i64 = 0;
+    while i < wn {
+        acc = acc + __psa_random_num(__psa_iter_get(weights, i));
+        __psa_list_push(cum, __psa_box_float(acc));
+        i = i + 1;
+    }
+    return __psa_random_choices_weighted(pop, cum, k);
+}
+
+fn psa_random_choices_cw(pop: PsaVal, cumv: PsaVal, kv: PsaVal) -> PsaVal {
+    // choices(population, cum_weights=cw, k=k): the
+    // cumulative weights are used as given.
+    let k = __psa_random_int(kv);
+    if cumv.tag != 4 {
+        if cumv.tag != 10 { panic(77150); };
+    };
+    let cn = __psa_dyn_len(cumv);
+    let cum = __psa_list_new();
+    let i: i64 = 0;
+    while i < cn {
+        __psa_list_push(cum, __psa_iter_get(cumv, i));
+        i = i + 1;
+    }
+    return __psa_random_choices_weighted(pop, cum, k);
+}
+
+fn psa_random_uniform(av: PsaVal, bv: PsaVal) -> PsaVal {
+    // uniform(a, b) == a + (b - a) * random().
+    let fa = __psa_random_num(av);
+    let fb = __psa_random_num(bv);
+    let st = __psa_random_state();
+    return __psa_box_float(fa + (fb - fa) * __psa_random_double(st));
+}
+
+fn psa_random_triangular(lowv: PsaVal, highv: PsaVal, modev: PsaVal) -> PsaVal {
+    // triangular(low, high, mode): CPython's form,
+    // including its ZeroDivisionError escape (a zero
+    // span returns low) and the u > c mirror.
+    let low = __psa_random_num(lowv);
+    let high = __psa_random_num(highv);
+    if high == low { return __psa_box_float(low); };
+    let c: f64 = 0.5;
+    if modev.tag == 3 {
+        c = 0.5;
+    } else {
+        let mode = __psa_random_num(modev);
+        c = (mode - low) / (high - low);
+    };
+    let st = __psa_random_state();
+    let u = __psa_random_double(st);
+    let lo = low;
+    let hi = high;
+    if u > c {
+        u = 1.0 - u;
+        c = 1.0 - c;
+        lo = high;
+        hi = low;
+    };
+    return __psa_box_float(lo + (hi - lo) * sa_math_sqrt(u * c));
+}

@@ -1,0 +1,530 @@
+// psa_std csv (L1): the honest function-surface subset of
+// CPython's csv module over PsaVal. See README-csv.md for
+// the module contract and the registered divergences.
+// Panic codes: 77167 argument of the wrong type (CPython
+// TypeError, including dialect validation), 77168 a
+// _csv.Error raised during parsing or rendering (strict
+// mode hitting end of data inside a quoted field; a
+// field that needs escaping under QUOTE_NONE with no
+// escapechar set).
+//
+// CPython's csv.reader / csv.writer are iterator /
+// writer objects; psa_std modules are function sets
+// (v1), so the surface here is the whole-table form:
+// reads / reader parse a complete input into a list of
+// rows (each row a list of strs, or floats for unquoted
+// fields under QUOTE_NONNUMERIC), and writes renders a
+// list of rows to one str. The parser is a byte-level
+// state machine implementing the CPython dialect
+// semantics for the supported parameter subset:
+// delimiter, quotechar, quoting, doublequote,
+// lineterminator (writer), skipinitialspace, strict,
+// escapechar. Dialect parameters arrive as a tag-5 dict
+// (or None for the CPython "excel" defaults).
+//
+// Semantics verified against CPython before writing:
+// a blank line yields an empty row []; a trailing
+// terminator yields no extra row; an unterminated
+// quoted field is accepted silently unless strict;
+// characters after a closing quote are appended to the
+// field (the '"b" ' -> 'b ' case); the writer's default
+// lineterminator is "\r\n" and every row is terminated.
+
+fn __psa_csv_type(v: PsaVal, tag: i64) -> void {
+    if v.tag != tag { panic(77167); };
+    return;
+}
+
+fn __psa_csv_byte(s: PsaVal, i: i64) -> i64 {
+    return __psa_bytes_get_h(s.ipay as ptr, i) as i64;
+}
+
+fn __psa_csv_dget(d: PsaVal, key: PsaVal, fallback: PsaVal) -> PsaVal {
+    if __psa_dict_contains(d, key) { return __psa_dict_get(d, key); };
+    return fallback;
+}
+
+fn __psa_csv_none() -> PsaVal {
+    return PsaVal { tag: 3, ipay: 0, fpay: 0.0 };
+}
+
+fn __psa_csv_char1(v: PsaVal) -> i64 {
+    // A dialect character parameter: a str of exactly
+    // one byte (the runtime's str surface is byte-level,
+    // as are CPython's csv characters on the wire).
+    __psa_csv_type(v, 6);
+    if __psa_bytes_len_h(v.ipay as ptr) != 1 { panic(77167); };
+    return __psa_csv_byte(v, 0);
+}
+
+fn __psa_csv_bool(v: PsaVal) -> bool {
+    __psa_csv_type(v, 2);
+    return v.ipay != 0;
+}
+
+fn __psa_csv_dialect(d: PsaVal) -> PsaVal {
+    // Normalise a user dialect dict (or None) into a
+    // complete internal record with byte-level fields:
+    //   d1 delimiter byte, q1 quotechar byte (-1 none),
+    //   quoting 0..3, dq doublequote, lt lineterminator
+    //   (str), sis skipinitialspace, strict, e1
+    //   escapechar byte (-1 none).
+    // Unknown keys are CPython's TypeError for a bad
+    // dialect keyword, here 77167.
+    let out = __psa_dict_new();
+    __psa_dict_set(out, __psa_csv_lit_delimiter(), __psa_box_int(44));
+    __psa_dict_set(out, __psa_csv_lit_quotechar(), __psa_box_int(34));
+    __psa_dict_set(out, __psa_csv_lit_quoting(), __psa_box_int(0));
+    __psa_dict_set(out, __psa_csv_lit_doublequote(), __psa_box_bool(true));
+    let lt = __psa_str_new();
+    lt = __psa_str_push(lt, 13u8);
+    lt = __psa_str_push(lt, 10u8);
+    __psa_dict_set(out, __psa_csv_lit_lineterminator(), lt);
+    __psa_dict_set(out, __psa_csv_lit_skipinitialspace(), __psa_box_bool(false));
+    __psa_dict_set(out, __psa_csv_lit_strict(), __psa_box_bool(false));
+    __psa_dict_set(out, __psa_csv_lit_escapechar(), __psa_box_int(-1));
+    if d.tag == 3 { return out; };
+    __psa_csv_type(d, 5);
+    let n = __psa_dict_len(d);
+    let i: i64 = 0;
+    while i < n {
+        let k = __psa_dict_key_at(d, i);
+        let v = __psa_dict_val_at(d, i);
+        let known = false;
+        if __psa_str_eq(k, __psa_csv_lit_delimiter()) {
+            known = true;
+            __psa_dict_set(out, __psa_csv_lit_delimiter(), __psa_box_int(__psa_csv_char1(v)));
+        };
+        if __psa_str_eq(k, __psa_csv_lit_quotechar()) {
+            known = true;
+            if v.tag == 3 {
+                __psa_dict_set(out, __psa_csv_lit_quotechar(), __psa_box_int(-1));
+            } else {
+                __psa_dict_set(out, __psa_csv_lit_quotechar(), __psa_box_int(__psa_csv_char1(v)));
+            };
+        };
+        if __psa_str_eq(k, __psa_csv_lit_quoting()) {
+            known = true;
+            __psa_csv_type(v, 0);
+            if v.ipay < 0 { panic(77167); };
+            if v.ipay > 3 { panic(77167); };
+            __psa_dict_set(out, __psa_csv_lit_quoting(), v);
+        };
+        if __psa_str_eq(k, __psa_csv_lit_doublequote()) {
+            known = true;
+            __psa_dict_set(out, __psa_csv_lit_doublequote(), __psa_box_bool(__psa_csv_bool(v)));
+        };
+        if __psa_str_eq(k, __psa_csv_lit_lineterminator()) {
+            known = true;
+            __psa_csv_type(v, 6);
+            __psa_dict_set(out, __psa_csv_lit_lineterminator(), v);
+        };
+        if __psa_str_eq(k, __psa_csv_lit_skipinitialspace()) {
+            known = true;
+            __psa_dict_set(out, __psa_csv_lit_skipinitialspace(), __psa_box_bool(__psa_csv_bool(v)));
+        };
+        if __psa_str_eq(k, __psa_csv_lit_strict()) {
+            known = true;
+            __psa_dict_set(out, __psa_csv_lit_strict(), __psa_box_bool(__psa_csv_bool(v)));
+        };
+        if __psa_str_eq(k, __psa_csv_lit_escapechar()) {
+            known = true;
+            if v.tag == 3 {
+                __psa_dict_set(out, __psa_csv_lit_escapechar(), __psa_box_int(-1));
+            } else {
+                __psa_dict_set(out, __psa_csv_lit_escapechar(), __psa_box_int(__psa_csv_char1(v)));
+            };
+        };
+        if !(known) { panic(77167); };
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---- reader ----
+
+fn __psa_csv_finish_field(row: PsaVal, field: PsaVal, quoted: bool, numeric: bool) -> void {
+    // QUOTE_NONNUMERIC converts unquoted fields to
+    // float on read; a malformed (or empty) unquoted
+    // field surfaces the runtime str->float panic
+    // 77079, the loud analogue of CPython's ValueError.
+    if numeric {
+        if !(quoted) {
+            __psa_list_push(row, __psa_box_float(__psa_str_to_float(field)));
+            return;
+        };
+    };
+    __psa_list_push(row, field);
+    return;
+}
+
+fn __psa_csv_parse(text: PsaVal, dia: PsaVal) -> PsaVal {
+    // Byte-level state machine. States: 0 start of
+    // field, 1 in unquoted field, 2 in quoted field,
+    // 3 saw a quote inside a quoted field, 4 after a
+    // closing quote (rest of field is literal).
+    let delim = __psa_dict_get(dia, __psa_csv_lit_delimiter()).ipay;
+    let quote = __psa_dict_get(dia, __psa_csv_lit_quotechar()).ipay;
+    let quoting = __psa_dict_get(dia, __psa_csv_lit_quoting()).ipay;
+    let sis = __psa_dict_get(dia, __psa_csv_lit_skipinitialspace()).ipay != 0;
+    let strict = __psa_dict_get(dia, __psa_csv_lit_strict()).ipay != 0;
+    let esc = __psa_dict_get(dia, __psa_csv_lit_escapechar()).ipay;
+    let numeric = quoting == 2;
+    let rows = __psa_list_new();
+    let row = __psa_list_new();
+    let field = __psa_str_new();
+    let field_quoted = false;
+    let has_content = false;
+    let state: i64 = 0;
+    let esc_pending = false;
+    let n = __psa_bytes_len_h(text.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        let b = __psa_csv_byte(text, i);
+        if esc_pending {
+            esc_pending = false;
+            field = __psa_str_push(field, b as u8);
+            if state == 0 { state = 1; };
+            if state == 3 { state = 4; };
+            i = i + 1;
+            continue;
+        };
+        let is_term = false;
+        if state != 2 {
+            if b == 10 { is_term = true; };
+            if b == 13 { is_term = true; };
+        };
+        if is_term {
+            if has_content {
+                __psa_csv_finish_field(row, field, field_quoted, numeric);
+                __psa_list_push(rows, row);
+            } else {
+                // A blank line is an empty row in
+                // CPython, not a skipped line.
+                __psa_list_push(rows, __psa_list_new());
+            };
+            row = __psa_list_new();
+            field = __psa_str_new();
+            field_quoted = false;
+            has_content = false;
+            state = 0;
+            if b == 13 {
+                if i + 1 < n {
+                    if __psa_csv_byte(text, i + 1) == 10 { i = i + 1; };
+                };
+            };
+            i = i + 1;
+            continue;
+        };
+        has_content = true;
+        if esc >= 0 {
+            if b == esc {
+                if state != 3 { esc_pending = true; i = i + 1; continue; };
+            };
+        };
+        if state == 0 {
+            if sis {
+                if b == 32 { i = i + 1; continue; };
+            };
+            if quote >= 0 {
+                if b == quote { state = 2; field_quoted = true; i = i + 1; continue; };
+            };
+            if b == delim {
+                __psa_csv_finish_field(row, field, field_quoted, numeric);
+                field = __psa_str_new();
+                field_quoted = false;
+                i = i + 1;
+                continue;
+            };
+            field = __psa_str_push(field, b as u8);
+            state = 1;
+            i = i + 1;
+            continue;
+        };
+        if state == 1 {
+            if b == delim {
+                __psa_csv_finish_field(row, field, field_quoted, numeric);
+                field = __psa_str_new();
+                field_quoted = false;
+                state = 0;
+                i = i + 1;
+                continue;
+            };
+            field = __psa_str_push(field, b as u8);
+            i = i + 1;
+            continue;
+        };
+        if state == 2 {
+            if quote >= 0 {
+                if b == quote { state = 3; i = i + 1; continue; };
+            };
+            field = __psa_str_push(field, b as u8);
+            i = i + 1;
+            continue;
+        };
+        if state == 3 {
+            if quote >= 0 {
+                if b == quote {
+                    field = __psa_str_push(field, b as u8);
+                    state = 2;
+                    i = i + 1;
+                    continue;
+                };
+            };
+            if b == delim {
+                __psa_csv_finish_field(row, field, field_quoted, numeric);
+                field = __psa_str_new();
+                field_quoted = false;
+                state = 0;
+                i = i + 1;
+                continue;
+            };
+            // A character other than the delimiter or
+            // a doubled quote after a closing quote:
+            // CPython's strict mode raises _csv.Error
+            // ("',' expected after '"'"); non-strict
+            // appends the rest of the field literally.
+            if strict { panic(77168); };
+            field = __psa_str_push(field, b as u8);
+            state = 4;
+            i = i + 1;
+            continue;
+        };
+        // state == 4: after a closing quote, literal
+        // until the delimiter or the record end.
+        if b == delim {
+            __psa_csv_finish_field(row, field, field_quoted, numeric);
+            field = __psa_str_new();
+            field_quoted = false;
+            state = 0;
+            i = i + 1;
+            continue;
+        };
+        field = __psa_str_push(field, b as u8);
+        i = i + 1;
+    }
+    if state == 2 {
+        // End of data inside a quoted field.
+        if strict { panic(77168); };
+    };
+    if has_content {
+        __psa_csv_finish_field(row, field, field_quoted, numeric);
+        __psa_list_push(rows, row);
+    };
+    return rows;
+}
+
+fn psa_csv_reads_d(text: PsaVal, dialect: PsaVal) -> PsaVal {
+    // csv.reader over a whole in-memory text (the
+    // io.StringIO shape): parse to a list of rows.
+    __psa_csv_type(text, 6);
+    return __psa_csv_parse(text, __psa_csv_dialect(dialect));
+}
+
+fn psa_csv_reads(text: PsaVal) -> PsaVal {
+    return psa_csv_reads_d(text, __psa_csv_none());
+}
+
+fn psa_csv_reader_d(lines: PsaVal, dialect: PsaVal) -> PsaVal {
+    // csv.reader over an iterable of lines: CPython
+    // pulls lines as a character stream (a quoted
+    // field may span lines), so joining the lines
+    // with no separator and parsing the stream is
+    // the same computation.
+    __psa_csv_type(lines, 4);
+    let text = __psa_str_new();
+    let n = __psa_list_len(lines);
+    let i: i64 = 0;
+    while i < n {
+        let ln = __psa_list_get(lines, i);
+        __psa_csv_type(ln, 6);
+        text = __psa_str_append_str(text, ln);
+        i = i + 1;
+    }
+    return __psa_csv_parse(text, __psa_csv_dialect(dialect));
+}
+
+fn psa_csv_reader(lines: PsaVal) -> PsaVal {
+    return psa_csv_reader_d(lines, __psa_csv_none());
+}
+
+// ---- writer ----
+
+fn __psa_csv_field_text(v: PsaVal) -> PsaVal {
+    // CPython's writer writes None as the empty
+    // string and str()s everything else; the
+    // runtime's str() surface panics 77030 for
+    // floats and containers (defect (xxiii) and the
+    // missing repr builders), which is the loud
+    // surface here too.
+    if v.tag == 3 { return __psa_str_new(); };
+    return __psa_str_of(v);
+}
+
+fn __psa_csv_needs_escape(b: i64, delim: i64, quote: i64) -> bool {
+    if b == delim { return true; };
+    if quote >= 0 {
+        if b == quote { return true; };
+    };
+    if b == 13 { return true; };
+    if b == 10 { return true; };
+    return false;
+}
+
+fn __psa_csv_render_field(out: PsaVal, text: PsaVal, numeric_value: bool, dia: PsaVal) -> PsaVal {
+    let delim = __psa_dict_get(dia, __psa_csv_lit_delimiter()).ipay;
+    let quote = __psa_dict_get(dia, __psa_csv_lit_quotechar()).ipay;
+    let quoting = __psa_dict_get(dia, __psa_csv_lit_quoting()).ipay;
+    let dq = __psa_dict_get(dia, __psa_csv_lit_doublequote()).ipay != 0;
+    let esc = __psa_dict_get(dia, __psa_csv_lit_escapechar()).ipay;
+    let o = out;
+    let n = __psa_bytes_len_h(text.ipay as ptr);
+    if quote < 0 {
+        // quotechar=None disables quoting entirely
+        // (CPython writes the field raw).
+        return __psa_str_append_str(o, text);
+    };
+    let quote_it = false;
+    if quoting == 1 { quote_it = true; };
+    if quoting == 2 {
+        if !(numeric_value) { quote_it = true; };
+    };
+    if quoting == 0 {
+        let i: i64 = 0;
+        while i < n {
+            if __psa_csv_needs_escape(__psa_csv_byte(text, i), delim, quote) { quote_it = true; };
+            i = i + 1;
+        }
+    };
+    if quoting == 3 {
+        // QUOTE_NONE: escape the special bytes with
+        // the escapechar; with no escapechar a field
+        // that needs escaping is CPython's _csv.Error
+        // "need to escape, but no escapechar set".
+        let i: i64 = 0;
+        while i < n {
+            let b = __psa_csv_byte(text, i);
+            if __psa_csv_needs_escape(b, delim, quote) {
+                if esc < 0 { panic(77168); };
+                o = __psa_str_push(o, esc as u8);
+            };
+            o = __psa_str_push(o, b as u8);
+            i = i + 1;
+        }
+        return o;
+    };
+    if !(quote_it) { return __psa_str_append_str(o, text); };
+    o = __psa_str_push(o, quote as u8);
+    let i: i64 = 0;
+    while i < n {
+        let b = __psa_csv_byte(text, i);
+        if b == quote {
+            if dq {
+                o = __psa_str_push(o, quote as u8);
+                o = __psa_str_push(o, quote as u8);
+            } else {
+                if esc < 0 { panic(77168); };
+                o = __psa_str_push(o, esc as u8);
+                o = __psa_str_push(o, quote as u8);
+            };
+        } else {
+            o = __psa_str_push(o, b as u8);
+        };
+        i = i + 1;
+    }
+    o = __psa_str_push(o, quote as u8);
+    return o;
+}
+
+fn __psa_csv_render(rows: PsaVal, dia: PsaVal) -> PsaVal {
+    __psa_csv_type(rows, 4);
+    let delim = __psa_dict_get(dia, __psa_csv_lit_delimiter()).ipay;
+    let lt = __psa_dict_get(dia, __psa_csv_lit_lineterminator());
+    let out = __psa_str_new();
+    let rn = __psa_list_len(rows);
+    let r: i64 = 0;
+    while r < rn {
+        let row = __psa_list_get(rows, r);
+        if row.tag != 4 {
+            if row.tag != 10 { panic(77167); };
+        };
+        let cn = __psa_dyn_len(row);
+        let c: i64 = 0;
+        while c < cn {
+            if c > 0 { out = __psa_str_push(out, delim as u8); };
+            let v = __psa_dyn_get(row, __psa_box_int(c));
+            let numeric_value = v.tag == 0 || v.tag == 1 || v.tag == 2;
+            out = __psa_csv_render_field(out, __psa_csv_field_text(v), numeric_value, dia);
+            c = c + 1;
+        }
+        out = __psa_str_append_str(out, lt);
+        r = r + 1;
+    }
+    return out;
+}
+
+fn psa_csv_writes_d(rows: PsaVal, dialect: PsaVal) -> PsaVal {
+    // csv.writer into an io.StringIO: render the
+    // whole table to one str.
+    return __psa_csv_render(rows, __psa_csv_dialect(dialect));
+}
+
+fn psa_csv_writes(rows: PsaVal) -> PsaVal {
+    return psa_csv_writes_d(rows, __psa_csv_none());
+}
+
+fn psa_csv_write_rows(f: PsaVal, rows: PsaVal, dialect: PsaVal) -> PsaVal {
+    // csv.writer(f).writerows(rows) for a psa file
+    // value (tag 12, from the D6 file runtime).
+    if f.tag != 12 { panic(77167); };
+    let text = __psa_csv_render(rows, __psa_csv_dialect(dialect));
+    let w = __psa_file_write(f, text);
+    return __psa_csv_none();
+}
+fn __psa_csv_lit_delimiter() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 100u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 108u8); s = __psa_str_push(s, 105u8); s = __psa_str_push(s, 109u8); s = __psa_str_push(s, 105u8); s = __psa_str_push(s, 116u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 114u8);
+    return s;
+}
+
+fn __psa_csv_lit_quotechar() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 113u8); s = __psa_str_push(s, 117u8); s = __psa_str_push(s, 111u8); s = __psa_str_push(s, 116u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 99u8); s = __psa_str_push(s, 104u8); s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 114u8);
+    return s;
+}
+
+fn __psa_csv_lit_quoting() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 113u8); s = __psa_str_push(s, 117u8); s = __psa_str_push(s, 111u8); s = __psa_str_push(s, 116u8); s = __psa_str_push(s, 105u8); s = __psa_str_push(s, 110u8); s = __psa_str_push(s, 103u8);
+    return s;
+}
+
+fn __psa_csv_lit_doublequote() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 100u8); s = __psa_str_push(s, 111u8); s = __psa_str_push(s, 117u8); s = __psa_str_push(s, 98u8); s = __psa_str_push(s, 108u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 113u8); s = __psa_str_push(s, 117u8); s = __psa_str_push(s, 111u8); s = __psa_str_push(s, 116u8); s = __psa_str_push(s, 101u8);
+    return s;
+}
+
+fn __psa_csv_lit_lineterminator() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 108u8); s = __psa_str_push(s, 105u8); s = __psa_str_push(s, 110u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 116u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 114u8); s = __psa_str_push(s, 109u8); s = __psa_str_push(s, 105u8); s = __psa_str_push(s, 110u8); s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 116u8); s = __psa_str_push(s, 111u8); s = __psa_str_push(s, 114u8);
+    return s;
+}
+
+fn __psa_csv_lit_skipinitialspace() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 107u8); s = __psa_str_push(s, 105u8); s = __psa_str_push(s, 112u8); s = __psa_str_push(s, 105u8); s = __psa_str_push(s, 110u8); s = __psa_str_push(s, 105u8); s = __psa_str_push(s, 116u8); s = __psa_str_push(s, 105u8); s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 108u8); s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 112u8); s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 99u8); s = __psa_str_push(s, 101u8);
+    return s;
+}
+
+fn __psa_csv_lit_strict() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 116u8); s = __psa_str_push(s, 114u8); s = __psa_str_push(s, 105u8); s = __psa_str_push(s, 99u8); s = __psa_str_push(s, 116u8);
+    return s;
+}
+
+fn __psa_csv_lit_escapechar() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 99u8); s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 112u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 99u8); s = __psa_str_push(s, 104u8); s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 114u8);
+    return s;
+}

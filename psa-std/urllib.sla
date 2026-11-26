@@ -1,0 +1,1565 @@
+@import "sa_std/http_client.sai"
+
+// psa_std urllib (net group L2): CPython's
+// urllib.request and urllib.parse, flattened into
+// one module of module-level functions (the psa
+// import surface is one name per module; the
+// WIRING spec maps both `import urllib.request`
+// and `import urllib.parse` onto this file).
+// Transport runs over the sa_std stateful HTTP
+// client (sa_std/http_client.sai, canonical
+// sa_std/http/client/http_client.sai, v2 request
+// path); URL parsing / quoting is pure byte logic
+// written here in full. See README-urllib.md for
+// the contract, the base-capability census and
+// the registered divergences (including why
+// http.client is not written as a second face).
+// Panic codes (7718x segment, registered in
+// README-urllib.md):
+//   77186 URLError: bad or unsupported URL,
+//         transport failure inside urlopen
+//         (CPython urllib.error.URLError)
+//   77187 HTTPError: the server answered with an
+//         error status (>= 400), or the redirect
+//         limit was exceeded (CPython
+//         urllib.error.HTTPError)
+//   77188 argument of the wrong type or value, a
+//         response used after close, or a surface
+//         the base cannot carry (CPython
+//         TypeError / ValueError)
+//   77189 malformed URL component in
+//         urllib.parse accessors (CPython
+//         ValueError from SplitResult.port etc.)
+//
+// Representation rulings (README has the full
+// list): byte strings are dyn strs whose byte
+// buffer IS the byte string (the base64 / D6
+// ruling); a Request is a tag-5 dict record with
+// the marker key "psareq"; a response is a tag-5
+// dict record with the marker key "psaresp" that
+// keeps the base client / request / response
+// handles alive until close() because the base
+// exposes headers by name only (there is no
+// header enumeration in http_client.sai). URL and
+// header staging caps: URL 4096 bytes, request
+// body 4096 bytes, one header name/value 1024
+// bytes -- longer inputs panic instead of
+// truncating (registered).
+
+// ---- literal keys ----
+
+fn __psa_urlb_lit_psareq() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 112u8); s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 114u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 113u8);
+    return s;
+}
+
+fn __psa_urlb_lit_url() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 117u8); s = __psa_str_push(s, 114u8); s = __psa_str_push(s, 108u8);
+    return s;
+}
+
+fn __psa_urlb_lit_data() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 100u8); s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 116u8); s = __psa_str_push(s, 97u8);
+    return s;
+}
+
+fn __psa_urlb_lit_headers() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 104u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 100u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 114u8); s = __psa_str_push(s, 115u8);
+    return s;
+}
+
+fn __psa_urlb_lit_method() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 109u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 116u8); s = __psa_str_push(s, 104u8); s = __psa_str_push(s, 111u8); s = __psa_str_push(s, 100u8);
+    return s;
+}
+
+fn __psa_urlb_lit_psaresp() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 112u8); s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 114u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 112u8);
+    return s;
+}
+
+fn __psa_urlb_lit_status() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 116u8); s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 116u8); s = __psa_str_push(s, 117u8); s = __psa_str_push(s, 115u8);
+    return s;
+}
+
+fn __psa_urlb_lit_body() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 98u8); s = __psa_str_push(s, 111u8); s = __psa_str_push(s, 100u8); s = __psa_str_push(s, 121u8);
+    return s;
+}
+
+fn __psa_urlb_lit_pos() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 112u8); s = __psa_str_push(s, 111u8); s = __psa_str_push(s, 115u8);
+    return s;
+}
+
+fn __psa_urlb_lit_resp() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 114u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 112u8);
+    return s;
+}
+
+fn __psa_urlb_lit_client() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 99u8); s = __psa_str_push(s, 108u8); s = __psa_str_push(s, 105u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 110u8); s = __psa_str_push(s, 116u8);
+    return s;
+}
+
+fn __psa_urlb_lit_req() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 114u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 113u8);
+    return s;
+}
+
+// ---- byte helpers ----
+
+fn __psa_urlb_byte(v: PsaVal, i: i64) -> u8 {
+    return __psa_bytes_get_h(v.ipay as ptr, i);
+}
+
+fn __psa_urlb_len(v: PsaVal) -> i64 {
+    return __psa_str_bytes_len(v);
+}
+
+// Bytes of s in [start, end) as a new dyn str.
+fn __psa_urlb_range(s: PsaVal, start: i64, end: i64) -> PsaVal {
+    let out = __psa_str_new();
+    let i = start;
+    while i < end {
+        out = __psa_str_push(out, __psa_urlb_byte(s, i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn __psa_urlb_is_alpha(b: u8) -> bool {
+    if b >= 65 {
+        if b <= 90 { return true; };
+    };
+    if b >= 97 {
+        if b <= 122 { return true; };
+    };
+    return false;
+}
+
+fn __psa_urlb_is_digit(b: u8) -> bool {
+    if b >= 48 {
+        if b <= 57 { return true; };
+    };
+    return false;
+}
+
+fn __psa_urlb_is_scheme_char(b: u8) -> bool {
+    if __psa_urlb_is_alpha(b) { return true; };
+    if __psa_urlb_is_digit(b) { return true; };
+    if b == 43 { return true; };
+    if b == 45 { return true; };
+    if b == 46 { return true; };
+    return false;
+}
+
+fn __psa_urlb_lower_byte(b: u8) -> u8 {
+    if b >= 65 {
+        if b <= 90 { return b + 32; };
+    };
+    return b;
+}
+
+fn __psa_urlb_lower(s: PsaVal) -> PsaVal {
+    let out = __psa_str_new();
+    let n = __psa_urlb_len(s);
+    let i: i64 = 0;
+    while i < n {
+        out = __psa_str_push(out, __psa_urlb_lower_byte(__psa_urlb_byte(s, i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn __psa_urlb_hex_val(b: u8) -> i64 {
+    if __psa_urlb_is_digit(b) { return b as i64 - 48; };
+    if b >= 97 {
+        if b <= 102 { return b as i64 - 87; };
+    };
+    if b >= 65 {
+        if b <= 70 { return b as i64 - 55; };
+    };
+    return -1;
+}
+
+fn __psa_urlb_hex_upper(v: i64) -> u8 {
+    if v < 10 { return 48 + v as u8; };
+    return 55 + v as u8;
+}
+
+// CPython urlsplit preprocessing: ASCII newline /
+// tab / carriage return bytes are removed anywhere
+// in the URL, and leading C0 controls and spaces
+// are stripped (the 3.6+ safety behaviour).
+fn __psa_urlb_clean(url: PsaVal) -> PsaVal {
+    let out = __psa_str_new();
+    let n = __psa_urlb_len(url);
+    let i: i64 = 0;
+    let started: bool = false;
+    while i < n {
+        let b = __psa_urlb_byte(url, i);
+        let keep: bool = true;
+        if b == 9 { keep = false; };
+        if b == 10 { keep = false; };
+        if b == 13 { keep = false; };
+        if started == false {
+            if b <= 32 { keep = false; } else { started = true; };
+        };
+        if keep { out = __psa_str_push(out, b); };
+        i = i + 1;
+    }
+    return out;
+}
+
+// Splits a cleaned URL. Returns a 5-tuple of dyn
+// strs (scheme, netloc, path, query, fragment) --
+// the exact shape psa_urllib_urlsplit returns.
+// Splitting follows RFC 3986 appendix B as CPython
+// implements it for the common schemes: fragment
+// at the first '#', scheme before the first ':'
+// when it precedes any '/', '?' or '#', netloc
+// between '//' and the next '/', '?' or end, query
+// after '?' up to the fragment.
+fn __psa_urlb_split_raw(url: PsaVal) -> PsaVal {
+    let s = __psa_urlb_clean(url);
+    let n = __psa_urlb_len(s);
+    // fragment
+    let frag_at: i64 = -1;
+    let i: i64 = 0;
+    while i < n {
+        if __psa_urlb_byte(s, i) == 35 { frag_at = i; i = n; } else { i = i + 1; };
+    }
+    let main_end = n;
+    let fragment = __psa_str_new();
+    if frag_at >= 0 {
+        fragment = __psa_urlb_range(s, frag_at + 1, n);
+        main_end = frag_at;
+    };
+    // scheme
+    let scheme = __psa_str_new();
+    let rest_start: i64 = 0;
+    let j: i64 = 0;
+    let colon: i64 = -1;
+    while j < main_end {
+        let b = __psa_urlb_byte(s, j);
+        if b == 58 { colon = j; j = main_end; } else {
+            if b == 47 { j = main_end; } else {
+                if b == 63 { j = main_end; } else { j = j + 1; };
+            };
+        };
+    }
+    if colon > 0 {
+        let ok: bool = __psa_urlb_is_alpha(__psa_urlb_byte(s, 0));
+        let k: i64 = 1;
+        while k < colon {
+            if __psa_urlb_is_scheme_char(__psa_urlb_byte(s, k)) == false { ok = false; };
+            k = k + 1;
+        }
+        if ok {
+            scheme = __psa_urlb_lower(__psa_urlb_range(s, 0, colon));
+            rest_start = colon + 1;
+        };
+    };
+    // netloc
+    let netloc = __psa_str_new();
+    let path_start = rest_start;
+    if rest_start + 1 < main_end {
+        if __psa_urlb_byte(s, rest_start) == 47 {
+            if __psa_urlb_byte(s, rest_start + 1) == 47 {
+                let e = rest_start + 2;
+                let done: bool = false;
+                while done == false {
+                    if e >= main_end { done = true; } else {
+                        let b = __psa_urlb_byte(s, e);
+                        if b == 47 { done = true; } else {
+                            if b == 63 { done = true; } else { e = e + 1; };
+                        };
+                    };
+                }
+                netloc = __psa_urlb_range(s, rest_start + 2, e);
+                path_start = e;
+            };
+        };
+    };
+    // query
+    let q_at: i64 = -1;
+    let q = path_start;
+    while q < main_end {
+        if __psa_urlb_byte(s, q) == 63 { q_at = q; q = main_end; } else { q = q + 1; };
+    }
+    let path_end = main_end;
+    let query = __psa_str_new();
+    if q_at >= 0 {
+        query = __psa_urlb_range(s, q_at + 1, main_end);
+        path_end = q_at;
+    };
+    let path = __psa_urlb_range(s, path_start, path_end);
+    let t = __psa_tuple_new();
+    __psa_tuple_push(t, scheme);
+    __psa_tuple_push(t, netloc);
+    __psa_tuple_push(t, path);
+    __psa_tuple_push(t, query);
+    __psa_tuple_push(t, fragment);
+    return t;
+}
+
+fn __psa_urlb_part(parts: PsaVal, i: i64) -> PsaVal {
+    return __psa_tuple_get(parts, i);
+}
+
+// netloc minus userinfo, minus port: the host
+// part, lowercased, brackets stripped for IPv6.
+fn __psa_urlb_host_of(netloc: PsaVal) -> PsaVal {
+    let n = __psa_urlb_len(netloc);
+    // strip userinfo up to the last '@'
+    let start: i64 = 0;
+    let i: i64 = 0;
+    while i < n {
+        if __psa_urlb_byte(netloc, i) == 64 { start = i + 1; };
+        i = i + 1;
+    }
+    // bracketed IPv6
+    if start < n {
+        if __psa_urlb_byte(netloc, start) == 91 {
+            let e = start + 1;
+            while e < n {
+                if __psa_urlb_byte(netloc, e) == 93 {
+                    return __psa_urlb_lower(__psa_urlb_range(netloc, start + 1, e));
+                };
+                e = e + 1;
+            }
+            return __psa_urlb_lower(__psa_urlb_range(netloc, start + 1, n));
+        };
+    };
+    // host:port -- host ends at the last ':'
+    let end = n;
+    let k: i64 = start;
+    while k < n {
+        if __psa_urlb_byte(netloc, k) == 58 { end = k; };
+        k = k + 1;
+    }
+    return __psa_urlb_lower(__psa_urlb_range(netloc, start, end));
+}
+
+// The raw port string of a netloc ("" when absent).
+fn __psa_urlb_port_str(netloc: PsaVal) -> PsaVal {
+    let n = __psa_urlb_len(netloc);
+    let start: i64 = 0;
+    let i: i64 = 0;
+    while i < n {
+        if __psa_urlb_byte(netloc, i) == 64 { start = i + 1; };
+        i = i + 1;
+    }
+    if start < n {
+        if __psa_urlb_byte(netloc, start) == 91 {
+            // IPv6: port follows "]:"
+            let e = start + 1;
+            while e < n {
+                if __psa_urlb_byte(netloc, e) == 93 {
+                    if e + 1 < n {
+                        if __psa_urlb_byte(netloc, e + 1) == 58 {
+                            return __psa_urlb_range(netloc, e + 2, n);
+                        };
+                    };
+                    return __psa_str_new();
+                };
+                e = e + 1;
+            }
+            return __psa_str_new();
+        };
+    };
+    let colon: i64 = -1;
+    let k: i64 = start;
+    while k < n {
+        if __psa_urlb_byte(netloc, k) == 58 { colon = k; };
+        k = k + 1;
+    }
+    if colon < 0 { return __psa_str_new(); };
+    return __psa_urlb_range(netloc, colon + 1, n);
+}
+
+// ---- urllib.parse entry points ----
+
+fn psa_urllib_parse_urlsplit(url: PsaVal) -> PsaVal {
+    if url.tag != 6 { panic(77188); };
+    return __psa_urlb_split_raw(url);
+}
+
+fn psa_urllib_parse_urlunsplit(parts: PsaVal) -> PsaVal {
+    if parts.tag != 10 { panic(77188); };
+    if __psa_vec_len_h(parts.ipay as ptr) != 5 { panic(77188); };
+    let scheme = __psa_urlb_part(parts, 0);
+    let netloc = __psa_urlb_part(parts, 1);
+    let path = __psa_urlb_part(parts, 2);
+    let query = __psa_urlb_part(parts, 3);
+    let fragment = __psa_urlb_part(parts, 4);
+    let out = __psa_str_new();
+    if __psa_urlb_len(scheme) > 0 {
+        out = __psa_str_append_str(out, scheme);
+        out = __psa_str_push(out, 58u8);
+    };
+    if __psa_urlb_len(netloc) > 0 {
+        out = __psa_str_push(out, 47u8);
+        out = __psa_str_push(out, 47u8);
+        out = __psa_str_append_str(out, netloc);
+        if __psa_urlb_len(path) > 0 {
+            if __psa_urlb_byte(path, 0) != 47 {
+                out = __psa_str_push(out, 47u8);
+            };
+        };
+    };
+    out = __psa_str_append_str(out, path);
+    if __psa_urlb_len(query) > 0 {
+        out = __psa_str_push(out, 63u8);
+        out = __psa_str_append_str(out, query);
+    };
+    if __psa_urlb_len(fragment) > 0 {
+        out = __psa_str_push(out, 35u8);
+        out = __psa_str_append_str(out, fragment);
+    };
+    return out;
+}
+
+fn psa_urllib_parse_hostname(parts: PsaVal) -> PsaVal {
+    if parts.tag != 10 { panic(77188); };
+    let netloc = __psa_urlb_part(parts, 1);
+    if __psa_urlb_len(netloc) == 0 { return __psa_m_none(); };
+    return __psa_urlb_host_of(netloc);
+}
+
+// CPython raises ValueError when .port is read on
+// a netloc whose port is not a number in range;
+// psa raises it here, at the accessor (77189).
+fn psa_urllib_parse_port(parts: PsaVal) -> PsaVal {
+    if parts.tag != 10 { panic(77188); };
+    let netloc = __psa_urlb_part(parts, 1);
+    let ps = __psa_urlb_port_str(netloc);
+    if __psa_urlb_len(ps) == 0 { return __psa_m_none(); };
+    let n = __psa_urlb_len(ps);
+    let v: i64 = 0;
+    let i: i64 = 0;
+    while i < n {
+        let b = __psa_urlb_byte(ps, i);
+        if __psa_urlb_is_digit(b) == false { panic(77189); };
+        v = v * 10 + (b as i64 - 48);
+        if v > 65535 { panic(77189); };
+        i = i + 1;
+    }
+    return __psa_box_int(v);
+}
+
+fn __psa_urlb_is_unreserved(b: u8) -> bool {
+    if __psa_urlb_is_alpha(b) { return true; };
+    if __psa_urlb_is_digit(b) { return true; };
+    if b == 95 { return true; };
+    if b == 46 { return true; };
+    if b == 45 { return true; };
+    if b == 126 { return true; };
+    return false;
+}
+
+fn __psa_urlb_in_str(s: PsaVal, b: u8) -> bool {
+    let n = __psa_urlb_len(s);
+    let i: i64 = 0;
+    while i < n {
+        if __psa_urlb_byte(s, i) == b { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn __psa_urlb_quote_impl(s: PsaVal, safe: PsaVal, plus: bool) -> PsaVal {
+    let out = __psa_str_new();
+    let n = __psa_urlb_len(s);
+    let i: i64 = 0;
+    while i < n {
+        let b = __psa_urlb_byte(s, i);
+        let keep: bool = false;
+        if __psa_urlb_is_unreserved(b) { keep = true; };
+        if __psa_urlb_in_str(safe, b) { keep = true; };
+        if keep {
+            out = __psa_str_push(out, b);
+        } else {
+            let encoded: bool = false;
+            if plus {
+                if b == 32 {
+                    out = __psa_str_push(out, 43u8);
+                    encoded = true;
+                };
+            };
+            if encoded == false {
+                out = __psa_str_push(out, 37u8);
+                out = __psa_str_push(out, __psa_urlb_hex_upper(b as i64 >> 4));
+                out = __psa_str_push(out, __psa_urlb_hex_upper(b as i64 & 15));
+            };
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+fn __psa_urlb_lit_slash() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 47u8);
+    return s;
+}
+
+fn psa_urllib_parse_quote(s: PsaVal) -> PsaVal {
+    if s.tag != 6 { panic(77188); };
+    return __psa_urlb_quote_impl(s, __psa_urlb_lit_slash(), false);
+}
+
+fn psa_urllib_parse_quote_safe(s: PsaVal, safe: PsaVal) -> PsaVal {
+    if s.tag != 6 { panic(77188); };
+    if safe.tag != 6 { panic(77188); };
+    return __psa_urlb_quote_impl(s, safe, false);
+}
+
+fn psa_urllib_parse_quote_plus(s: PsaVal) -> PsaVal {
+    if s.tag != 6 { panic(77188); };
+    return __psa_urlb_quote_impl(s, __psa_str_new(), true);
+}
+
+fn psa_urllib_parse_quote_plus_safe(s: PsaVal, safe: PsaVal) -> PsaVal {
+    if s.tag != 6 { panic(77188); };
+    if safe.tag != 6 { panic(77188); };
+    return __psa_urlb_quote_impl(s, safe, true);
+}
+
+fn __psa_urlb_unquote_impl(s: PsaVal, plus: bool) -> PsaVal {
+    let out = __psa_str_new();
+    let n = __psa_urlb_len(s);
+    let i: i64 = 0;
+    while i < n {
+        let b = __psa_urlb_byte(s, i);
+        if b == 37 {
+            let done: bool = false;
+            if i + 2 < n {
+                let h1 = __psa_urlb_hex_val(__psa_urlb_byte(s, i + 1));
+                let h2 = __psa_urlb_hex_val(__psa_urlb_byte(s, i + 2));
+                if h1 >= 0 {
+                    if h2 >= 0 {
+                        out = __psa_str_push(out, (h1 * 16 + h2) as u8);
+                        i = i + 3;
+                        done = true;
+                    };
+                };
+            };
+            if done == false {
+                out = __psa_str_push(out, b);
+                i = i + 1;
+            };
+        } else {
+            if plus {
+                if b == 43 {
+                    out = __psa_str_push(out, 32u8);
+                } else {
+                    out = __psa_str_push(out, b);
+                };
+            } else {
+                out = __psa_str_push(out, b);
+            };
+            i = i + 1;
+        };
+    }
+    return out;
+}
+
+fn psa_urllib_parse_unquote(s: PsaVal) -> PsaVal {
+    if s.tag != 6 { panic(77188); };
+    return __psa_urlb_unquote_impl(s, false);
+}
+
+fn psa_urllib_parse_unquote_plus(s: PsaVal) -> PsaVal {
+    if s.tag != 6 { panic(77188); };
+    return __psa_urlb_unquote_impl(s, true);
+}
+
+// ---- query strings ----
+
+// One name=value pair appended to out (with '&'
+// separator when out is non-empty).
+fn __psa_urlb_encode_pair(out: PsaVal, name: PsaVal, value: PsaVal) -> PsaVal {
+    let o = out;
+    if __psa_urlb_len(o) > 0 { o = __psa_str_push(o, 38u8); };
+    o = __psa_str_append_str(o, __psa_urlb_quote_impl(__psa_str_of(name), __psa_str_new(), true));
+    o = __psa_str_push(o, 61u8);
+    o = __psa_str_append_str(o, __psa_urlb_quote_impl(__psa_str_of(value), __psa_str_new(), true));
+    return o;
+}
+
+fn __psa_urlb_encode_into(out: PsaVal, name: PsaVal, value: PsaVal, doseq: bool) -> PsaVal {
+    let o = out;
+    if doseq {
+        if value.tag == 4 {
+            let n = __psa_vec_len_h(value.ipay as ptr);
+            let i: i64 = 0;
+            while i < n {
+                o = __psa_urlb_encode_pair(o, name, __psa_list_get(value, i));
+                i = i + 1;
+            }
+            return o;
+        };
+        if value.tag == 10 {
+            let n = __psa_vec_len_h(value.ipay as ptr);
+            let i: i64 = 0;
+            while i < n {
+                o = __psa_urlb_encode_pair(o, name, __psa_tuple_get(value, i));
+                i = i + 1;
+            }
+            return o;
+        };
+    };
+    o = __psa_urlb_encode_pair(o, name, value);
+    return o;
+}
+
+// query: a dict (insertion order, as CPython
+// dicts) or a list/tuple of 2-tuples.
+fn psa_urllib_parse_urlencode(query: PsaVal) -> PsaVal {
+    return psa_urllib_parse_urlencode_doseq(query, __psa_box_int(0));
+}
+
+fn psa_urllib_parse_urlencode_doseq(query: PsaVal, doseq: PsaVal) -> PsaVal {
+    let dq = __psa_dyn_truthy(doseq);
+    let out = __psa_str_new();
+    let o = out;
+    if query.tag == 5 {
+        let n = __psa_dict_len(query);
+        let i: i64 = 0;
+        while i < n {
+            let k = __psa_dict_key_at(query, i);
+            let v = __psa_dict_val_at(query, i);
+            o = __psa_urlb_encode_into(o, k, v, dq);
+            i = i + 1;
+        }
+        return o;
+    };
+    if query.tag == 4 {
+        let n = __psa_vec_len_h(query.ipay as ptr);
+        let i: i64 = 0;
+        while i < n {
+            let pair = __psa_list_get(query, i);
+            if pair.tag != 10 { panic(77188); };
+            o = __psa_urlb_encode_into(o, __psa_tuple_get(pair, 0), __psa_tuple_get(pair, 1), dq);
+            i = i + 1;
+        }
+        return o;
+    };
+    if query.tag == 10 {
+        let n = __psa_vec_len_h(query.ipay as ptr);
+        let i: i64 = 0;
+        while i < n {
+            let pair = __psa_tuple_get(query, i);
+            if pair.tag != 10 { panic(77188); };
+            o = __psa_urlb_encode_into(o, __psa_tuple_get(pair, 0), __psa_tuple_get(pair, 1), dq);
+            i = i + 1;
+        }
+        return o;
+    };
+    panic(77188);
+}
+
+// parse_qsl: '&'-separated (CPython 3.10+ no
+// longer splits on ';'), each piece split at the
+// first '='; blank values dropped unless
+// keep_blank; pieces without '=' dropped unless
+// keep_blank (then their value is "").
+fn psa_urllib_parse_parse_qsl(qs: PsaVal) -> PsaVal {
+    return psa_urllib_parse_parse_qsl_kb(qs, __psa_box_int(0));
+}
+
+fn psa_urllib_parse_parse_qsl_kb(qs: PsaVal, keep_blank: PsaVal) -> PsaVal {
+    if qs.tag != 6 { panic(77188); };
+    let kb = __psa_dyn_truthy(keep_blank);
+    let out = __psa_list_new();
+    let n = __psa_urlb_len(qs);
+    let start: i64 = 0;
+    let i: i64 = 0;
+    while i <= n {
+        let at_end: bool = false;
+        if i == n { at_end = true; } else {
+            if __psa_urlb_byte(qs, i) == 38 { at_end = true; };
+        };
+        if at_end {
+            if i > start {
+                // one piece [start, i)
+                let eq: i64 = -1;
+                let k = start;
+                while k < i {
+                    if __psa_urlb_byte(qs, k) == 61 { eq = k; k = i; } else { k = k + 1; };
+                }
+                let name = __psa_str_new();
+                let value = __psa_str_new();
+                let include: bool = false;
+                if eq >= 0 {
+                    name = __psa_urlb_unquote_impl(__psa_urlb_range(qs, start, eq), true);
+                    value = __psa_urlb_unquote_impl(__psa_urlb_range(qs, eq + 1, i), true);
+                    if __psa_urlb_len(value) > 0 { include = true; };
+                    if kb { include = true; };
+                } else {
+                    name = __psa_urlb_unquote_impl(__psa_urlb_range(qs, start, i), true);
+                    if kb { include = true; };
+                };
+                if include {
+                    let t = __psa_tuple_new();
+                    __psa_tuple_push(t, name);
+                    __psa_tuple_push(t, value);
+                    __psa_list_push(out, t);
+                };
+            };
+            start = i + 1;
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+fn psa_urllib_parse_parse_qs(qs: PsaVal) -> PsaVal {
+    return psa_urllib_parse_parse_qs_kb(qs, __psa_box_int(0));
+}
+
+fn psa_urllib_parse_parse_qs_kb(qs: PsaVal, keep_blank: PsaVal) -> PsaVal {
+    let pairs = psa_urllib_parse_parse_qsl_kb(qs, keep_blank);
+    let out = __psa_dict_new();
+    let n = __psa_vec_len_h(pairs.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        let pair = __psa_list_get(pairs, i);
+        let k = __psa_tuple_get(pair, 0);
+        let v = __psa_tuple_get(pair, 1);
+        if __psa_dict_contains(out, k) {
+            let lst = __psa_dict_get(out, k);
+            __psa_list_push(lst, v);
+        } else {
+            let lst = __psa_list_new();
+            __psa_list_push(lst, v);
+            __psa_dict_set(out, k, lst);
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---- urljoin (RFC 3986 5.3, CPython rules) ----
+
+// Removes the last segment of an accumulated
+// output path (for ".." handling).
+fn __psa_urlb_pop_segment(out: PsaVal) -> PsaVal {
+    let n = __psa_urlb_len(out);
+    let cut: i64 = -1;
+    let i: i64 = 0;
+    while i < n {
+        if __psa_urlb_byte(out, i) == 47 { cut = i; };
+        i = i + 1;
+    }
+    if cut < 0 { return __psa_str_new(); };
+    return __psa_urlb_range(out, 0, cut);
+}
+
+fn __psa_urlb_remove_dots(path: PsaVal) -> PsaVal {
+    let out = __psa_str_new();
+    let o = out;
+    let rest = path;
+    let guard: i64 = 0;
+    let done: bool = false;
+    while done == false {
+        guard = guard + 1;
+        if guard > 10000 { done = true; } else {
+            let n = __psa_urlb_len(rest);
+            if n == 0 { done = true; } else {
+                let restarted: bool = false;
+                if __psa_urlb_len(rest) >= 3 {
+                    // "../" prefix: remove and restart
+                    // the iteration (the new prefix may
+                    // itself start with "../")
+                    if __psa_urlb_byte(rest, 0) == 46 {
+                        if __psa_urlb_byte(rest, 1) == 46 {
+                            if __psa_urlb_byte(rest, 2) == 47 {
+                                rest = __psa_urlb_range(rest, 3, n);
+                                restarted = true;
+                            };
+                        };
+                    };
+                };
+                if restarted == false {
+                let n2 = __psa_urlb_len(rest);
+                if n2 == 0 { done = true; } else {
+                    let handled: bool = false;
+                    if n2 >= 2 {
+                        if __psa_urlb_byte(rest, 0) == 46 {
+                            if __psa_urlb_byte(rest, 1) == 47 {
+                                rest = __psa_urlb_range(rest, 2, n2);
+                                handled = true;
+                            };
+                        };
+                    };
+                    if handled == false {
+                        // "/../" prefix (47 46 46 47):
+                        // drop it and pop the last
+                        // output segment (RFC 3986
+                        // 5.2.4). This branch previously
+                        // tested 47 46 47 -- the "/./"
+                        // pattern -- so ".." was never
+                        // normalised at all.
+                        if n2 >= 4 {
+                            if __psa_urlb_byte(rest, 0) == 47 {
+                                if __psa_urlb_byte(rest, 1) == 46 {
+                                    if __psa_urlb_byte(rest, 2) == 46 {
+                                        if __psa_urlb_byte(rest, 3) == 47 {
+                                            rest = __psa_urlb_range(rest, 3, n2);
+                                            o = __psa_urlb_pop_segment(o);
+                                            handled = true;
+                                        };
+                                    };
+                                };
+                            };
+                        };
+                    };
+                    if handled == false {
+                        // trailing "/.." (47 46 46):
+                        // same pop, rest becomes "/".
+                        if n2 == 3 {
+                            if __psa_urlb_byte(rest, 0) == 47 {
+                                if __psa_urlb_byte(rest, 1) == 46 {
+                                    if __psa_urlb_byte(rest, 2) == 46 {
+                                        rest = __psa_urlb_lit_slash();
+                                        o = __psa_urlb_pop_segment(o);
+                                        handled = true;
+                                    };
+                                };
+                            };
+                        };
+                    };
+                    if handled == false {
+                        // "/./" prefix (47 46 47): drop
+                        // the "." segment, keep the
+                        // slash; no pop.
+                        if n2 >= 3 {
+                            if __psa_urlb_byte(rest, 0) == 47 {
+                                if __psa_urlb_byte(rest, 1) == 46 {
+                                    if __psa_urlb_byte(rest, 2) == 47 {
+                                        rest = __psa_urlb_range(rest, 2, n2);
+                                        handled = true;
+                                    };
+                                };
+                            };
+                        };
+                    };
+                    if handled == false {
+                        if n2 >= 2 {
+                            if __psa_urlb_byte(rest, 0) == 47 {
+                                if __psa_urlb_byte(rest, 1) == 46 {
+                                    if n2 == 2 {
+                                        rest = __psa_urlb_lit_slash();
+                                        handled = true;
+                                    };
+                                };
+                            };
+                        };
+                    };
+                    if handled == false {
+                        if n2 == 1 {
+                            if __psa_urlb_byte(rest, 0) == 46 {
+                                rest = __psa_str_new();
+                                handled = true;
+                            };
+                        };
+                    };
+                    if handled == false {
+                        if n2 == 2 {
+                            if __psa_urlb_byte(rest, 0) == 46 {
+                                if __psa_urlb_byte(rest, 1) == 46 {
+                                    rest = __psa_str_new();
+                                    o = __psa_urlb_pop_segment(o);
+                                    handled = true;
+                                };
+                            };
+                        };
+                    };
+                    if handled == false {
+                        // move the first segment (with a
+                        // leading '/' if present) to out
+                        let e: i64 = 0;
+                        if __psa_urlb_byte(rest, 0) == 47 { e = 1; };
+                        let f = e;
+                        let stop: bool = false;
+                        while stop == false {
+                            if f >= n2 { stop = true; } else {
+                                if __psa_urlb_byte(rest, f) == 47 { stop = true; } else { f = f + 1; };
+                            };
+                        }
+                        o = __psa_str_append_str(o, __psa_urlb_range(rest, 0, f));
+                        rest = __psa_urlb_range(rest, f, n2);
+                    };
+                };
+                };
+            };
+        };
+    }
+    return o;
+}
+
+fn psa_urllib_parse_urljoin(base: PsaVal, url: PsaVal) -> PsaVal {
+    if base.tag != 6 { panic(77188); };
+    if url.tag != 6 { panic(77188); };
+    let bp = __psa_urlb_split_raw(base);
+    let rp = __psa_urlb_split_raw(url);
+    let bscheme = __psa_urlb_part(bp, 0);
+    let bnetloc = __psa_urlb_part(bp, 1);
+    let bpath = __psa_urlb_part(bp, 2);
+    let bquery = __psa_urlb_part(bp, 3);
+    let rscheme = __psa_urlb_part(rp, 0);
+    let rnetloc = __psa_urlb_part(rp, 1);
+    let rpath = __psa_urlb_part(rp, 2);
+    let rquery = __psa_urlb_part(rp, 3);
+    let rfrag = __psa_urlb_part(rp, 4);
+    // A reference with a different scheme is used
+    // as-is (dot segments removed); with the same
+    // scheme CPython treats it as relative.
+    if __psa_urlb_len(rscheme) > 0 {
+        if __psa_str_eq(rscheme, bscheme) == false {
+            let t = __psa_tuple_new();
+            __psa_tuple_push(t, rscheme);
+            __psa_tuple_push(t, rnetloc);
+            __psa_tuple_push(t, __psa_urlb_remove_dots(rpath));
+            __psa_tuple_push(t, rquery);
+            __psa_tuple_push(t, rfrag);
+            return psa_urllib_parse_urlunsplit(t);
+        };
+    };
+    let scheme = bscheme;
+    let netloc = bnetloc;
+    let path = bpath;
+    let query = bquery;
+    if __psa_urlb_len(rnetloc) > 0 {
+        netloc = rnetloc;
+        path = __psa_urlb_remove_dots(rpath);
+        query = rquery;
+    } else {
+        if __psa_urlb_len(rpath) == 0 {
+            // empty reference path: keep the base
+            // path; the query is replaced only when
+            // the reference carried one -- the split
+            // cannot distinguish "no '?'" from an
+            // empty query, so a reference containing
+            // '?' is re-checked on the raw string.
+            if __psa_urlb_in_str(url, 63u8) { query = rquery; };
+        } else {
+            if __psa_urlb_byte(rpath, 0) == 47 {
+                path = __psa_urlb_remove_dots(rpath);
+            } else {
+                // merge: base path up to its last '/'
+                let bn = __psa_urlb_len(bpath);
+                let cut: i64 = -1;
+                let i: i64 = 0;
+                while i < bn {
+                    if __psa_urlb_byte(bpath, i) == 47 { cut = i; };
+                    i = i + 1;
+                }
+                let merged = __psa_str_new();
+                if cut >= 0 {
+                    merged = __psa_urlb_range(bpath, 0, cut + 1);
+                } else {
+                    if __psa_urlb_len(bnetloc) > 0 {
+                        merged = __psa_str_push(merged, 47u8);
+                    };
+                };
+                merged = __psa_str_append_str(merged, rpath);
+                path = __psa_urlb_remove_dots(merged);
+            };
+            query = rquery;
+        };
+    };
+    let t = __psa_tuple_new();
+    __psa_tuple_push(t, scheme);
+    __psa_tuple_push(t, netloc);
+    __psa_tuple_push(t, path);
+    __psa_tuple_push(t, query);
+    __psa_tuple_push(t, rfrag);
+    return psa_urllib_parse_urlunsplit(t);
+}
+
+fn __psa_urlb_lit_get() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 71u8); s = __psa_str_push(s, 69u8); s = __psa_str_push(s, 84u8);
+    return s;
+}
+
+fn __psa_urlb_lit_post() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 80u8); s = __psa_str_push(s, 79u8); s = __psa_str_push(s, 83u8); s = __psa_str_push(s, 84u8);
+    return s;
+}
+
+fn __psa_urlb_lit_put() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 80u8); s = __psa_str_push(s, 85u8); s = __psa_str_push(s, 84u8);
+    return s;
+}
+
+fn __psa_urlb_lit_delete() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 68u8); s = __psa_str_push(s, 69u8); s = __psa_str_push(s, 76u8); s = __psa_str_push(s, 69u8); s = __psa_str_push(s, 84u8); s = __psa_str_push(s, 69u8);
+    return s;
+}
+
+fn __psa_urlb_lit_head() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 72u8); s = __psa_str_push(s, 69u8); s = __psa_str_push(s, 65u8); s = __psa_str_push(s, 68u8);
+    return s;
+}
+
+fn __psa_urlb_lit_patch() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 80u8); s = __psa_str_push(s, 65u8); s = __psa_str_push(s, 84u8); s = __psa_str_push(s, 67u8); s = __psa_str_push(s, 72u8);
+    return s;
+}
+
+fn __psa_urlb_lit_options() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 79u8); s = __psa_str_push(s, 80u8); s = __psa_str_push(s, 84u8); s = __psa_str_push(s, 73u8); s = __psa_str_push(s, 79u8); s = __psa_str_push(s, 78u8); s = __psa_str_push(s, 83u8);
+    return s;
+}
+
+fn __psa_urlb_lit_location() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 76u8); s = __psa_str_push(s, 111u8); s = __psa_str_push(s, 99u8); s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 116u8); s = __psa_str_push(s, 105u8); s = __psa_str_push(s, 111u8); s = __psa_str_push(s, 110u8);
+    return s;
+}
+
+fn __psa_urlb_lit_content_type() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 67u8); s = __psa_str_push(s, 111u8); s = __psa_str_push(s, 110u8); s = __psa_str_push(s, 116u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 110u8); s = __psa_str_push(s, 116u8); s = __psa_str_push(s, 45u8); s = __psa_str_push(s, 84u8); s = __psa_str_push(s, 121u8); s = __psa_str_push(s, 112u8); s = __psa_str_push(s, 101u8);
+    return s;
+}
+
+fn __psa_urlb_lit_form_ct() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 112u8); s = __psa_str_push(s, 112u8); s = __psa_str_push(s, 108u8); s = __psa_str_push(s, 105u8); s = __psa_str_push(s, 99u8); s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 116u8); s = __psa_str_push(s, 105u8); s = __psa_str_push(s, 111u8); s = __psa_str_push(s, 110u8); s = __psa_str_push(s, 47u8); s = __psa_str_push(s, 120u8); s = __psa_str_push(s, 45u8); s = __psa_str_push(s, 119u8); s = __psa_str_push(s, 119u8); s = __psa_str_push(s, 119u8); s = __psa_str_push(s, 45u8); s = __psa_str_push(s, 102u8); s = __psa_str_push(s, 111u8); s = __psa_str_push(s, 114u8); s = __psa_str_push(s, 109u8); s = __psa_str_push(s, 45u8); s = __psa_str_push(s, 117u8); s = __psa_str_push(s, 114u8); s = __psa_str_push(s, 108u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 110u8); s = __psa_str_push(s, 99u8); s = __psa_str_push(s, 111u8); s = __psa_str_push(s, 100u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 100u8);
+    return s;
+}
+
+// ---- urllib.request ----
+
+fn __psa_urlb_upper(s: PsaVal) -> PsaVal {
+    let out = __psa_str_new();
+    let n = __psa_urlb_len(s);
+    let i: i64 = 0;
+    while i < n {
+        let b = __psa_urlb_byte(s, i);
+        if b >= 97 {
+            if b <= 122 { b = b - 32; };
+        };
+        out = __psa_str_push(out, b);
+        i = i + 1;
+    }
+    return out;
+}
+
+// HTTP method codes from sa_std/http/http.sla.
+fn __psa_urlb_method_code(m: PsaVal) -> u8 {
+    let u = __psa_urlb_upper(m);
+    if __psa_str_eq(u, __psa_urlb_lit_get()) { return 1; };
+    if __psa_str_eq(u, __psa_urlb_lit_post()) { return 2; };
+    if __psa_str_eq(u, __psa_urlb_lit_put()) { return 3; };
+    if __psa_str_eq(u, __psa_urlb_lit_delete()) { return 4; };
+    if __psa_str_eq(u, __psa_urlb_lit_head()) { return 5; };
+    if __psa_str_eq(u, __psa_urlb_lit_patch()) { return 6; };
+    if __psa_str_eq(u, __psa_urlb_lit_options()) { return 7; };
+    panic(77188);
+}
+
+fn __psa_urlb_req_rec(url: PsaVal, data: PsaVal, headers: PsaVal, method: PsaVal) -> PsaVal {
+    if url.tag != 6 { panic(77188); };
+    if data.tag != 3 {
+        if data.tag != 6 { panic(77188); };
+    };
+    if headers.tag != 3 {
+        if headers.tag != 5 { panic(77188); };
+    };
+    if method.tag != 3 {
+        if method.tag != 6 { panic(77188); };
+    };
+    let rec = __psa_dict_new();
+    __psa_dict_set(rec, __psa_urlb_lit_psareq(), __psa_box_int(1));
+    __psa_dict_set(rec, __psa_urlb_lit_url(), url);
+    __psa_dict_set(rec, __psa_urlb_lit_data(), data);
+    if headers.tag == 3 {
+        __psa_dict_set(rec, __psa_urlb_lit_headers(), __psa_dict_new());
+    } else {
+        __psa_dict_set(rec, __psa_urlb_lit_headers(), headers);
+    };
+    __psa_dict_set(rec, __psa_urlb_lit_method(), method);
+    return rec;
+}
+
+fn psa_urllib_request_new(url: PsaVal) -> PsaVal {
+    return __psa_urlb_req_rec(url, __psa_m_none(), __psa_m_none(), __psa_m_none());
+}
+
+fn psa_urllib_request_new_data(url: PsaVal, data: PsaVal) -> PsaVal {
+    return __psa_urlb_req_rec(url, data, __psa_m_none(), __psa_m_none());
+}
+
+fn psa_urllib_request_new_full(url: PsaVal, data: PsaVal, headers: PsaVal, method: PsaVal) -> PsaVal {
+    return __psa_urlb_req_rec(url, data, headers, method);
+}
+
+fn __psa_urlb_req_check(v: PsaVal) -> PsaVal {
+    if v.tag != 5 { panic(77188); };
+    if __psa_dict_contains(v, __psa_urlb_lit_psareq()) == false { panic(77188); };
+    return v;
+}
+
+// The effective method: the explicit method when
+// set, else POST when data is present, else GET
+// (CPython Request.get_method).
+fn psa_urllib_request_get_method(req: PsaVal) -> PsaVal {
+    let rec = __psa_urlb_req_check(req);
+    let m = __psa_dict_get(rec, __psa_urlb_lit_method());
+    if m.tag == 6 { return m; };
+    let data = __psa_dict_get(rec, __psa_urlb_lit_data());
+    if data.tag == 6 { return __psa_urlb_lit_post(); };
+    return __psa_urlb_lit_get();
+}
+
+fn psa_urllib_request_full_url(req: PsaVal) -> PsaVal {
+    let rec = __psa_urlb_req_check(req);
+    return __psa_dict_get(rec, __psa_urlb_lit_url());
+}
+
+fn psa_urllib_request_add_header(req: PsaVal, key: PsaVal, val: PsaVal) -> PsaVal {
+    let rec = __psa_urlb_req_check(req);
+    if key.tag != 6 { panic(77188); };
+    if val.tag != 6 { panic(77188); };
+    let h = __psa_dict_get(rec, __psa_urlb_lit_headers());
+    __psa_dict_set(h, key, val);
+    return __psa_m_none();
+}
+
+// Case-insensitive header lookup over a dict
+// (CPython's Request header dict is case-aware
+// through capitalize(); psa scans, registered).
+fn __psa_urlb_dict_get_ci(d: PsaVal, key: PsaVal) -> PsaVal {
+    let lk = __psa_urlb_lower(key);
+    let n = __psa_dict_len(d);
+    let i: i64 = 0;
+    while i < n {
+        let k = __psa_dict_key_at(d, i);
+        if k.tag == 6 {
+            if __psa_str_eq(__psa_urlb_lower(k), lk) {
+                return __psa_dict_val_at(d, i);
+            };
+        };
+        i = i + 1;
+    }
+    return __psa_m_none();
+}
+
+fn psa_urllib_request_get_header(req: PsaVal, key: PsaVal) -> PsaVal {
+    let rec = __psa_urlb_req_check(req);
+    if key.tag != 6 { panic(77188); };
+    let h = __psa_dict_get(rec, __psa_urlb_lit_headers());
+    return __psa_urlb_dict_get_ci(h, key);
+}
+
+fn __psa_urlb_resp_check(v: PsaVal) -> PsaVal {
+    if v.tag != 5 { panic(77188); };
+    if __psa_dict_contains(v, __psa_urlb_lit_psaresp()) == false { panic(77188); };
+    return v;
+}
+
+// Reads one response header by name through the
+// base client (headers are exposed by name only).
+// Returns None when the header is absent.
+fn __psa_urlb_resp_header(resp: i64, name: PsaVal) -> PsaVal {
+    let nb = [0u8; 256];
+    let nn = __psa_urlb_len(name);
+    if nn > 256 { panic(77188); };
+    let i: i64 = 0;
+    while i < nn {
+        let __ix = i as u64;
+        nb[__ix] = __psa_urlb_byte(name, i);
+        i = i + 1;
+    }
+    let outv = [0u64; 1];
+    let outl = [0u64; 1];
+    let st = sa_http_client_resp_get_header(resp as ptr, PTR_BYTE_ADD(&nb, 0), nn as u64, &outv[0], &outl[0]);
+    if st != 0 { return __psa_m_none(); };
+    let out = __psa_str_new();
+    let j: u64 = 0;
+    while j < outl[0] {
+        out = __psa_str_push(out, PTR_BYTE_AT(outv[0] as ptr, j));
+        j = j + 1;
+    }
+    return out;
+}
+
+fn __psa_urlb_free_handles(client: i64, req: i64, resp: i64) -> void {
+    if resp != 0 { sa_http_client_resp_free(resp as ptr); };
+    if req != 0 { sa_http_client_req_free(req as ptr); };
+    if client != 0 { sa_http_client_free(client as ptr); };
+}
+
+// The urlopen engine: follows redirects like
+// CPython's HTTPRedirectHandler (at most 10 hops;
+// 301/302 turn POST into GET, 303 turns every
+// method but HEAD into GET and drops the body,
+// 307/308 keep method and body), raises HTTPError
+// (77187) on a final error status, URLError
+// (77186) on transport failure and on non-http(s)
+// schemes. The response body is copied out of the
+// base response; the base handles stay in the
+// record for getheader until close().
+// Stages one header pair into scratch buffers and
+// adds it to the request; -1 when a side exceeds the
+// 1024-byte staging cap, else the extern status.
+// (Staging lives in its own function: borrowing the
+// buffers inside the header loop trips the SA
+// referee's loop-head state check.)
+fn __psa_urlb_add_header(reqh: i64, k: PsaVal, v: PsaVal) -> i32 {
+    let kb = [0u8; 1024];
+    let kn = __psa_urlb_len(k);
+    if kn > 1024 { return -1; };
+    let ki: i64 = 0;
+    while ki < kn {
+        let __ix = ki as u64;
+        kb[__ix] = __psa_urlb_byte(k, ki);
+        ki = ki + 1;
+    }
+    let vb = [0u8; 1024];
+    let vn = __psa_urlb_len(v);
+    if vn > 1024 { return -1; };
+    let vi: i64 = 0;
+    while vi < vn {
+        let __ix = vi as u64;
+        vb[__ix] = __psa_urlb_byte(v, vi);
+        vi = vi + 1;
+    }
+    let sth = sa_http_client_req_add_header_v2(reqh as ptr, PTR_BYTE_ADD(&kb, 0), kn as u64, PTR_BYTE_ADD(&vb, 0), vn as u64);
+    return sth;
+}
+
+fn __psa_urlb_open(req0: PsaVal, timeout: PsaVal) -> PsaVal {
+    let url = __psa_dict_get(req0, __psa_urlb_lit_url());
+    let data = __psa_dict_get(req0, __psa_urlb_lit_data());
+    let headers = __psa_dict_get(req0, __psa_urlb_lit_headers());
+    let method = psa_urllib_request_get_method(req0);
+    // timeout -> milliseconds (or -1 for none)
+    let timeout_ms: i64 = -1;
+    if timeout.tag == 1 {
+        if timeout.fpay < 0.0 { panic(77188); };
+        timeout_ms = (timeout.fpay * 1000.0) as i64;
+    };
+    if timeout.tag == 0 {
+        if timeout.ipay < 0 { panic(77188); };
+        timeout_ms = timeout.ipay * 1000;
+    };
+    if timeout.tag != 3 {
+        if timeout.tag != 1 {
+            if timeout.tag != 0 { panic(77188); };
+        };
+    };
+    let hops: i64 = 0;
+    let finished: bool = false;
+    let result = __psa_m_none();
+    while finished == false {
+        let parts = __psa_urlb_split_raw(url);
+        let scheme = __psa_urlb_part(parts, 0);
+        let use_tls: u8 = 0;
+        let scheme_ok: bool = false;
+        if __psa_urlb_len(scheme) == 4 {
+            // "http"
+            if __psa_urlb_byte(scheme, 0) == 104 {
+                if __psa_urlb_byte(scheme, 1) == 116 {
+                    if __psa_urlb_byte(scheme, 2) == 116 {
+                        if __psa_urlb_byte(scheme, 3) == 112 { scheme_ok = true; };
+                    };
+                };
+            };
+        };
+        if __psa_urlb_len(scheme) == 5 {
+            // "https"
+            if __psa_urlb_byte(scheme, 0) == 104 {
+                if __psa_urlb_byte(scheme, 1) == 116 {
+                    if __psa_urlb_byte(scheme, 2) == 116 {
+                        if __psa_urlb_byte(scheme, 3) == 112 {
+                            if __psa_urlb_byte(scheme, 4) == 115 { scheme_ok = true; use_tls = 1; };
+                        };
+                    };
+                };
+            };
+        };
+        if scheme_ok == false { panic(77186); };
+        if __psa_urlb_len(__psa_urlb_part(parts, 1)) == 0 { panic(77186); };
+        let ca = [0u8; 1];
+        let outc = [0u64; 1];
+        let stc = sa_http_client_new_v2(use_tls, PTR_BYTE_ADD(&ca, 0), 0, &outc[0]);
+        if stc != 0 { panic(77186); };
+        let client = outc[0] as i64;
+        // stage the URL
+        let ubuf = [0u8; 4096];
+        let un = __psa_urlb_len(url);
+        if un > 4096 { __psa_urlb_free_handles(client, 0, 0); panic(77186); };
+        let ui: i64 = 0;
+        while ui < un {
+            let __ix = ui as u64;
+            ubuf[__ix] = __psa_urlb_byte(url, ui);
+            ui = ui + 1;
+        }
+        let mcode = __psa_urlb_method_code(method);
+        let outr = [0u64; 1];
+        let str = sa_http_client_req_new_v2(client as ptr, mcode, PTR_BYTE_ADD(&ubuf, 0), un as u64, &outr[0]);
+        if str != 0 { __psa_urlb_free_handles(client, 0, 0); panic(77186); };
+        let reqh = outr[0] as i64;
+        // headers
+        let has_ct: bool = false;
+        let hn = __psa_dict_len(headers);
+        let hi: i64 = 0;
+        while hi < hn {
+            let k = __psa_dict_key_at(headers, hi);
+            let v = __psa_dict_val_at(headers, hi);
+            if k.tag != 6 { __psa_urlb_free_handles(client, reqh, 0); panic(77188); };
+            if v.tag != 6 { __psa_urlb_free_handles(client, reqh, 0); panic(77188); };
+            if __psa_str_eq(__psa_urlb_lower(k), __psa_urlb_lower(__psa_urlb_lit_content_type())) { has_ct = true; };
+            let sthh = __psa_urlb_add_header(reqh, k, v);
+            if sthh != 0 { __psa_urlb_free_handles(client, reqh, 0); panic(77186); };
+            hi = hi + 1;
+        }
+        // body (with CPython's default content type)
+        if data.tag == 6 {
+            if has_ct == false {
+                let ct = __psa_urlb_lit_content_type();
+                let cv = __psa_urlb_lit_form_ct();
+                let kb = [0u8; 1024];
+                let kn = __psa_urlb_len(ct);
+                let ki: i64 = 0;
+                while ki < kn {
+                    let __ix = ki as u64;
+                    kb[__ix] = __psa_urlb_byte(ct, ki);
+                    ki = ki + 1;
+                }
+                let vb = [0u8; 1024];
+                let vn = __psa_urlb_len(cv);
+                let vi: i64 = 0;
+                while vi < vn {
+                    let __ix = vi as u64;
+                    vb[__ix] = __psa_urlb_byte(cv, vi);
+                    vi = vi + 1;
+                }
+                let sth = sa_http_client_req_add_header_v2(reqh as ptr, PTR_BYTE_ADD(&kb, 0), kn as u64, PTR_BYTE_ADD(&vb, 0), vn as u64);
+                if sth != 0 { __psa_urlb_free_handles(client, reqh, 0); panic(77186); };
+            };
+            let bbuf = [0u8; 4096];
+            let bn = __psa_urlb_len(data);
+            if bn > 4096 { __psa_urlb_free_handles(client, reqh, 0); panic(77186); };
+            let bi: i64 = 0;
+            while bi < bn {
+                let __ix = bi as u64;
+                bbuf[__ix] = __psa_urlb_byte(data, bi);
+                bi = bi + 1;
+            }
+            let stb = sa_http_client_req_set_body_v2(reqh as ptr, PTR_BYTE_ADD(&bbuf, 0), bn as u64);
+            if stb != 0 { __psa_urlb_free_handles(client, reqh, 0); panic(77186); };
+        };
+        if timeout_ms >= 0 {
+            sa_http_client_req_set_timeout_v2(reqh as ptr, timeout_ms as u32);
+        };
+        let outresp = [0u64; 1];
+        let sts = sa_http_client_req_send_v2(reqh as ptr, &outresp[0]);
+        if sts != 0 { __psa_urlb_free_handles(client, reqh, 0); panic(77186); };
+        let resp = outresp[0] as i64;
+        let code = sa_http_client_resp_status(resp as ptr) as i64;
+        // redirect?
+        let is_redir: bool = false;
+        if code == 301 { is_redir = true; };
+        if code == 302 { is_redir = true; };
+        if code == 303 { is_redir = true; };
+        if code == 307 { is_redir = true; };
+        if code == 308 { is_redir = true; };
+        let followed: bool = false;
+        if is_redir {
+            let loc = __psa_urlb_resp_header(resp, __psa_urlb_lit_location());
+            if loc.tag == 6 {
+                hops = hops + 1;
+                if hops > 10 { __psa_urlb_free_handles(client, reqh, resp); panic(77187); };
+                let new_url = psa_urllib_parse_urljoin(url, loc);
+                if code == 303 {
+                    if __psa_str_eq(__psa_urlb_upper(method), __psa_urlb_lit_head()) == false {
+                        method = __psa_urlb_lit_get();
+                        data = __psa_m_none();
+                    };
+                };
+                if code == 301 {
+                    if __psa_str_eq(__psa_urlb_upper(method), __psa_urlb_lit_post()) {
+                        method = __psa_urlb_lit_get();
+                        data = __psa_m_none();
+                    };
+                };
+                if code == 302 {
+                    if __psa_str_eq(__psa_urlb_upper(method), __psa_urlb_lit_post()) {
+                        method = __psa_urlb_lit_get();
+                        data = __psa_m_none();
+                    };
+                };
+                url = new_url;
+                __psa_urlb_free_handles(client, reqh, resp);
+                followed = true;
+            };
+        };
+        if followed == false {
+            if code >= 400 { __psa_urlb_free_handles(client, reqh, resp); panic(77187); };
+            // success: copy the body out
+            let outb = [0u64; 1];
+            let outbl = [0u64; 1];
+            let stb2 = sa_http_client_resp_body_slice(resp as ptr, &outb[0], &outbl[0]);
+            let body = __psa_str_new();
+            if stb2 == 0 {
+                let bi2: u64 = 0;
+                while bi2 < outbl[0] {
+                    body = __psa_str_push(body, PTR_BYTE_AT(outb[0] as ptr, bi2));
+                    bi2 = bi2 + 1;
+                }
+            };
+            let rec = __psa_dict_new();
+            __psa_dict_set(rec, __psa_urlb_lit_psaresp(), __psa_box_int(1));
+            __psa_dict_set(rec, __psa_urlb_lit_status(), __psa_box_int(code));
+            __psa_dict_set(rec, __psa_urlb_lit_body(), body);
+            __psa_dict_set(rec, __psa_urlb_lit_pos(), __psa_box_int(0));
+            __psa_dict_set(rec, __psa_urlb_lit_url(), url);
+            __psa_dict_set(rec, __psa_urlb_lit_resp(), __psa_box_int(resp));
+            __psa_dict_set(rec, __psa_urlb_lit_client(), __psa_box_int(client));
+            __psa_dict_set(rec, __psa_urlb_lit_req(), __psa_box_int(reqh));
+            result = rec;
+            finished = true;
+        };
+    }
+    return result;
+}
+
+fn psa_urllib_urlopen(url: PsaVal) -> PsaVal {
+    return psa_urllib_urlopen_full(url, __psa_m_none(), __psa_m_none());
+}
+
+fn psa_urllib_urlopen_data(url: PsaVal, data: PsaVal) -> PsaVal {
+    return psa_urllib_urlopen_full(url, data, __psa_m_none());
+}
+
+fn psa_urllib_urlopen_full(url: PsaVal, data: PsaVal, timeout: PsaVal) -> PsaVal {
+    let req = __psa_m_none();
+    if url.tag == 6 {
+        req = __psa_urlb_req_rec(url, data, __psa_m_none(), __psa_m_none());
+    } else {
+        if url.tag == 5 {
+            req = __psa_urlb_req_check(url);
+            if data.tag != 3 {
+                __psa_dict_set(req, __psa_urlb_lit_data(), data);
+            };
+        } else {
+            panic(77188);
+        };
+    };
+    return __psa_urlb_open(req, timeout);
+}
+
+// ---- response surface ----
+
+fn psa_urllib_getcode(resp: PsaVal) -> PsaVal {
+    let rec = __psa_urlb_resp_check(resp);
+    return __psa_dict_get(rec, __psa_urlb_lit_status());
+}
+
+fn psa_urllib_geturl(resp: PsaVal) -> PsaVal {
+    let rec = __psa_urlb_resp_check(resp);
+    return __psa_dict_get(rec, __psa_urlb_lit_url());
+}
+
+fn psa_urllib_read(resp: PsaVal) -> PsaVal {
+    return psa_urllib_read_n(resp, __psa_box_int(-1));
+}
+
+fn psa_urllib_read_n(resp: PsaVal, n: PsaVal) -> PsaVal {
+    let rec = __psa_urlb_resp_check(resp);
+    if n.tag != 0 { panic(77188); };
+    let pos = __psa_dict_get(rec, __psa_urlb_lit_pos());
+    if pos.ipay < 0 { panic(77188); };
+    let body = __psa_dict_get(rec, __psa_urlb_lit_body());
+    let total = __psa_urlb_len(body);
+    let take = total - pos.ipay;
+    if n.ipay >= 0 {
+        if n.ipay < take { take = n.ipay; };
+    };
+    let out = __psa_urlb_range(body, pos.ipay, pos.ipay + take);
+    __psa_dict_set(rec, __psa_urlb_lit_pos(), __psa_box_int(pos.ipay + take));
+    return out;
+}
+
+fn psa_urllib_readline(resp: PsaVal) -> PsaVal {
+    let rec = __psa_urlb_resp_check(resp);
+    let pos = __psa_dict_get(rec, __psa_urlb_lit_pos());
+    if pos.ipay < 0 { panic(77188); };
+    let body = __psa_dict_get(rec, __psa_urlb_lit_body());
+    let total = __psa_urlb_len(body);
+    let end = total;
+    let i = pos.ipay;
+    let scanning: bool = true;
+    while scanning {
+        if i >= total { scanning = false; } else {
+            if __psa_urlb_byte(body, i) == 10 { end = i + 1; scanning = false; } else { i = i + 1; };
+        };
+    }
+    let out = __psa_urlb_range(body, pos.ipay, end);
+    __psa_dict_set(rec, __psa_urlb_lit_pos(), __psa_box_int(end));
+    return out;
+}
+
+fn psa_urllib_getheader(resp: PsaVal, name: PsaVal) -> PsaVal {
+    return psa_urllib_getheader_default(resp, name, __psa_m_none());
+}
+
+fn psa_urllib_getheader_default(resp: PsaVal, name: PsaVal, default: PsaVal) -> PsaVal {
+    let rec = __psa_urlb_resp_check(resp);
+    if name.tag != 6 { panic(77188); };
+    let h = __psa_dict_get(rec, __psa_urlb_lit_resp());
+    if h.ipay == 0 { panic(77188); };
+    let v = __psa_urlb_resp_header(h.ipay, name);
+    if v.tag == 3 { return default; };
+    return v;
+}
+
+// info() cannot be carried honestly: the base
+// client exposes response headers by name only
+// and offers no enumeration, so there is no
+// headers mapping to return. Loud refusal
+// (77188), registered in README-urllib.md.
+fn psa_urllib_info(resp: PsaVal) -> PsaVal {
+    panic(77188);
+}
+
+fn psa_urllib_close(resp: PsaVal) -> PsaVal {
+    let rec = __psa_urlb_resp_check(resp);
+    let r = __psa_dict_get(rec, __psa_urlb_lit_resp());
+    let c = __psa_dict_get(rec, __psa_urlb_lit_client());
+    let q = __psa_dict_get(rec, __psa_urlb_lit_req());
+    __psa_urlb_free_handles(c.ipay, q.ipay, r.ipay);
+    __psa_dict_set(rec, __psa_urlb_lit_resp(), __psa_box_int(0));
+    __psa_dict_set(rec, __psa_urlb_lit_client(), __psa_box_int(0));
+    __psa_dict_set(rec, __psa_urlb_lit_req(), __psa_box_int(0));
+    __psa_dict_set(rec, __psa_urlb_lit_pos(), __psa_box_int(-1));
+    return __psa_m_none();
+}

@@ -1,0 +1,379 @@
+// psa_std math (L1): the honest subset of CPython's math
+// module over PsaVal. See README.md for the module contract.
+// Panic codes: 77132 argument of the wrong type (CPython
+// TypeError), 77133 domain error (CPython ValueError),
+// 77134 range error (CPython OverflowError, including the
+// i64 boundary CPython's bigint would cross silently).
+//
+// Coverage rule: a function is here only if the current
+// runtime surface computes it exactly. Integer functions
+// are exact i64 arithmetic with overflow checks. Float
+// functions ride the sa_std libm externs (sa_math_pow /
+// sa_math_sqrt / sa_math_sin / sa_math_cos), which is the
+// same libm CPython's math module calls, so results agree
+// bit for bit on the same machine. Anything that would
+// need the float-repr builder (defect (xxiii)), Vec<f64>
+// (defect (xxiv)) or a libm entry sa_std does not export
+// (exp / log / tan / hypot / ...) is NOT here: see the
+// README's not-covered list. No silent approximations.
+//
+// Divergences from CPython, all loud: integers are i64, so
+// factorial / comb / perm / lcm panic 77134 where CPython's
+// bigint would return a larger value; floor / ceil / trunc
+// of a float outside the i64 range panic 77134 (CPython
+// returns a bigint); gcd / lcm with an i64::MIN operand
+// panic 77134 (its absolute value is not representable).
+
+fn __psa_math_int(v: PsaVal) -> i64 {
+    // CPython's integer math functions accept int (bool is
+    // an int subclass); a float argument is a TypeError
+    // there even when integral, and so it is here.
+    if v.tag == 0 { return v.ipay; };
+    if v.tag == 2 { return v.ipay; };
+    panic(77132);
+}
+
+fn __psa_math_num(v: PsaVal) -> f64 {
+    if v.tag == 1 { return v.fpay; };
+    if v.tag == 0 { return v.ipay as f64; };
+    if v.tag == 2 { return v.ipay as f64; };
+    panic(77132);
+}
+
+fn __psa_math_finite(f: f64) -> bool {
+    // f - f is 0.0 exactly for finite f, and NaN for
+    // NaN and for both infinities.
+    return f - f == 0.0;
+}
+
+fn __psa_math_gcd2(a: i64, b: i64) -> i64 {
+    // Euclid on non-negative inputs.
+    let x = a;
+    let y = b;
+    while y != 0 {
+        let r = x % y;
+        x = y;
+        y = r;
+    }
+    return x;
+}
+
+fn __psa_math_abs(v: PsaVal) -> i64 {
+    // Absolute value of an integer argument; i64::MIN has
+    // no representable absolute value (see header).
+    let n = __psa_math_int(v);
+    if n == -9223372036854775807 - 1 { panic(77134); };
+    if n < 0 { return -n; };
+    return n;
+}
+
+// ---- rounding: CPython returns int for all three ----
+
+fn psa_math_floor(v: PsaVal) -> PsaVal {
+    // math.floor(x): largest int <= x. Int in, int out.
+    if v.tag == 0 { return v; };
+    if v.tag == 2 { return __psa_box_int(v.ipay); };
+    if v.tag == 1 {
+        let f = v.fpay;
+        if f != f { panic(77133); };
+        if f >= 9223372036854775808.0 { panic(77134); };
+        if f < -9223372036854775808.0 { panic(77134); };
+        let q = __psa_dyn_floor_f(f);
+        return __psa_box_int(q as i64);
+    };
+    panic(77132);
+}
+
+fn psa_math_ceil(v: PsaVal) -> PsaVal {
+    // math.ceil(x): smallest int >= x, via -floor(-x),
+    // which is exact on doubles.
+    if v.tag == 0 { return v; };
+    if v.tag == 2 { return __psa_box_int(v.ipay); };
+    if v.tag == 1 {
+        let f = v.fpay;
+        if f != f { panic(77133); };
+        if f >= 9223372036854775808.0 { panic(77134); };
+        if f < -9223372036854775808.0 { panic(77134); };
+        let q = -__psa_dyn_floor_f(-f);
+        return __psa_box_int(q as i64);
+    };
+    panic(77132);
+}
+
+fn psa_math_trunc(v: PsaVal) -> PsaVal {
+    // math.trunc(x): x rounded toward zero to an int.
+    // The SLA float->int cast truncates, as in json.sla.
+    if v.tag == 0 { return v; };
+    if v.tag == 2 { return __psa_box_int(v.ipay); };
+    if v.tag == 1 {
+        let f = v.fpay;
+        if f != f { panic(77133); };
+        if f >= 9223372036854775808.0 { panic(77134); };
+        if f < -9223372036854775808.0 { panic(77134); };
+        return __psa_box_int(f as i64);
+    };
+    panic(77132);
+}
+
+// ---- float functions on the libm surface ----
+
+fn psa_math_fabs(v: PsaVal) -> PsaVal {
+    // math.fabs(x): absolute value, always a float
+    // (math.fabs(3) == 3.0 in CPython).
+    let f = __psa_math_num(v);
+    if f < 0.0 { return __psa_box_float(-f); };
+    return __psa_box_float(f);
+}
+
+fn psa_math_sqrt(v: PsaVal) -> PsaVal {
+    // math.sqrt(x): ValueError on a negative input;
+    // sqrt(inf) == inf and sqrt(nan) == nan pass through.
+    let f = __psa_math_num(v);
+    if f < 0.0 { panic(77133); };
+    return __psa_box_float(sa_math_sqrt(f));
+}
+
+fn psa_math_sin(v: PsaVal) -> PsaVal {
+    // math.sin(x): ValueError when x is infinite (libm
+    // returns NaN there); sin(nan) == nan passes through.
+    let f = __psa_math_num(v);
+    let r = sa_math_sin(f);
+    if r != r {
+        if f == f { panic(77133); };
+    };
+    return __psa_box_float(r);
+}
+
+fn psa_math_cos(v: PsaVal) -> PsaVal {
+    // math.cos(x): same domain shape as sin.
+    let f = __psa_math_num(v);
+    let r = sa_math_cos(f);
+    if r != r {
+        if f == f { panic(77133); };
+    };
+    return __psa_box_float(r);
+}
+
+fn psa_math_degrees(v: PsaVal) -> PsaVal {
+    // math.degrees(x) == x * (180 / pi); the factor is
+    // computed from the same double pi CPython uses.
+    let f = __psa_math_num(v);
+    return __psa_box_float(f * (180.0 / 3.141592653589793));
+}
+
+fn psa_math_radians(v: PsaVal) -> PsaVal {
+    // math.radians(x) == x * (pi / 180).
+    let f = __psa_math_num(v);
+    return __psa_box_float(f * (3.141592653589793 / 180.0));
+}
+
+fn __psa_math_ipow(a: i64, e: i64) -> (i64, bool) {
+    // Checked integer power for e >= 0: (a**e, true), or
+    // (0, false) when the exact result leaves i64. The
+    // accumulation runs on the magnitude, where the
+    // division-based overflow check is direction-safe;
+    // the sign is applied at the end. A magnitude of
+    // exactly 2^63 (a negative result of i64::MIN, e.g.
+    // (-2)**63) is reported as overflow and left to the
+    // libm path, which represents it exactly.
+    if e == 0 { return (1, true); };
+    if e == 1 { return (a, true); };
+    if a == -9223372036854775807 - 1 { return (0, false); };
+    let ma = a;
+    if ma < 0 { ma = -a; };
+    let r: i64 = 1;
+    let b = ma;
+    let n = e;
+    while n > 0 {
+        if (n & 1) == 1 {
+            if b != 0 {
+                if r > 9223372036854775807 / b { return (0, false); };
+            };
+            r = r * b;
+        };
+        n = n >> 1;
+        if n > 0 {
+            if b != 0 {
+                if b > 9223372036854775807 / b { return (0, false); };
+            };
+            b = b * b;
+        };
+    }
+    if a < 0 {
+        if (e & 1) == 1 { return (-r, true); };
+    };
+    return (r, true);
+}
+
+fn psa_math_pow(x: PsaVal, y: PsaVal) -> PsaVal {
+    // math.pow(x, y): always a float in CPython (unlike
+    // the ** operator). Integer path: int base, int
+    // non-negative exponent and an i64-fitting result are
+    // computed exactly and converted; anything else goes
+    // to libm pow, which CPython also calls. Domain:
+    // pow(0, negative) and a negative base with a
+    // fractional exponent are ValueError (77133); a finite
+    // overflow of the double range is OverflowError
+    // (77134). pow(1, nan) == 1.0 and pow(nan, 0) == 1.0
+    // fall out of libm, as in CPython.
+    if x.tag == 0 || x.tag == 2 {
+        if y.tag == 0 || y.tag == 2 {
+            if y.ipay >= 0 {
+                let (r, ok) = __psa_math_ipow(x.ipay, y.ipay);
+                if ok { return __psa_box_float(r as f64); };
+            };
+        };
+    };
+    let fx = __psa_math_num(x);
+    let fy = __psa_math_num(y);
+    if fx == 0.0 {
+        if fy < 0.0 { panic(77133); };
+        if fy == 0.0 { return __psa_box_float(1.0); };
+        return __psa_box_float(0.0);
+    };
+    let r = sa_math_pow(fx, fy);
+    if r != r {
+        if fx == fx {
+            if fy == fy { panic(77133); };
+        };
+        return __psa_box_float(r);
+    };
+    if !(__psa_math_finite(r)) {
+        if __psa_math_finite(fx) {
+            if __psa_math_finite(fy) { panic(77134); };
+        };
+    };
+    return __psa_box_float(r);
+}
+
+fn psa_math_isclose(a: PsaVal, b: PsaVal) -> PsaVal {
+    // math.isclose with the CPython default tolerances
+    // (rel_tol=1e-09, abs_tol=0.0): |a-b| <= rel_tol *
+    // max(|a|, |b|). Equal values (including same-signed
+    // infinities) are close; NaN is close to nothing.
+    let fa = __psa_math_num(a);
+    let fb = __psa_math_num(b);
+    if fa == fb { return __psa_box_bool(true); };
+    if fa != fa { return __psa_box_bool(false); };
+    if fb != fb { return __psa_box_bool(false); };
+    let da = fa - fb;
+    let diff = da;
+    if diff < 0.0 { diff = -da; };
+    let ma = fa;
+    if ma < 0.0 { ma = -fa; };
+    let mb = fb;
+    if mb < 0.0 { mb = -fb; };
+    let m = ma;
+    if mb > m { m = mb; };
+    return __psa_box_bool(diff <= 0.000000001 * m);
+}
+
+// ---- exact integer functions ----
+
+fn psa_math_gcd(a: PsaVal, b: PsaVal) -> PsaVal {
+    // math.gcd: non-negative greatest common divisor;
+    // gcd(0, 0) == 0.
+    let x = __psa_math_abs(a);
+    let y = __psa_math_abs(b);
+    return __psa_box_int(__psa_math_gcd2(x, y));
+}
+
+fn psa_math_lcm(a: PsaVal, b: PsaVal) -> PsaVal {
+    // math.lcm: non-negative least common multiple;
+    // lcm with a zero argument is 0.
+    let x = __psa_math_abs(a);
+    let y = __psa_math_abs(b);
+    if x == 0 { return __psa_box_int(0); };
+    if y == 0 { return __psa_box_int(0); };
+    let g = __psa_math_gcd2(x, y);
+    let q = x / g;
+    if q > 9223372036854775807 / y { panic(77134); };
+    return __psa_box_int(q * y);
+}
+
+fn psa_math_factorial(v: PsaVal) -> PsaVal {
+    // math.factorial(n): ValueError on a negative input;
+    // 21! and beyond leave i64 and panic 77134 (CPython
+    // returns a bigint there -- registered divergence).
+    let n = __psa_math_int(v);
+    if n < 0 { panic(77133); };
+    let r: i64 = 1;
+    let i: i64 = 2;
+    while i <= n {
+        if r > 9223372036854775807 / i { panic(77134); };
+        r = r * i;
+        i = i + 1;
+    }
+    return __psa_box_int(r);
+}
+
+fn psa_math_isqrt(v: PsaVal) -> PsaVal {
+    // math.isqrt(n): exact floor of the square root.
+    // Binary search comparing mid <= n / mid, so no
+    // intermediate ever overflows.
+    let n = __psa_math_int(v);
+    if n < 0 { panic(77133); };
+    let lo: i64 = 0;
+    let hi = n;
+    if hi > 3037000500 { hi = 3037000500; };
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        if mid <= n / mid {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        };
+    }
+    return __psa_box_int(lo);
+}
+
+fn psa_math_comb(nv: PsaVal, kv: PsaVal) -> PsaVal {
+    // math.comb(n, k): binomial coefficient; ValueError
+    // on negative inputs, 0 when k > n. The iterative
+    // product divides at every step (each intermediate
+    // is itself a binomial coefficient, hence integral),
+    // with factors reduced by gcd first so the overflow
+    // check is exact.
+    let n = __psa_math_int(nv);
+    let k0 = __psa_math_int(kv);
+    if n < 0 { panic(77133); };
+    if k0 < 0 { panic(77133); };
+    if k0 > n { return __psa_box_int(0); };
+    let k = k0;
+    if k > n - k { k = n - k; };
+    let r: i64 = 1;
+    let i: i64 = 1;
+    while i <= k {
+        let num = n - k + i;
+        let g1 = __psa_math_gcd2(r, i);
+        let r2 = r / g1;
+        let i1 = i / g1;
+        let g2 = __psa_math_gcd2(num, i1);
+        let num2 = num / g2;
+        // i1 / g2 == 1 here: i divides r * num exactly,
+        // and what remains of it is coprime to both.
+        if r2 > 9223372036854775807 / num2 { panic(77134); };
+        r = r2 * num2;
+        i = i + 1;
+    }
+    return __psa_box_int(r);
+}
+
+fn psa_math_perm(nv: PsaVal, kv: PsaVal) -> PsaVal {
+    // math.perm(n, k): n! / (n-k)!; ValueError on
+    // negative inputs, 0 when k > n.
+    let n = __psa_math_int(nv);
+    let k = __psa_math_int(kv);
+    if n < 0 { panic(77133); };
+    if k < 0 { panic(77133); };
+    if k > n { return __psa_box_int(0); };
+    let r: i64 = 1;
+    let i: i64 = 0;
+    while i < k {
+        let f = n - i;
+        if r > 9223372036854775807 / f { panic(77134); };
+        r = r * f;
+        i = i + 1;
+    }
+    return __psa_box_int(r);
+}

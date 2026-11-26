@@ -1,0 +1,15 @@
+import itertools
+def add(a, b):
+    return a + b
+xs = []
+xs.append(1)
+xs.append(2)
+xs.append(3)
+print(itertools.accumulate(xs))
+print(itertools.accumulate(xs, add))
+ys = []
+ys.append(1)
+ys.append(2)
+ys.append(3)
+ys.append(4)
+print(itertools.takewhile(lambda x: x < 3, ys))

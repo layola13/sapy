@@ -1,0 +1,208 @@
+// psa_std string (L1): the honest subset of CPython's
+// string module over PsaVal. See README.md for the
+// module contract. Panic codes: 77135 argument of the
+// wrong type (CPython TypeError), 77136 bad value
+// (CPython ValueError: an empty separator).
+//
+// The module's constants are provided as zero-argument
+// entry points returning dyn strs (psa_string_digits()
+// and so on): psa's emitter wires std-module *calls*
+// today, while attribute reads of std modules
+// (`string.digits` without a call) are not wired yet --
+// see the README. capwords is the module's one pure
+// function and is wired for `string.capwords(...)`.
+//
+// Case work is ASCII-only, the registered stance of the
+// runtime's str method set (D5): bytes >= 0x80 pass
+// through unchanged, where CPython would case-map and
+// split on Unicode whitespace.
+
+fn __psa_string_str(v: PsaVal) -> void {
+    if v.tag != 6 { panic(77135); };
+    return;
+}
+
+fn __psa_string_range(s: PsaVal, lo: i64, hi: i64) -> PsaVal {
+    // Append the byte codes lo..=hi to s.
+    let out = s;
+    let c = lo;
+    while c <= hi {
+        out = __psa_str_push(out, c as u8);
+        c = c + 1;
+    }
+    return out;
+}
+
+fn psa_string_ascii_lowercase() -> PsaVal {
+    // "abcdefghijklmnopqrstuvwxyz"
+    return __psa_string_range(__psa_str_new(), 97, 122);
+}
+
+fn psa_string_ascii_uppercase() -> PsaVal {
+    // "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    return __psa_string_range(__psa_str_new(), 65, 90);
+}
+
+fn psa_string_ascii_letters() -> PsaVal {
+    // ascii_lowercase + ascii_uppercase (CPython order).
+    let s = __psa_string_range(__psa_str_new(), 97, 122);
+    return __psa_string_range(s, 65, 90);
+}
+
+fn psa_string_digits() -> PsaVal {
+    // "0123456789"
+    return __psa_string_range(__psa_str_new(), 48, 57);
+}
+
+fn psa_string_hexdigits() -> PsaVal {
+    // "0123456789abcdefABCDEF" (CPython order).
+    let s = __psa_string_range(__psa_str_new(), 48, 57);
+    s = __psa_string_range(s, 97, 102);
+    return __psa_string_range(s, 65, 70);
+}
+
+fn psa_string_octdigits() -> PsaVal {
+    // "01234567"
+    return __psa_string_range(__psa_str_new(), 48, 55);
+}
+
+fn __psa_string_punct(s: PsaVal) -> PsaVal {
+    // The four ASCII punctuation ranges:
+    // !"#$%&'()*+,-./  :;<=>?@  [\]^_`  {|}~
+    let out = __psa_string_range(s, 33, 47);
+    out = __psa_string_range(out, 58, 64);
+    out = __psa_string_range(out, 91, 96);
+    return __psa_string_range(out, 123, 126);
+}
+
+fn psa_string_punctuation() -> PsaVal {
+    return __psa_string_punct(__psa_str_new());
+}
+
+fn __psa_string_ws(s: PsaVal) -> PsaVal {
+    // " \t\n\r\x0b\x0c" (CPython order).
+    let out = __psa_str_push(s, 32u8);
+    out = __psa_str_push(out, 9u8);
+    out = __psa_str_push(out, 10u8);
+    out = __psa_str_push(out, 13u8);
+    out = __psa_str_push(out, 11u8);
+    return __psa_str_push(out, 12u8);
+}
+
+fn psa_string_whitespace() -> PsaVal {
+    return __psa_string_ws(__psa_str_new());
+}
+
+fn psa_string_printable() -> PsaVal {
+    // digits + ascii_letters + punctuation + whitespace
+    // (CPython's composition and order).
+    let s = __psa_string_range(__psa_str_new(), 48, 57);
+    s = __psa_string_range(s, 97, 122);
+    s = __psa_string_range(s, 65, 90);
+    s = __psa_string_punct(s);
+    return __psa_string_ws(s);
+}
+
+// ---- capwords ----
+
+fn __psa_string_upper_byte(b: i64) -> u8 {
+    if b >= 97 && b <= 122 { return (b - 32) as u8; };
+    return b as u8;
+}
+
+fn __psa_string_lower_byte(b: i64) -> u8 {
+    if b >= 65 && b <= 90 { return (b + 32) as u8; };
+    return b as u8;
+}
+
+fn __psa_string_capitalize(v: PsaVal) -> PsaVal {
+    // str.capitalize on bytes: first byte upper-cased,
+    // the rest lower-cased (ASCII-only, see header).
+    let out = __psa_str_new();
+    let n = __psa_bytes_len_h(v.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        let b = __psa_bytes_get_h(v.ipay as ptr, i) as i64;
+        if i == 0 {
+            out = __psa_str_push(out, __psa_string_upper_byte(b));
+        } else {
+            out = __psa_str_push(out, __psa_string_lower_byte(b));
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+fn psa_string_capwords(v: PsaVal) -> PsaVal {
+    // string.capwords(s): split on runs of whitespace,
+    // capitalize each word, join with single spaces.
+    // Leading/trailing whitespace disappears (CPython's
+    // split() drops the empty pieces).
+    __psa_string_str(v);
+    let out = __psa_str_new();
+    let n = __psa_bytes_len_h(v.ipay as ptr);
+    let i: i64 = 0;
+    let in_word = false;
+    let pending_space = false;
+    while i < n {
+        let b = __psa_bytes_get_h(v.ipay as ptr, i) as i64;
+        if __psa_str_is_space(b) {
+            if in_word {
+                in_word = false;
+                pending_space = true;
+            };
+        } else {
+            if !(in_word) {
+                if pending_space {
+                    out = __psa_str_push(out, 32u8);
+                    pending_space = false;
+                };
+                in_word = true;
+                out = __psa_str_push(out, __psa_string_upper_byte(b));
+            } else {
+                out = __psa_str_push(out, __psa_string_lower_byte(b));
+            };
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+fn psa_string_capwords_sep(v: PsaVal, sep: PsaVal) -> PsaVal {
+    // string.capwords(s, sep): split on the exact
+    // separator (empty pieces are kept, as str.split
+    // with a separator does), capitalize each piece,
+    // join with the separator. An empty separator is
+    // CPython's ValueError. Separator matching is at
+    // byte level; for a valid UTF-8 separator that can
+    // only match at code-point boundaries (UTF-8 is
+    // self-synchronizing).
+    __psa_string_str(v);
+    __psa_string_str(sep);
+    let sn = __psa_bytes_len_h(sep.ipay as ptr);
+    if sn == 0 { panic(77136); };
+    let n = __psa_bytes_len_h(v.ipay as ptr);
+    let out = __psa_str_new();
+    let piece = __psa_str_new();
+    let first = true;
+    let i: i64 = 0;
+    while i < n {
+        let matched = false;
+        if i + sn <= n {
+            if __psa_str_match_at(v, sep, i) { matched = true; };
+        };
+        if matched {
+            if !(first) { out = __psa_str_append_str(out, sep); };
+            first = false;
+            out = __psa_str_append_str(out, __psa_string_capitalize(piece));
+            piece = __psa_str_new();
+            i = i + sn;
+        } else {
+            piece = __psa_str_push(piece, __psa_bytes_get_h(v.ipay as ptr, i));
+            i = i + 1;
+        };
+    }
+    if !(first) { out = __psa_str_append_str(out, sep); };
+    out = __psa_str_append_str(out, __psa_string_capitalize(piece));
+    return out;
+}

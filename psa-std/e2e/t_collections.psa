@@ -1,0 +1,5 @@
+import collections
+print(collections.Counter(["a", "b", "b"]))
+c = collections.Counter(["a", "b", "b"])
+print(collections.counter_get(c, "b"))
+print(collections.counter_total(c))

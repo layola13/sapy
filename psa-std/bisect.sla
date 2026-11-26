@@ -1,0 +1,132 @@
+// psa_std bisect (L1): CPython's bisect module over
+// PsaVal. See README-bisect.md for the module contract.
+// Panic codes: 77156 argument of the wrong type (CPython
+// TypeError), 77157 bad value (CPython ValueError: a
+// negative lo). Element comparisons ride the runtime's
+// __psa_dyn_lt, whose own loud panic (77012) is the
+// surface for element pairs psa cannot order (mixed
+// str/number, tuples, lists) where CPython would compare
+// -- a runtime-surface limit, registered in the README
+// fragment, never a silent default.
+//
+// The entry points take (a, x, lo, hi) with hi allowed
+// to be None (tag 3), exactly CPython's defaults made
+// explicit; the emitter wiring pads omitted trailing
+// arguments (lo = 0, hi = None). CPython's `bisect` is
+// an alias of bisect_right and `insort` of insort_right;
+// both aliases are entry points here too. The key=
+// parameter (Python 3.10+) is NOT covered: see the
+// README fragment.
+
+fn __psa_bisect_seq(v: PsaVal) -> void {
+    // bisect works on any sequence; psa sequences with a
+    // dyn element surface are list (4), str (6) and
+    // tuple (10), read through __psa_iter_get.
+    if v.tag == 4 { return; };
+    if v.tag == 6 { return; };
+    if v.tag == 10 { return; };
+    panic(77156);
+}
+
+fn __psa_bisect_int(v: PsaVal) -> i64 {
+    if v.tag == 0 { return v.ipay; };
+    if v.tag == 2 { return v.ipay; };
+    panic(77156);
+}
+
+fn __psa_bisect_bounds(a: PsaVal, lo: PsaVal, hi: PsaVal) -> (i64, i64) {
+    // CPython: lo < 0 is a ValueError; hi defaults to
+    // len(a). A hi below lo is not an error (the search
+    // loop simply does not run, as in CPython).
+    let l = __psa_bisect_int(lo);
+    if l < 0 { panic(77157); };
+    let h: i64 = 0;
+    if hi.tag == 3 {
+        h = __psa_dyn_len(a);
+    } else {
+        h = __psa_bisect_int(hi);
+    };
+    return (l, h);
+}
+
+fn psa_bisect_bisect_left(a: PsaVal, x: PsaVal, lo: PsaVal, hi: PsaVal) -> PsaVal {
+    // bisect_left: insertion point to the left of any
+    // existing entries equal to x.
+    __psa_bisect_seq(a);
+    let (l, h) = __psa_bisect_bounds(a, lo, hi);
+    while l < h {
+        let mid = (l + h) / 2;
+        if __psa_dyn_lt(__psa_iter_get(a, mid), x) {
+            l = mid + 1;
+        } else {
+            h = mid;
+        };
+    }
+    return __psa_box_int(l);
+}
+
+fn psa_bisect_bisect_right(a: PsaVal, x: PsaVal, lo: PsaVal, hi: PsaVal) -> PsaVal {
+    // bisect_right: insertion point to the right of any
+    // existing entries equal to x.
+    __psa_bisect_seq(a);
+    let (l, h) = __psa_bisect_bounds(a, lo, hi);
+    while l < h {
+        let mid = (l + h) / 2;
+        if __psa_dyn_lt(x, __psa_iter_get(a, mid)) {
+            h = mid;
+        } else {
+            l = mid + 1;
+        };
+    }
+    return __psa_box_int(l);
+}
+
+fn psa_bisect_bisect(a: PsaVal, x: PsaVal, lo: PsaVal, hi: PsaVal) -> PsaVal {
+    // CPython's `bisect` is bisect_right under a second
+    // name.
+    return psa_bisect_bisect_right(a, x, lo, hi);
+}
+
+fn __psa_bisect_insert(a: PsaVal, pos: i64, x: PsaVal) -> void {
+    // Insert x at pos in the tag-4 list a, in place, by
+    // the runtime's own list.insert idiom (grow by one,
+    // shift the tail one slot right, store).
+    let n = __psa_list_len(a);
+    if pos >= n {
+        __psa_list_push(a, x);
+        return;
+    };
+    __psa_list_push(a, __psa_list_get(a, n - 1));
+    let i = n;
+    while i > pos {
+        __psa_list_set(a, i, __psa_list_get(a, i - 1));
+        i = i - 1;
+    }
+    __psa_list_set(a, pos, x);
+    return;
+}
+
+fn psa_bisect_insort_left(a: PsaVal, x: PsaVal, lo: PsaVal, hi: PsaVal) -> PsaVal {
+    // insort_left: bisect_left, then insert there. The
+    // sequence must be a mutable list (CPython calls
+    // a.insert, which tuples and strs do not have -- a
+    // TypeError there, 77156 here).
+    if a.tag != 4 { panic(77156); };
+    let pos = psa_bisect_bisect_left(a, x, lo, hi);
+    __psa_bisect_insert(a, pos.ipay, x);
+    return __psa_m_none();
+}
+
+fn psa_bisect_insort_right(a: PsaVal, x: PsaVal, lo: PsaVal, hi: PsaVal) -> PsaVal {
+    // insort_right: bisect_right, then insert there.
+    if a.tag != 4 { panic(77156); };
+    let pos = psa_bisect_bisect_right(a, x, lo, hi);
+    __psa_bisect_insert(a, pos.ipay, x);
+    return __psa_m_none();
+}
+
+fn psa_bisect_insort(a: PsaVal, x: PsaVal, lo: PsaVal, hi: PsaVal) -> PsaVal {
+    // CPython's `insort` is insort_right under a second
+    // name.
+    return psa_bisect_insort_right(a, x, lo, hi);
+}

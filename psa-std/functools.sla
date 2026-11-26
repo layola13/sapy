@@ -1,0 +1,146 @@
+// psa_std functools (L1): the honest subset of
+// CPython's functools module over PsaVal. See
+// README-functools.md for the module contract.
+// Panic codes: 77144 argument of the wrong type
+// (CPython TypeError -- including reduce of an
+// empty iterable with no initial value), 77146
+// argument not callable, 77148 registered-gap loud
+// refusal, 77149 non-iterable argument (shared
+// psa_std codes, see README.md).
+//
+// Why this module is mostly refusals: functools is
+// a library of CALLABLE FACTORIES -- partial,
+// lru_cache, cmp_to_key, total_ordering,
+// singledispatch and wraps all RETURN a new
+// callable or mutate one. A psa callable value is
+// a fixed function id (tag 7) or a bound method
+// (tag 9); user code cannot mint a new one at run
+// time, and psa lambdas refuse captures (D3), which
+// is exactly the state partial and lru_cache would
+// have to close over. There is no honest PsaVal
+// representation for their results, so each entry
+// point refuses loudly (77148) instead of returning
+// a look-alike that would fail later, elsewhere,
+// and silently-er. reduce -- the one member that
+// consumes a callable instead of manufacturing
+// one -- is fully implemented.
+
+fn __psa_functools_items(v: PsaVal) -> PsaVal {
+    if v.tag == 4 || v.tag == 5 || v.tag == 6 || v.tag == 10 || v.tag == 11 || v.tag == 13 {
+        return __psa_list_from(__psa_iter_source(v));
+    };
+    panic(77149);
+}
+
+fn __psa_functools_callable(f: PsaVal) -> void {
+    if f.tag == 7 { return; };
+    if f.tag == 9 { return; };
+    panic(77146);
+}
+
+fn __psa_functools_call2(f: PsaVal, x: PsaVal, y: PsaVal) -> PsaVal {
+    let args = __psa_list_new();
+    __psa_list_push(args, x);
+    __psa_list_push(args, y);
+    return __psa_call_value(f, args);
+}
+
+// ---- reduce (the implementable member) ----
+
+fn psa_functools_reduce(f: PsaVal, it: PsaVal) -> PsaVal {
+    // functools.reduce(func, iterable): fold left.
+    // An empty iterable with no initial value is
+    // CPython's TypeError (77144); a one-element
+    // iterable returns that element without ever
+    // calling func (CPython).
+    __psa_functools_callable(f);
+    let xs = __psa_functools_items(it);
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    if n == 0 { panic(77144); };
+    let acc = __psa_vec_get_h(xs.ipay as ptr, 0);
+    let i: i64 = 1;
+    while i < n {
+        acc = __psa_functools_call2(f, acc, __psa_vec_get_h(xs.ipay as ptr, i));
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn psa_functools_reduce_init(f: PsaVal, it: PsaVal, init: PsaVal) -> PsaVal {
+    // functools.reduce(func, iterable, initial):
+    // the fold starts from initial; an empty
+    // iterable returns initial itself.
+    __psa_functools_callable(f);
+    let xs = __psa_functools_items(it);
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    let acc = init;
+    let i: i64 = 0;
+    while i < n {
+        acc = __psa_functools_call2(f, acc, __psa_vec_get_h(xs.ipay as ptr, i));
+        i = i + 1;
+    }
+    return acc;
+}
+
+// ---- callable factories: registered gaps ----
+// Each stub below exists so that a program reaching
+// for the name fails HERE, loudly, with the reason
+// on record -- never with a fake object.
+
+fn psa_functools_partial(f: PsaVal, args: PsaVal) -> PsaVal {
+    // partial(func, *args) returns a NEW callable
+    // closing over args. psa cannot mint callables
+    // and its lambdas refuse captures (D3), so the
+    // result is unrepresentable. Spell it as a
+    // lambda or a def in the program itself.
+    panic(77148);
+}
+
+fn psa_functools_lru_cache(f: PsaVal) -> PsaVal {
+    // lru_cache is a decorator: it returns a
+    // wrapped callable with a memo table closed
+    // over. Unrepresentable for the same reason as
+    // partial (and the wrapper, not the cache, is
+    // the result). Memoize with an explicit dict
+    // in the program.
+    panic(77148);
+}
+
+fn psa_functools_cache(f: PsaVal) -> PsaVal {
+    // cache is lru_cache(maxsize=None) as a
+    // decorator -- same refusal.
+    panic(77148);
+}
+
+fn psa_functools_cmp_to_key(f: PsaVal) -> PsaVal {
+    // cmp_to_key(mycmp) returns a key CLASS whose
+    // instances wrap values and compare through
+    // mycmp. Minting a class at run time is beyond
+    // the value surface; sort keys must be plain
+    // values in psa. Refused loudly.
+    panic(77148);
+}
+
+fn psa_functools_total_ordering(cls: PsaVal) -> PsaVal {
+    // total_ordering is a class decorator: it
+    // returns the class with comparison methods
+    // filled in. psa classes are emitted per
+    // program (tag 8) and cannot be rewritten at
+    // run time. Define the comparisons in the
+    // class itself.
+    panic(77148);
+}
+
+fn psa_functools_singledispatch(f: PsaVal) -> PsaVal {
+    // singledispatch returns a generic-function
+    // object (a new callable with a registry).
+    // Unrepresentable, same reason as partial.
+    panic(77148);
+}
+
+fn psa_functools_wraps(f: PsaVal) -> PsaVal {
+    // wraps returns a decorator (a callable that
+    // returns a callable) -- two levels of callable
+    // manufacture. Unrepresentable.
+    panic(77148);
+}

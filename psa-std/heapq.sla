@@ -1,0 +1,364 @@
+// psa_std heapq (L1): CPython's heapq module over
+// PsaVal. See README-heapq.md for the module contract.
+// Panic codes: 77154 argument of the wrong type
+// (CPython TypeError), 77155 pop / replace from an
+// empty heap (CPython IndexError).
+//
+// The sift procedures replicate CPython's _siftup /
+// _siftdown step for step, so the heap *arrangement*
+// after any operation -- not just the multiset of
+// elements -- is byte-identical to CPython's. That is
+// observable behaviour: heappop order and the list a
+// user prints after heapify both depend on it, so a
+// differently-arranged heap would be a silent
+// divergence, not an implementation detail.
+// (CPython's names are swapped relative to the motion:
+// its _siftdown moves an element toward the root, its
+// _siftup toward the leaves. The helpers below are
+// named by motion: __psa_heap_up is CPython's
+// _siftdown, __psa_heap_down is CPython's _siftup.)
+//
+// Element comparisons ride __psa_dyn_lt: numbers (int
+// and float freely mixed) and strs order exactly as in
+// CPython; pairs psa cannot order (tuples, lists,
+// mixed str/number) take the runtime's loud 77012
+// panic where CPython would compare element-wise or
+// raise TypeError -- registered in the README
+// fragment. The key= parameter of nlargest /
+// nsmallest is NOT covered: see the README fragment.
+
+fn __psa_heap_list(v: PsaVal) -> void {
+    if v.tag != 4 { panic(77154); };
+    return;
+}
+
+fn __psa_heap_up(heap: PsaVal, startpos: i64, pos: i64) -> void {
+    // CPython _siftdown: move heap[pos] toward the root
+    // until its parent is not greater than it.
+    let newitem = __psa_list_get(heap, pos);
+    let moving = true;
+    while moving {
+        if pos > startpos {
+            let parentpos = (pos - 1) >> 1;
+            let parent = __psa_list_get(heap, parentpos);
+            if __psa_dyn_lt(newitem, parent) {
+                __psa_list_set(heap, pos, parent);
+                pos = parentpos;
+            } else {
+                moving = false;
+            };
+        } else {
+            moving = false;
+        };
+    }
+    __psa_list_set(heap, pos, newitem);
+    return;
+}
+
+fn __psa_heap_down(heap: PsaVal, pos: i64) -> void {
+    // CPython _siftup: move heap[pos] toward the leaves
+    // (choosing the smaller child, the right one on a
+    // tie of `not left < right`), then _siftdown the
+    // displaced element back up from startpos.
+    let endpos = __psa_list_len(heap);
+    let startpos = pos;
+    let newitem = __psa_list_get(heap, pos);
+    let childpos = 2 * pos + 1;
+    while childpos < endpos {
+        let rightpos = childpos + 1;
+        if rightpos < endpos {
+            if !(__psa_dyn_lt(__psa_list_get(heap, childpos), __psa_list_get(heap, rightpos))) {
+                childpos = rightpos;
+            };
+        };
+        __psa_list_set(heap, pos, __psa_list_get(heap, childpos));
+        pos = childpos;
+        childpos = 2 * pos + 1;
+    }
+    __psa_list_set(heap, pos, newitem);
+    __psa_heap_up(heap, startpos, pos);
+    return;
+}
+
+fn psa_heapq_heappush(heap: PsaVal, item: PsaVal) -> PsaVal {
+    // heappush: append, then sift the new element up.
+    __psa_heap_list(heap);
+    __psa_list_push(heap, item);
+    __psa_heap_up(heap, 0, __psa_list_len(heap) - 1);
+    return __psa_m_none();
+}
+
+fn psa_heapq_heappop(heap: PsaVal) -> PsaVal {
+    // heappop: remove and return the smallest element.
+    __psa_heap_list(heap);
+    let n = __psa_list_len(heap);
+    if n == 0 { panic(77155); };
+    let lastelt = __psa_vec_remove_h(heap.ipay as ptr, n - 1);
+    if __psa_list_len(heap) > 0 {
+        let returnitem = __psa_list_get(heap, 0);
+        __psa_list_set(heap, 0, lastelt);
+        __psa_heap_down(heap, 0);
+        return returnitem;
+    };
+    return lastelt;
+}
+
+fn psa_heapq_heapify(heap: PsaVal) -> PsaVal {
+    // heapify: transform the list into a heap, in place,
+    // bottom-up over the parents (CPython order).
+    __psa_heap_list(heap);
+    let n = __psa_list_len(heap);
+    let i = n / 2 - 1;
+    while i >= 0 {
+        __psa_heap_down(heap, i);
+        i = i - 1;
+    }
+    return __psa_m_none();
+}
+
+fn psa_heapq_heapreplace(heap: PsaVal, item: PsaVal) -> PsaVal {
+    // heapreplace: pop the smallest, push item, as one
+    // sift (more efficient than pop + push, and the
+    // arrangement differs from pop + push, as in
+    // CPython).
+    __psa_heap_list(heap);
+    if __psa_list_len(heap) == 0 { panic(77155); };
+    let returnitem = __psa_list_get(heap, 0);
+    __psa_list_set(heap, 0, item);
+    __psa_heap_down(heap, 0);
+    return returnitem;
+}
+
+fn psa_heapq_heappushpop(heap: PsaVal, item: PsaVal) -> PsaVal {
+    // heappushpop: if item is larger than the smallest,
+    // swap it into the heap and return the smallest;
+    // otherwise return item with the heap untouched.
+    __psa_heap_list(heap);
+    if __psa_list_len(heap) > 0 {
+        let top = __psa_list_get(heap, 0);
+        if __psa_dyn_lt(top, item) {
+            __psa_list_set(heap, 0, item);
+            __psa_heap_down(heap, 0);
+            return top;
+        };
+    };
+    return item;
+}
+
+// ---- nlargest / nsmallest ----
+
+fn __psa_heap_int(v: PsaVal) -> i64 {
+    if v.tag == 0 { return v.ipay; };
+    if v.tag == 2 { return v.ipay; };
+    panic(77154);
+}
+
+fn __psa_heap_copy(v: PsaVal) -> PsaVal {
+    // Copy a sequence (list / str / tuple) into a fresh
+    // list through the dyn element surface.
+    if v.tag == 4 || v.tag == 6 || v.tag == 10 {
+        let out = __psa_list_new();
+        let n = __psa_dyn_len(v);
+        let i: i64 = 0;
+        while i < n {
+            __psa_list_push(out, __psa_iter_get(v, i));
+            i = i + 1;
+        }
+        return out;
+    };
+    panic(77154);
+}
+
+fn __psa_heap_sort_desc(xs: PsaVal) -> void {
+    // Stable descending insertion sort: equal elements
+    // keep their incoming relative order, exactly what
+    // CPython's list.sort(reverse=True) guarantees.
+    let n = __psa_list_len(xs);
+    let i: i64 = 1;
+    while i < n {
+        let key = __psa_list_get(xs, i);
+        let j = i - 1;
+        let shifting = true;
+        while shifting {
+            if j >= 0 {
+                if __psa_dyn_lt(__psa_list_get(xs, j), key) {
+                    __psa_list_set(xs, j + 1, __psa_list_get(xs, j));
+                    j = j - 1;
+                } else {
+                    shifting = false;
+                };
+            } else {
+                shifting = false;
+            };
+        }
+        __psa_list_set(xs, j + 1, key);
+        i = i + 1;
+    }
+    return;
+}
+
+fn __psa_heap_sort_asc(xs: PsaVal) -> void {
+    // Stable ascending insertion sort (list.sort()).
+    let n = __psa_list_len(xs);
+    let i: i64 = 1;
+    while i < n {
+        let key = __psa_list_get(xs, i);
+        let j = i - 1;
+        let shifting = true;
+        while shifting {
+            if j >= 0 {
+                if __psa_dyn_lt(key, __psa_list_get(xs, j)) {
+                    __psa_list_set(xs, j + 1, __psa_list_get(xs, j));
+                    j = j - 1;
+                } else {
+                    shifting = false;
+                };
+            } else {
+                shifting = false;
+            };
+        }
+        __psa_list_set(xs, j + 1, key);
+        i = i + 1;
+    }
+    return;
+}
+
+fn psa_heapq_nlargest(nv: PsaVal, iterable: PsaVal) -> PsaVal {
+    // nlargest(n, iterable): the n largest elements in
+    // descending order, by CPython's algorithm: heapify
+    // the first n, replace the root by any later element
+    // strictly greater than it, then a stable descending
+    // sort. n < 0 yields [] (CPython); n == 1 goes
+    // through the same path (CPython's C accelerator
+    // special-cases it with a max scan whose tie
+    // behaviour -- first maximal element wins -- the
+    // strict-> heap path reproduces).
+    let n = __psa_heap_int(nv);
+    let src = __psa_heap_copy(iterable);
+    let total = __psa_list_len(src);
+    let out = __psa_list_new();
+    if n < 0 { return out; };
+    if n == 0 { return out; };
+    if total == 0 { return out; };
+    let take = n;
+    if take > total { take = total; };
+    let i: i64 = 0;
+    while i < take {
+        __psa_list_push(out, __psa_list_get(src, i));
+        i = i + 1;
+    }
+    psa_heapq_heapify(out);
+    let j = take;
+    while j < total {
+        let elem = __psa_list_get(src, j);
+        if __psa_dyn_gt(elem, __psa_list_get(out, 0)) {
+            psa_heapq_heapreplace(out, elem);
+        };
+        j = j + 1;
+    }
+    __psa_heap_sort_desc(out);
+    return out;
+}
+
+fn __psa_heap_up_max(heap: PsaVal, startpos: i64, pos: i64) -> void {
+    // CPython _siftdown_max: move heap[pos] toward the
+    // root while its parent is strictly smaller.
+    let newitem = __psa_list_get(heap, pos);
+    let moving = true;
+    while moving {
+        if pos > startpos {
+            let parentpos = (pos - 1) >> 1;
+            let parent = __psa_list_get(heap, parentpos);
+            if __psa_dyn_lt(parent, newitem) {
+                __psa_list_set(heap, pos, parent);
+                pos = parentpos;
+            } else {
+                moving = false;
+            };
+        } else {
+            moving = false;
+        };
+    }
+    __psa_list_set(heap, pos, newitem);
+    return;
+}
+
+fn __psa_heap_down_max(heap: PsaVal, pos: i64) -> void {
+    // CPython _siftup_max: move heap[pos] toward the
+    // leaves, choosing the LARGER child (the right one
+    // unless it is strictly smaller than the left),
+    // then _siftdown_max back up from startpos.
+    let endpos = __psa_list_len(heap);
+    let startpos = pos;
+    let newitem = __psa_list_get(heap, pos);
+    let childpos = 2 * pos + 1;
+    while childpos < endpos {
+        let rightpos = childpos + 1;
+        if rightpos < endpos {
+            if !(__psa_dyn_lt(__psa_list_get(heap, rightpos), __psa_list_get(heap, childpos))) {
+                childpos = rightpos;
+            };
+        };
+        __psa_list_set(heap, pos, __psa_list_get(heap, childpos));
+        pos = childpos;
+        childpos = 2 * pos + 1;
+    }
+    __psa_list_set(heap, pos, newitem);
+    __psa_heap_up_max(heap, startpos, pos);
+    return;
+}
+
+fn __psa_heap_heapify_max(heap: PsaVal) -> void {
+    // CPython _heapify_max.
+    let n = __psa_list_len(heap);
+    let i = n / 2 - 1;
+    while i >= 0 {
+        __psa_heap_down_max(heap, i);
+        i = i - 1;
+    }
+    return;
+}
+
+fn __psa_heap_replace_max(heap: PsaVal, item: PsaVal) -> PsaVal {
+    // CPython _heapreplace_max.
+    let returnitem = __psa_list_get(heap, 0);
+    __psa_list_set(heap, 0, item);
+    __psa_heap_down_max(heap, 0);
+    return returnitem;
+}
+
+fn psa_heapq_nsmallest(nv: PsaVal, iterable: PsaVal) -> PsaVal {
+    // nsmallest(n, iterable): NOT the min-heap mirror
+    // of nlargest -- CPython keeps the candidate set in
+    // a MAX-heap (_heapify_max), so the root is the
+    // largest of the current n smallest, replaced by
+    // any later element strictly smaller than it; a
+    // stable ascending sort finishes. (Using the
+    // min-heap here would replace the wrong root and
+    // select the wrong set.)
+    let n = __psa_heap_int(nv);
+    let src = __psa_heap_copy(iterable);
+    let total = __psa_list_len(src);
+    let out = __psa_list_new();
+    if n < 0 { return out; };
+    if n == 0 { return out; };
+    if total == 0 { return out; };
+    let take = n;
+    if take > total { take = total; };
+    let i: i64 = 0;
+    while i < take {
+        __psa_list_push(out, __psa_list_get(src, i));
+        i = i + 1;
+    }
+    __psa_heap_heapify_max(out);
+    let j = take;
+    while j < total {
+        let elem = __psa_list_get(src, j);
+        if __psa_dyn_lt(elem, __psa_list_get(out, 0)) {
+            __psa_heap_replace_max(out, elem);
+        };
+        j = j + 1;
+    }
+    __psa_heap_sort_asc(out);
+    return out;
+}

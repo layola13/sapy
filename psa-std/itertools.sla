@@ -1,0 +1,720 @@
+// psa_std itertools (L1): the honest subset of
+// CPython's itertools module over PsaVal. See
+// README-itertools.md for the module contract.
+// Panic codes: 77142 argument of the wrong type
+// (CPython TypeError), 77143 bad value (CPython
+// ValueError), 77146 argument not callable, 77148
+// registered-gap loud refusal, 77149 non-iterable
+// argument (shared psa_std codes, see README.md).
+//
+// Laziness divergence, registered once for the whole
+// module: CPython's itertools functions return lazy
+// iterators; psa has no iterator value a stdlib
+// function can mint (generators are per-program,
+// tag 13), so every function here MATERIALIZES its
+// inputs (generators are drained via the runtime's
+// __psa_iter_source) and returns a plain list. The
+// elements and their order are CPython's; only the
+// laziness is gone. The truly infinite producers
+// (count, cycle's infinite repetition) cannot be
+// materialized at all and refuse loudly (77148).
+
+fn __psa_itertools_items(v: PsaVal) -> PsaVal {
+    if v.tag == 4 || v.tag == 5 || v.tag == 6 || v.tag == 10 || v.tag == 11 || v.tag == 13 {
+        return __psa_list_from(__psa_iter_source(v));
+    };
+    panic(77149);
+}
+
+fn __psa_itertools_int(v: PsaVal) -> i64 {
+    if v.tag == 0 { return v.ipay; };
+    if v.tag == 2 { return v.ipay; };
+    panic(77142);
+}
+
+fn __psa_itertools_callable(f: PsaVal) -> void {
+    if f.tag == 7 { return; };
+    if f.tag == 9 { return; };
+    panic(77146);
+}
+
+fn __psa_itertools_call1(f: PsaVal, x: PsaVal) -> PsaVal {
+    let args = __psa_list_new();
+    __psa_list_push(args, x);
+    return __psa_call_value(f, args);
+}
+
+fn __psa_itertools_call2(f: PsaVal, x: PsaVal, y: PsaVal) -> PsaVal {
+    let args = __psa_list_new();
+    __psa_list_push(args, x);
+    __psa_list_push(args, y);
+    return __psa_call_value(f, args);
+}
+
+fn __psa_itertools_pair(x: PsaVal, y: PsaVal) -> PsaVal {
+    let t = __psa_tuple_new();
+    __psa_tuple_push(t, x);
+    __psa_tuple_push(t, y);
+    return t;
+}
+
+// ---- chain ----
+
+fn psa_itertools_chain(a: PsaVal, b: PsaVal) -> PsaVal {
+    // chain(a, b): two-iterable form (the general
+    // variadic form is chain_from_iterable below --
+    // SLA entry points have fixed arity).
+    let out = __psa_list_new();
+    let xs = __psa_itertools_items(a);
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        __psa_list_push(out, __psa_vec_get_h(xs.ipay as ptr, i));
+        i = i + 1;
+    }
+    let ys = __psa_itertools_items(b);
+    let m = __psa_vec_len_h(ys.ipay as ptr);
+    let j: i64 = 0;
+    while j < m {
+        __psa_list_push(out, __psa_vec_get_h(ys.ipay as ptr, j));
+        j = j + 1;
+    }
+    return out;
+}
+
+fn psa_itertools_chain_from_iterable(it: PsaVal) -> PsaVal {
+    // chain.from_iterable(iterable_of_iterables).
+    let out = __psa_list_new();
+    let parts = __psa_itertools_items(it);
+    let n = __psa_vec_len_h(parts.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        let xs = __psa_itertools_items(__psa_vec_get_h(parts.ipay as ptr, i));
+        let m = __psa_vec_len_h(xs.ipay as ptr);
+        let j: i64 = 0;
+        while j < m {
+            __psa_list_push(out, __psa_vec_get_h(xs.ipay as ptr, j));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---- islice ----
+
+fn __psa_itertools_slice(it: PsaVal, start: i64, stop: i64, step: i64) -> PsaVal {
+    // Shared islice body; stop < 0 means "to the end"
+    // (the caller maps None there). Bounds are plain
+    // branches, never &&-guarded reads.
+    let xs = __psa_itertools_items(it);
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    let end = stop;
+    if end < 0 { end = n; };
+    let out = __psa_list_new();
+    let i = start;
+    while i < end {
+        if i < n {
+            __psa_list_push(out, __psa_vec_get_h(xs.ipay as ptr, i));
+        };
+        i = i + step;
+    }
+    return out;
+}
+
+fn __psa_itertools_islice_arg(v: PsaVal) -> i64 {
+    // An islice bound: None maps to -1 (the open
+    // end), an int to itself; negatives are
+    // CPython's ValueError.
+    if v.tag == 3 { return -1; };
+    let n = __psa_itertools_int(v);
+    if n < 0 { panic(77143); };
+    return n;
+}
+
+fn psa_itertools_islice_stop(it: PsaVal, stop: PsaVal) -> PsaVal {
+    // islice(iterable, stop).
+    let s = __psa_itertools_islice_arg(stop);
+    return __psa_itertools_slice(it, 0, s, 1);
+}
+
+fn psa_itertools_islice_start_stop(it: PsaVal, start: PsaVal, stop: PsaVal) -> PsaVal {
+    // islice(iterable, start, stop).
+    let a = __psa_itertools_islice_arg(start);
+    let b = __psa_itertools_islice_arg(stop);
+    let a2 = a;
+    if a2 < 0 { a2 = 0; };
+    return __psa_itertools_slice(it, a2, b, 1);
+}
+
+fn psa_itertools_islice_start_stop_step(it: PsaVal, start: PsaVal, stop: PsaVal, step: PsaVal) -> PsaVal {
+    // islice(iterable, start, stop, step); a step
+    // below 1 is CPython's ValueError.
+    let a = __psa_itertools_islice_arg(start);
+    let b = __psa_itertools_islice_arg(stop);
+    let st = __psa_itertools_int(step);
+    if st < 1 { panic(77143); };
+    let a2 = a;
+    if a2 < 0 { a2 = 0; };
+    return __psa_itertools_slice(it, a2, b, st);
+}
+
+// ---- repeat ----
+
+fn psa_itertools_repeat(x: PsaVal, nv: PsaVal) -> PsaVal {
+    // repeat(x, times): times <= 0 yields an empty
+    // list (CPython). The no-times form is infinite
+    // and is not offered (registered).
+    let n = __psa_itertools_int(nv);
+    let out = __psa_list_new();
+    let i: i64 = 0;
+    while i < n {
+        __psa_list_push(out, x);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---- accumulate ----
+
+fn psa_itertools_accumulate(it: PsaVal) -> PsaVal {
+    // accumulate(iterable): running totals under
+    // dyn addition; an empty input yields [].
+    let xs = __psa_itertools_items(it);
+    let out = __psa_list_new();
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    if n == 0 { return out; };
+    let acc = __psa_vec_get_h(xs.ipay as ptr, 0);
+    __psa_list_push(out, acc);
+    let i: i64 = 1;
+    while i < n {
+        acc = __psa_dyn_add(acc, __psa_vec_get_h(xs.ipay as ptr, i));
+        __psa_list_push(out, acc);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn psa_itertools_accumulate_fn(it: PsaVal, f: PsaVal) -> PsaVal {
+    // accumulate(iterable, func): running reduction
+    // with a binary callable.
+    __psa_itertools_callable(f);
+    let xs = __psa_itertools_items(it);
+    let out = __psa_list_new();
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    if n == 0 { return out; };
+    let acc = __psa_vec_get_h(xs.ipay as ptr, 0);
+    __psa_list_push(out, acc);
+    let i: i64 = 1;
+    while i < n {
+        acc = __psa_itertools_call2(f, acc, __psa_vec_get_h(xs.ipay as ptr, i));
+        __psa_list_push(out, acc);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn psa_itertools_accumulate_init(it: PsaVal, init: PsaVal) -> PsaVal {
+    // accumulate(iterable, initial=init) with the
+    // default addition: the output starts with init
+    // and has one more element than the input
+    // (CPython, verified).
+    let xs = __psa_itertools_items(it);
+    let out = __psa_list_new();
+    let acc = init;
+    __psa_list_push(out, acc);
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        acc = __psa_dyn_add(acc, __psa_vec_get_h(xs.ipay as ptr, i));
+        __psa_list_push(out, acc);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---- takewhile / dropwhile / compress ----
+
+fn psa_itertools_takewhile(pred: PsaVal, it: PsaVal) -> PsaVal {
+    // takewhile(pred, iterable): elements while pred
+    // holds; the first failure ends the output (the
+    // failing element is consumed and dropped).
+    __psa_itertools_callable(pred);
+    let xs = __psa_itertools_items(it);
+    let out = __psa_list_new();
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    let i: i64 = 0;
+    let taking = true;
+    while i < n {
+        if taking {
+            let x = __psa_vec_get_h(xs.ipay as ptr, i);
+            if __psa_dyn_truthy(__psa_itertools_call1(pred, x)) {
+                __psa_list_push(out, x);
+            } else {
+                taking = false;
+            };
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+fn psa_itertools_dropwhile(pred: PsaVal, it: PsaVal) -> PsaVal {
+    // dropwhile(pred, iterable): drop while pred
+    // holds, then yield everything else verbatim
+    // (pred is not consulted again, CPython).
+    __psa_itertools_callable(pred);
+    let xs = __psa_itertools_items(it);
+    let out = __psa_list_new();
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    let i: i64 = 0;
+    let dropping = true;
+    while i < n {
+        let x = __psa_vec_get_h(xs.ipay as ptr, i);
+        if dropping {
+            if !(__psa_dyn_truthy(__psa_itertools_call1(pred, x))) {
+                dropping = false;
+                __psa_list_push(out, x);
+            };
+        } else {
+            __psa_list_push(out, x);
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+fn psa_itertools_compress(data: PsaVal, selectors: PsaVal) -> PsaVal {
+    // compress(data, selectors): elements of data
+    // whose selector is truthy; iteration stops at
+    // the shorter of the two (CPython).
+    let xs = __psa_itertools_items(data);
+    let ss = __psa_itertools_items(selectors);
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    let m = __psa_vec_len_h(ss.ipay as ptr);
+    let lim = n;
+    if m < lim { lim = m; };
+    let out = __psa_list_new();
+    let i: i64 = 0;
+    while i < lim {
+        if __psa_dyn_truthy(__psa_vec_get_h(ss.ipay as ptr, i)) {
+            __psa_list_push(out, __psa_vec_get_h(xs.ipay as ptr, i));
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---- starmap / tee / pairwise / zip_longest ----
+
+fn psa_itertools_starmap(f: PsaVal, it: PsaVal) -> PsaVal {
+    // starmap(func, iterable): func(*item) for each
+    // item, where item is a tuple / list of args.
+    __psa_itertools_callable(f);
+    let xs = __psa_itertools_items(it);
+    let out = __psa_list_new();
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        let args = __psa_itertools_items(__psa_vec_get_h(xs.ipay as ptr, i));
+        __psa_list_push(out, __psa_call_value(f, args));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn psa_itertools_tee2(it: PsaVal) -> PsaVal {
+    // tee(iterable, 2): two independent copies as a
+    // 2-tuple of lists. CPython's tee shares a lazy
+    // buffer; materialized, the honest equivalent is
+    // two independent lists (registered divergence:
+    // no shared consumption, no laziness).
+    let xs = __psa_itertools_items(it);
+    let a = __psa_list_new();
+    let b = __psa_list_new();
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        let x = __psa_vec_get_h(xs.ipay as ptr, i);
+        __psa_list_push(a, x);
+        __psa_list_push(b, x);
+        i = i + 1;
+    }
+    return __psa_itertools_pair(a, b);
+}
+
+fn psa_itertools_pairwise(it: PsaVal) -> PsaVal {
+    // pairwise(iterable) (CPython 3.10+): consecutive
+    // overlapping pairs as 2-tuples.
+    let xs = __psa_itertools_items(it);
+    let out = __psa_list_new();
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    let i: i64 = 0;
+    while i + 1 < n {
+        __psa_list_push(out, __psa_itertools_pair(__psa_vec_get_h(xs.ipay as ptr, i), __psa_vec_get_h(xs.ipay as ptr, i + 1)));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn psa_itertools_zip_longest(a: PsaVal, b: PsaVal, fill: PsaVal) -> PsaVal {
+    // zip_longest(a, b, fillvalue=fill): pairs until
+    // the LONGER input ends, padding with fill.
+    let xs = __psa_itertools_items(a);
+    let ys = __psa_itertools_items(b);
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    let m = __psa_vec_len_h(ys.ipay as ptr);
+    let lim = n;
+    if m > lim { lim = m; };
+    let out = __psa_list_new();
+    let i: i64 = 0;
+    while i < lim {
+        let x = fill;
+        if i < n { x = __psa_vec_get_h(xs.ipay as ptr, i); };
+        let y = fill;
+        if i < m { y = __psa_vec_get_h(ys.ipay as ptr, i); };
+        __psa_list_push(out, __psa_itertools_pair(x, y));
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---- groupby ----
+
+fn __psa_itertools_groupby_run(xs: PsaVal, f: PsaVal, use_f: bool) -> PsaVal {
+    // Shared groupby body: consecutive runs of equal
+    // keys; the key is f(x) when use_f, else x.
+    let out = __psa_list_new();
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    if n == 0 { return out; };
+    let first = __psa_vec_get_h(xs.ipay as ptr, 0);
+    let cur_key = first;
+    if use_f { cur_key = __psa_itertools_call1(f, first); };
+    let group = __psa_list_new();
+    __psa_list_push(group, first);
+    let i: i64 = 1;
+    while i < n {
+        let x = __psa_vec_get_h(xs.ipay as ptr, i);
+        let k = x;
+        if use_f { k = __psa_itertools_call1(f, x); };
+        if __psa_dyn_eq(k, cur_key) {
+            __psa_list_push(group, x);
+        } else {
+            __psa_list_push(out, __psa_itertools_pair(cur_key, group));
+            cur_key = k;
+            group = __psa_list_new();
+            __psa_list_push(group, x);
+        };
+        i = i + 1;
+    }
+    __psa_list_push(out, __psa_itertools_pair(cur_key, group));
+    return out;
+}
+
+fn psa_itertools_groupby(it: PsaVal) -> PsaVal {
+    // groupby(iterable): groups of CONSECUTIVE equal
+    // elements (CPython -- not a sort; verified).
+    // The key-function slot is unused in this form;
+    // a None value stands in for it.
+    let xs = __psa_itertools_items(it);
+    let none = PsaVal { tag: 3, ipay: 0, fpay: 0.0 };
+    return __psa_itertools_groupby_run(xs, none, false);
+}
+
+fn psa_itertools_groupby_key(it: PsaVal, f: PsaVal) -> PsaVal {
+    // groupby(iterable, key=func).
+    __psa_itertools_callable(f);
+    let xs = __psa_itertools_items(it);
+    return __psa_itertools_groupby_run(xs, f, true);
+}
+
+// ---- product / permutations / combinations ----
+
+fn psa_itertools_product(a: PsaVal, b: PsaVal) -> PsaVal {
+    // product(a, b): cartesian product, the rightmost
+    // pool varying fastest (CPython order, verified).
+    let xs = __psa_itertools_items(a);
+    let ys = __psa_itertools_items(b);
+    let out = __psa_list_new();
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    let m = __psa_vec_len_h(ys.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        let j: i64 = 0;
+        while j < m {
+            __psa_list_push(out, __psa_itertools_pair(__psa_vec_get_h(xs.ipay as ptr, i), __psa_vec_get_h(ys.ipay as ptr, j)));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn psa_itertools_product_from(it: PsaVal) -> PsaVal {
+    // product(*pools) via an iterable of iterables:
+    // odometer over the materialized pools; any
+    // empty pool empties the product (CPython).
+    let parts = __psa_itertools_items(it);
+    let np = __psa_vec_len_h(parts.ipay as ptr);
+    let pools = __psa_list_new();
+    let p: i64 = 0;
+    let empty = false;
+    while p < np {
+        let pool = __psa_itertools_items(__psa_vec_get_h(parts.ipay as ptr, p));
+        if __psa_vec_len_h(pool.ipay as ptr) == 0 { empty = true; };
+        __psa_list_push(pools, pool);
+        p = p + 1;
+    }
+    let out = __psa_list_new();
+    if empty { return out; };
+    if np == 0 {
+        // product() of no pools yields one empty
+        // tuple (CPython).
+        __psa_list_push(out, __psa_tuple_new());
+        return out;
+    };
+    let idx = __psa_list_new();
+    let q: i64 = 0;
+    while q < np {
+        __psa_list_push(idx, __psa_box_int(0));
+        q = q + 1;
+    }
+    let done = false;
+    while !(done) {
+        let t = __psa_tuple_new();
+        let r: i64 = 0;
+        while r < np {
+            let pool = __psa_vec_get_h(pools.ipay as ptr, r);
+            let ii = __psa_vec_get_h(idx.ipay as ptr, r).ipay;
+            __psa_tuple_push(t, __psa_vec_get_h(pool.ipay as ptr, ii));
+            r = r + 1;
+        }
+        __psa_list_push(out, t);
+        // Odometer step, rightmost fastest.
+        let s = np - 1;
+        let carry = true;
+        while s >= 0 {
+            if carry {
+                let pool = __psa_vec_get_h(pools.ipay as ptr, s);
+                let cur = __psa_vec_get_h(idx.ipay as ptr, s).ipay + 1;
+                if cur >= __psa_vec_len_h(pool.ipay as ptr) {
+                    __psa_vec_set_h(idx.ipay as ptr, s, __psa_box_int(0));
+                    s = s - 1;
+                } else {
+                    __psa_vec_set_h(idx.ipay as ptr, s, __psa_box_int(cur));
+                    carry = false;
+                };
+            } else {
+                break;
+            };
+        }
+        if s < 0 { done = true; };
+    }
+    return out;
+}
+
+fn __psa_itertools_pool_tuple(xs: PsaVal, idx: PsaVal, r: i64) -> PsaVal {
+    // The tuple pool[idx[0]], ..., pool[idx[r-1]].
+    let t = __psa_tuple_new();
+    let i: i64 = 0;
+    while i < r {
+        let ii = __psa_vec_get_h(idx.ipay as ptr, i).ipay;
+        __psa_tuple_push(t, __psa_vec_get_h(xs.ipay as ptr, ii));
+        i = i + 1;
+    }
+    return t;
+}
+
+fn psa_itertools_permutations(it: PsaVal, rv: PsaVal) -> PsaVal {
+    // permutations(iterable, r): CPython's exact
+    // emission order (the indices/cycles algorithm
+    // from the CPython docs, transliterated).
+    // r > n yields nothing; r < 0 is ValueError.
+    let xs = __psa_itertools_items(it);
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    let r = __psa_itertools_int(rv);
+    if r < 0 { panic(77143); };
+    let out = __psa_list_new();
+    if r > n { return out; };
+    let indices = __psa_list_new();
+    let i: i64 = 0;
+    while i < n {
+        __psa_list_push(indices, __psa_box_int(i));
+        i = i + 1;
+    }
+    let cycles = __psa_list_new();
+    let c0 = n;
+    while c0 > n - r {
+        __psa_list_push(cycles, __psa_box_int(c0));
+        c0 = c0 - 1;
+    }
+    __psa_list_push(out, __psa_itertools_pool_tuple(xs, indices, r));
+    let running = true;
+    while running {
+        let advanced = false;
+        let i2 = r - 1;
+        while i2 >= 0 {
+            if !(advanced) {
+                let cyc = __psa_vec_get_h(cycles.ipay as ptr, i2).ipay - 1;
+                __psa_vec_set_h(cycles.ipay as ptr, i2, __psa_box_int(cyc));
+                if cyc == 0 {
+                    // Rotate indices[i:] left by one:
+                    // move indices[i] to the end of the
+                    // whole index list (CPython's
+                    // indices[i:] = indices[i+1:] +
+                    // indices[i:i+1] over the full n).
+                    let head = __psa_vec_get_h(indices.ipay as ptr, i2);
+                    let s = i2;
+                    while s + 1 < n {
+                        __psa_vec_set_h(indices.ipay as ptr, s, __psa_vec_get_h(indices.ipay as ptr, s + 1));
+                        s = s + 1;
+                    }
+                    __psa_vec_set_h(indices.ipay as ptr, n - 1, head);
+                    __psa_vec_set_h(cycles.ipay as ptr, i2, __psa_box_int(n - i2));
+                } else {
+                    let j = __psa_vec_get_h(cycles.ipay as ptr, i2).ipay;
+                    let a = __psa_vec_get_h(indices.ipay as ptr, i2);
+                    let b = __psa_vec_get_h(indices.ipay as ptr, n - j);
+                    __psa_vec_set_h(indices.ipay as ptr, i2, b);
+                    __psa_vec_set_h(indices.ipay as ptr, n - j, a);
+                    __psa_list_push(out, __psa_itertools_pool_tuple(xs, indices, r));
+                    advanced = true;
+                };
+            };
+            i2 = i2 - 1;
+        }
+        if !(advanced) { running = false; };
+    }
+    return out;
+}
+
+fn psa_itertools_permutations_full(it: PsaVal) -> PsaVal {
+    // permutations(iterable) with r = len(iterable).
+    let xs = __psa_itertools_items(it);
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    return psa_itertools_permutations(xs, __psa_box_int(n));
+}
+
+fn psa_itertools_combinations(it: PsaVal, rv: PsaVal) -> PsaVal {
+    // combinations(iterable, r): lexicographic by
+    // position (CPython order, verified); r > n
+    // yields nothing; r < 0 is ValueError.
+    let xs = __psa_itertools_items(it);
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    let r = __psa_itertools_int(rv);
+    if r < 0 { panic(77143); };
+    let out = __psa_list_new();
+    if r > n { return out; };
+    let indices = __psa_list_new();
+    let i: i64 = 0;
+    while i < r {
+        __psa_list_push(indices, __psa_box_int(i));
+        i = i + 1;
+    }
+    __psa_list_push(out, __psa_itertools_pool_tuple(xs, indices, r));
+    let running = true;
+    while running {
+        // Find the rightmost index that can advance.
+        let i2 = r - 1;
+        let found = false;
+        while i2 >= 0 {
+            if !(found) {
+                let cur = __psa_vec_get_h(indices.ipay as ptr, i2).ipay;
+                if cur != i2 + n - r {
+                    found = true;
+                } else {
+                    i2 = i2 - 1;
+                };
+            } else {
+                break;
+            };
+        }
+        if !(found) {
+            running = false;
+        } else {
+            let cur = __psa_vec_get_h(indices.ipay as ptr, i2).ipay;
+            __psa_vec_set_h(indices.ipay as ptr, i2, __psa_box_int(cur + 1));
+            let j = i2 + 1;
+            while j < r {
+                let prev = __psa_vec_get_h(indices.ipay as ptr, j - 1).ipay;
+                __psa_vec_set_h(indices.ipay as ptr, j, __psa_box_int(prev + 1));
+                j = j + 1;
+            }
+            __psa_list_push(out, __psa_itertools_pool_tuple(xs, indices, r));
+        };
+    }
+    return out;
+}
+
+fn psa_itertools_combinations_with_replacement(it: PsaVal, rv: PsaVal) -> PsaVal {
+    // combinations_with_replacement(iterable, r):
+    // positions non-decreasing (CPython order,
+    // verified); r < 0 is ValueError; an empty pool
+    // with r > 0 yields nothing.
+    let xs = __psa_itertools_items(it);
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    let r = __psa_itertools_int(rv);
+    if r < 0 { panic(77143); };
+    let out = __psa_list_new();
+    if n == 0 {
+        if r > 0 { return out; };
+    };
+    let indices = __psa_list_new();
+    let i: i64 = 0;
+    while i < r {
+        __psa_list_push(indices, __psa_box_int(0));
+        i = i + 1;
+    }
+    __psa_list_push(out, __psa_itertools_pool_tuple(xs, indices, r));
+    let running = true;
+    while running {
+        // Find the rightmost index not at its max.
+        let i2 = r - 1;
+        let found = false;
+        while i2 >= 0 {
+            if !(found) {
+                let cur = __psa_vec_get_h(indices.ipay as ptr, i2).ipay;
+                if cur != n - 1 {
+                    found = true;
+                } else {
+                    i2 = i2 - 1;
+                };
+            } else {
+                break;
+            };
+        }
+        if !(found) {
+            running = false;
+        } else {
+            let cur = __psa_vec_get_h(indices.ipay as ptr, i2).ipay + 1;
+            let j = i2;
+            while j < r {
+                __psa_vec_set_h(indices.ipay as ptr, j, __psa_box_int(cur));
+                j = j + 1;
+            }
+            __psa_list_push(out, __psa_itertools_pool_tuple(xs, indices, r));
+        };
+    }
+    return out;
+}
+
+// ---- infinite producers: registered gaps ----
+
+fn psa_itertools_count(start: PsaVal, step: PsaVal) -> PsaVal {
+    // count(start, step) is an INFINITE iterator.
+    // psa_std functions return materialized values;
+    // an infinite list cannot exist, and a bounded
+    // prefix would be a silent lie about the type.
+    // Refused loudly; use psa_itertools_repeat /
+    // islice over a finite source, or a generator
+    // in the program itself.
+    panic(77148);
+}
+
+fn psa_itertools_cycle(it: PsaVal) -> PsaVal {
+    // cycle(iterable) repeats forever -- infinite,
+    // same refusal as count. A finite number of
+    // repetitions is spelled with chain_from_
+    // iterable over repeat of the source list.
+    panic(77148);
+}

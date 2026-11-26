@@ -205,9 +205,17 @@ fn merge_imports(prog: &mut ast::Program, base_dir: &Path) -> Result<(), String>
     Ok(())
 }
 
-/// The psa_std modules this psa build ships (v1: json).
+/// The psa_std modules this psa build ships (json, math,
+/// string, and the batch-3 modules csv, logging, argparse,
+/// collections, itertools, functools, bisect, heapq,
+/// base64, random, re, socket, urllib -- see
+/// psa-std/BATCH-WIRING.md).
 fn is_std_module(key: &str) -> bool {
-    matches!(key, "json")
+    matches!(
+        key,
+        "json" | "math" | "string" | "csv" | "logging" | "argparse" | "collections"
+            | "itertools" | "functools" | "bisect" | "heapq" | "base64" | "random" | "re" | "socket" | "urllib"
+    )
 }
 
 fn load_module(

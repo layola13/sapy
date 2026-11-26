@@ -169,6 +169,44 @@ pub struct Emitter {
     /// which splices the module's SLA text at assembly.
     std_json: bool,
     used_psa_json: bool,
+    /// psa_std L1 batch 2: the same wiring for `math` and
+    /// `string` -- `std_*` records the merge-pass binding,
+    /// `used_psa_*` is set when an entry point is actually
+    /// called and gates the SLA splice at assembly.
+    std_math: bool,
+    used_psa_math: bool,
+    std_string: bool,
+    used_psa_string: bool,
+    /// psa_std batch 3: the same wiring for csv, logging,
+    /// argparse, collections, itertools, functools, bisect,
+    /// heapq, base64, random and re (see
+    /// psa-std/BATCH-WIRING.md).
+    std_csv: bool,
+    used_psa_csv: bool,
+    std_logging: bool,
+    used_psa_logging: bool,
+    std_argparse: bool,
+    used_psa_argparse: bool,
+    std_collections: bool,
+    used_psa_collections: bool,
+    std_itertools: bool,
+    used_psa_itertools: bool,
+    std_functools: bool,
+    used_psa_functools: bool,
+    std_bisect: bool,
+    used_psa_bisect: bool,
+    std_heapq: bool,
+    used_psa_heapq: bool,
+    std_base64: bool,
+    used_psa_base64: bool,
+    std_random: bool,
+    used_psa_random: bool,
+    std_re: bool,
+    used_psa_re: bool,
+    std_socket: bool,
+    used_psa_socket: bool,
+    std_urllib: bool,
+    used_psa_urllib: bool,
     /// D6: the program uses try/raise/with anywhere (pre-scan
     /// in emit_program). Gates the trailing pending-exception
     /// check after call-containing statements (emit_stmt),
@@ -388,7 +426,42 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
         used_coro: false,
         genexp_counter: 0,
         std_json: prog.std_imports.iter().any(|m| m == "json"),
-        used_psa_json: false,
+        // psa_std: argparse's sys.argv path calls
+        // psa_json_parse, and the assembly splice reads
+        // used_psa_json (json block) before the argparse
+        // block runs, so the dependency is primed here at
+        // construction (psa-std/BATCH-WIRING.md, R5).
+        used_psa_json: prog.std_imports.iter().any(|m| m == "argparse"),
+        std_math: prog.std_imports.iter().any(|m| m == "math"),
+        used_psa_math: false,
+        std_string: prog.std_imports.iter().any(|m| m == "string"),
+        used_psa_string: false,
+        std_csv: prog.std_imports.iter().any(|m| m == "csv"),
+        used_psa_csv: false,
+        std_logging: prog.std_imports.iter().any(|m| m == "logging"),
+        used_psa_logging: false,
+        std_argparse: prog.std_imports.iter().any(|m| m == "argparse"),
+        used_psa_argparse: false,
+        std_collections: prog.std_imports.iter().any(|m| m == "collections"),
+        used_psa_collections: false,
+        std_itertools: prog.std_imports.iter().any(|m| m == "itertools"),
+        used_psa_itertools: false,
+        std_functools: prog.std_imports.iter().any(|m| m == "functools"),
+        used_psa_functools: false,
+        std_bisect: prog.std_imports.iter().any(|m| m == "bisect"),
+        used_psa_bisect: false,
+        std_heapq: prog.std_imports.iter().any(|m| m == "heapq"),
+        used_psa_heapq: false,
+        std_base64: prog.std_imports.iter().any(|m| m == "base64"),
+        used_psa_base64: false,
+        std_random: prog.std_imports.iter().any(|m| m == "random"),
+        used_psa_random: false,
+        std_re: prog.std_imports.iter().any(|m| m == "re"),
+        used_psa_re: false,
+        std_socket: prog.std_imports.iter().any(|m| m == "socket"),
+        used_psa_socket: false,
+        std_urllib: prog.std_imports.iter().any(|m| m == "urllib"),
+        used_psa_urllib: false,
         program_exc: false,
     };
     em.program_exc = prog.funcs.iter().any(|f| stmts_use_exc(&f.body))
@@ -672,6 +745,13 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
         out.push_str("@import \"sa_std/thread.sa\"\n");
         out.push_str("@import \"sa_std/core/result.sa\"\n");
     }
+    if em.std_random {
+        // psa_std: random.sla calls sa_crypto_random_bytes
+        // for entropy seeding; emitted whenever `import
+        // random` bound to the standard library, regardless
+        // of used_dyn (WIRING-random.md).
+        out.push_str("@import \"sa_std/crypto.sai\"\n");
+    }
     out.push('\n');
     if em.used_dyn {
         out.push_str("@derive(copy)\nstruct PsaVal { tag: i64, ipay: i64, fpay: f64 }\n\nstruct PsaStage { tag: i64, ipay: i64, fpay: f64 }\n\n");
@@ -698,6 +778,20 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
     if em.used_file {
         out.push_str(D6_FILE_RUNTIME);
     }
+    if em.used_dyn && !em.used_gen {
+        // psa_std collections / itertools / functools call
+        // __psa_iter_source unconditionally; the draining
+        // definition lives in D7_GEN_RUNTIME. In a program
+        // with no generators no tag-13 value can be
+        // constructed (generator defs/exprs are the only
+        // source, and no std module creates one), so the
+        // identity is the same function here.
+        out.push_str("fn __psa_iter_source(v: PsaVal) -> PsaVal {
+    return v;
+}
+
+");
+    }
     if em.used_gen {
         out.push_str(D7_GEN_RUNTIME);
     }
@@ -706,6 +800,66 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
     }
     if em.used_psa_json {
         out.push_str(PSA_JSON_SLA);
+        out.push('\n');
+    }
+    if em.used_psa_math {
+        out.push_str(PSA_MATH_SLA);
+        out.push('\n');
+    }
+    if em.used_psa_string {
+        out.push_str(PSA_STRING_SLA);
+        out.push('\n');
+    }
+    if em.used_psa_csv {
+        out.push_str(PSA_CSV_SLA);
+        out.push('\n');
+    }
+    if em.used_psa_logging {
+        out.push_str(PSA_LOGGING_SLA);
+        out.push('\n');
+    }
+    if em.used_psa_argparse {
+        out.push_str(PSA_ARGPARSE_SLA);
+        out.push('\n');
+    }
+    if em.used_psa_collections {
+        out.push_str(PSA_COLLECTIONS_SLA);
+        out.push('\n');
+    }
+    if em.used_psa_itertools {
+        out.push_str(PSA_ITERTOOLS_SLA);
+        out.push('\n');
+    }
+    if em.used_psa_functools {
+        out.push_str(PSA_FUNCTOOLS_SLA);
+        out.push('\n');
+    }
+    if em.used_psa_bisect {
+        out.push_str(PSA_BISECT_SLA);
+        out.push('\n');
+    }
+    if em.used_psa_heapq {
+        out.push_str(PSA_HEAPQ_SLA);
+        out.push('\n');
+    }
+    if em.used_psa_base64 {
+        out.push_str(PSA_BASE64_SLA);
+        out.push('\n');
+    }
+    if em.used_psa_random {
+        out.push_str(PSA_RANDOM_SLA);
+        out.push('\n');
+    }
+    if em.used_psa_re {
+        out.push_str(PSA_RE_SLA);
+        out.push('\n');
+    }
+    if em.used_psa_socket {
+        out.push_str(PSA_SOCKET_SLA);
+        out.push('\n');
+    }
+    if em.used_psa_urllib {
+        out.push_str(PSA_URLLIB_SLA);
         out.push('\n');
     }
     for f in &em.emitted {
@@ -1578,11 +1732,25 @@ impl Emitter {
         let n = def.param_count();
         self.ensure_fn(name, &vec![Ty::Dyn; n], line)?;
         let sig = self.sigs.get(name).expect("ensure_fn registers a signature");
-        if sig.params.iter().any(|t| *t != Ty::Dyn) || sig.ret != Some(Ty::Dyn) {
+        // Parameters must be all-dynamic: the generated
+        // adapter passes PsaVal arguments straight through.
+        // The return may be dynamic, a static scalar or
+        // void: the adapter normalises it (box int / float
+        // / bool, None for void), exactly as it does for
+        // method callables.
+        let ret_ok = matches!(
+            sig.ret,
+            Some(Ty::Dyn)
+                | Some(Ty::Int)
+                | Some(Ty::Float)
+                | Some(Ty::Bool)
+                | Some(Ty::Void)
+        );
+        if sig.params.iter().any(|t| *t != Ty::Dyn) || !ret_ok {
             return Err(eerr(
                 line,
                 &format!(
-                    "function `{}` cannot be used as a value: callable functions are pinned to all-dynamic signatures, but it was already emitted with a different one",
+                    "function `{}` cannot be used as a value: callable functions are pinned to all-dynamic parameters, but it was already emitted with a different one",
                     name
                 ),
             ));
@@ -6300,6 +6468,1134 @@ impl Emitter {
                     self.used_psa_json = true;
                     return Ok((format!("{}({})", sla_fn, acode), Ty::Dyn));
                 }
+                // psa_std L1 batch 2: `math.<fn>(...)` with
+                // `import math` bound to the standard library
+                // calls the spliced module's SLA entry points
+                // directly, same shape as the json intercept
+                // above. Arities are per-function (the CPython
+                // signatures restricted to positional args).
+                if self.std_math && obj == "math" && ctx.lookup(obj).is_none() {
+                    let (sla_fn, arity): (&str, usize) = match method.as_str() {
+                        "floor" => ("psa_math_floor", 1),
+                        "ceil" => ("psa_math_ceil", 1),
+                        "trunc" => ("psa_math_trunc", 1),
+                        "fabs" => ("psa_math_fabs", 1),
+                        "sqrt" => ("psa_math_sqrt", 1),
+                        "sin" => ("psa_math_sin", 1),
+                        "cos" => ("psa_math_cos", 1),
+                        "degrees" => ("psa_math_degrees", 1),
+                        "radians" => ("psa_math_radians", 1),
+                        "factorial" => ("psa_math_factorial", 1),
+                        "isqrt" => ("psa_math_isqrt", 1),
+                        "gcd" => ("psa_math_gcd", 2),
+                        "lcm" => ("psa_math_lcm", 2),
+                        "comb" => ("psa_math_comb", 2),
+                        "perm" => ("psa_math_perm", 2),
+                        "pow" => ("psa_math_pow", 2),
+                        "isclose" => ("psa_math_isclose", 2),
+                        _ => {
+                            return Err(eerr(
+                                line,
+                                &format!(
+                                    "psa_std module `math` has no function `{}` in v1 (floor / ceil / trunc / fabs / sqrt / sin / cos / degrees / radians / factorial / isqrt / gcd / lcm / comb / perm / pow / isclose)",
+                                    method
+                                ),
+                            ))
+                        }
+                    };
+                    if args.len() != arity {
+                        return Err(eerr(
+                            line,
+                            &format!(
+                                "math.{} takes exactly {} positional argument(s) in v1",
+                                method, arity
+                            ),
+                        ));
+                    }
+                    let mut acodes: Vec<String> = Vec::new();
+                    for a in args {
+                        acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                    }
+                    self.used_dyn = true;
+                    self.used_psa_math = true;
+                    return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                }
+                // psa_std L1 batch 2: `string.capwords(...)`
+                // is the string module's one wired function
+                // (its constants are values, reached through
+                // the module's zero-argument entry points in
+                // the SLA text, not through calls -- see
+                // psa-std/README.md).
+                if self.std_string && obj == "string" && ctx.lookup(obj).is_none() {
+                    if method != "capwords" {
+                        return Err(eerr(
+                            line,
+                            &format!(
+                                "psa_std module `string` has no function `{}` in v1 (capwords; the constants are values, not functions)",
+                                method
+                            ),
+                        ));
+                    }
+                    if args.len() != 1 && args.len() != 2 {
+                        return Err(eerr(
+                            line,
+                            "string.capwords takes one or two positional arguments in v1",
+                        ));
+                    }
+                    let mut acodes: Vec<String> = Vec::new();
+                    for a in args {
+                        acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                    }
+                    self.used_dyn = true;
+                    self.used_psa_string = true;
+                    let sla_fn = if args.len() == 2 {
+                        "psa_string_capwords_sep"
+                    } else {
+                        "psa_string_capwords"
+                    };
+                    return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                }
+                // psa_std batch 3: `csv.<fn>(...)` with
+                // `import csv` bound to the standard library,
+                // same shape as the math intercept above.
+                // write_rows additionally sets used_file so
+                // the D6 file runtime (which provides
+                // __psa_file_write) is emitted.
+                if self.std_csv && obj == "csv" && ctx.lookup(obj).is_none() {
+                    let (sla_fn, arity): (&str, usize) = match method.as_str() {
+                        "reads" => ("psa_csv_reads", 1),
+                        "reads_d" => ("psa_csv_reads_d", 2),
+                        "reader" => ("psa_csv_reader", 1),
+                        "reader_d" => ("psa_csv_reader_d", 2),
+                        "writes" => ("psa_csv_writes", 1),
+                        "writes_d" => ("psa_csv_writes_d", 2),
+                        "write_rows" => ("psa_csv_write_rows", 3),
+                        _ => {
+                            return Err(eerr(
+                                line,
+                                &format!(
+                                    "psa_std module `csv` has no function `{}` in v1 (reads / reads_d / reader / reader_d / writes / writes_d / write_rows)",
+                                    method
+                                ),
+                            ))
+                        }
+                    };
+                    if args.len() != arity {
+                        return Err(eerr(
+                            line,
+                            &format!(
+                                "csv.{} takes exactly {} positional argument(s) in v1",
+                                method, arity
+                            ),
+                        ));
+                    }
+                    let mut acodes: Vec<String> = Vec::new();
+                    for a in args {
+                        acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                    }
+                    self.used_dyn = true;
+                    self.used_psa_csv = true;
+                    if method == "write_rows" {
+                        self.used_file = true;
+                    }
+                    return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                }
+                // psa_std batch 3: `logging.<fn>(...)`. The
+                // root logging calls (debug / info / warning
+                // / error / critical, and log) are CPython
+                // *args forms: the intercept passes the
+                // message and collects any trailing
+                // positional arguments into a tag-4 list
+                // (None when there are none) for the root_*
+                // SLA entry points. Logger method syntax is
+                // not wired (it needs std object tracking;
+                // see WIRING-logging.md).
+                if self.std_logging && obj == "logging" && ctx.lookup(obj).is_none() {
+                    let root_fn: Option<&str> = match method.as_str() {
+                        "debug" => Some("psa_logging_root_debug"),
+                        "info" => Some("psa_logging_root_info"),
+                        "warning" => Some("psa_logging_root_warning"),
+                        "error" => Some("psa_logging_root_error"),
+                        "critical" => Some("psa_logging_root_critical"),
+                        _ => None,
+                    };
+                    if let Some(sla_fn) = root_fn {
+                        if args.is_empty() {
+                            return Err(eerr(
+                                line,
+                                &format!(
+                                    "logging.{} takes at least one positional argument (the message) in v1",
+                                    method
+                                ),
+                            ));
+                        }
+                        let msgcode = self.emit_dyn_value(ctx, &args[0], line)?;
+                        let argscode = if args.len() == 1 {
+                            "__psa_m_none()".to_string()
+                        } else {
+                            self.emit_dyn_value(
+                                ctx,
+                                &Expr::ListLit(args[1..].to_vec()),
+                                line,
+                            )?
+                        };
+                        self.used_dyn = true;
+                        self.used_psa_logging = true;
+                        return Ok((
+                            format!("{}({}, {})", sla_fn, msgcode, argscode),
+                            Ty::Dyn,
+                        ));
+                    }
+                    if method == "log" {
+                        if args.len() < 2 {
+                            return Err(eerr(
+                                line,
+                                "logging.log takes at least two positional arguments (level, message) in v1",
+                            ));
+                        }
+                        let levelcode = self.emit_dyn_value(ctx, &args[0], line)?;
+                        let msgcode = self.emit_dyn_value(ctx, &args[1], line)?;
+                        let argscode = if args.len() == 2 {
+                            "__psa_m_none()".to_string()
+                        } else {
+                            self.emit_dyn_value(
+                                ctx,
+                                &Expr::ListLit(args[2..].to_vec()),
+                                line,
+                            )?
+                        };
+                        self.used_dyn = true;
+                        self.used_psa_logging = true;
+                        return Ok((
+                            format!(
+                                "psa_logging_root_log({}, {}, {})",
+                                levelcode, msgcode, argscode
+                            ),
+                            Ty::Dyn,
+                        ));
+                    }
+                    let (sla_fn, arity): (&str, usize) = match method.as_str() {
+                        "getLogger" => ("psa_logging_get_logger", 1),
+                        "set_level" => ("psa_logging_set_level", 2),
+                        "get_effective_level" => ("psa_logging_get_effective_level", 1),
+                        "basicConfig" => ("psa_logging_basic_config", 2),
+                        "basicConfig_force" => ("psa_logging_basic_config_force", 2),
+                        "level_debug" => ("psa_logging_level_debug", 0),
+                        "level_info" => ("psa_logging_level_info", 0),
+                        "level_warning" => ("psa_logging_level_warning", 0),
+                        "level_error" => ("psa_logging_level_error", 0),
+                        "level_critical" => ("psa_logging_level_critical", 0),
+                        _ => {
+                            return Err(eerr(
+                                line,
+                                &format!(
+                                    "psa_std module `logging` has no function `{}` in v1 (getLogger / set_level / get_effective_level / basicConfig / basicConfig_force / log / debug / info / warning / error / critical / level_debug / level_info / level_warning / level_error / level_critical)",
+                                    method
+                                ),
+                            ))
+                        }
+                    };
+                    if args.len() != arity {
+                        return Err(eerr(
+                            line,
+                            &format!(
+                                "logging.{} takes exactly {} positional argument(s) in v1",
+                                method, arity
+                            ),
+                        ));
+                    }
+                    let mut acodes: Vec<String> = Vec::new();
+                    for a in args {
+                        acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                    }
+                    self.used_dyn = true;
+                    self.used_psa_logging = true;
+                    return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                }
+                // psa_std batch 3:
+                // `argparse.ArgumentParser(prog, description)`
+                // is the module's one wired entry point; a
+                // missing description pads to None.
+                // ArgumentParser method syntax (add_argument
+                // / parse_args / ...) is not wired -- it
+                // needs std object tracking (see
+                // WIRING-argparse.md). used_psa_json was
+                // primed at construction for the argv path.
+                if self.std_argparse && obj == "argparse" && ctx.lookup(obj).is_none() {
+                    if method != "ArgumentParser" {
+                        return Err(eerr(
+                            line,
+                            &format!(
+                                "psa_std module `argparse` has no function `{}` in v1 (ArgumentParser)",
+                                method
+                            ),
+                        ));
+                    }
+                    if args.len() != 1 && args.len() != 2 {
+                        return Err(eerr(
+                            line,
+                            "argparse.ArgumentParser takes one or two positional arguments (prog, description) in v1",
+                        ));
+                    }
+                    let mut acodes: Vec<String> = Vec::new();
+                    for a in args {
+                        acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                    }
+                    if acodes.len() == 1 {
+                        acodes.push("__psa_m_none()".to_string());
+                    }
+                    self.used_dyn = true;
+                    self.used_psa_argparse = true;
+                    return Ok((
+                        format!("psa_argparse_new_parser({})", acodes.join(", ")),
+                        Ty::Dyn,
+                    ));
+                }
+                // psa_std batch 3: `collections.<fn>(...)`,
+                // same shape as the math intercept above.
+                // Only the module-level spellings are wired;
+                // method-call syntax on the returned
+                // containers is not (WIRING-collections.md).
+                if self.std_collections && obj == "collections" && ctx.lookup(obj).is_none() {
+                    let (sla_fn, arity): (&str, usize) = match method.as_str() {
+                        "Counter" => ("psa_collections_counter_any", 1),
+                        "defaultdict" => ("psa_collections_defaultdict_new", 1),
+                        "deque" => ("psa_collections_deque_new", 1),
+                        "ChainMap" => ("psa_collections_chainmap_new", 1),
+                        "OrderedDict" => ("psa_collections_ordereddict_any", 1),
+                        "namedtuple" => ("psa_collections_namedtuple", 2),
+                        "counter_dict" => ("psa_collections_counter_dict", 1),
+                        "counter_get" => ("psa_collections_counter_get", 2),
+                        "counter_update" => ("psa_collections_counter_update", 2),
+                        "counter_subtract" => ("psa_collections_counter_subtract", 2),
+                        "counter_add" => ("psa_collections_counter_add", 2),
+                        "counter_sub" => ("psa_collections_counter_sub", 2),
+                        "counter_and" => ("psa_collections_counter_and", 2),
+                        "counter_or" => ("psa_collections_counter_or", 2),
+                        "counter_elements" => ("psa_collections_counter_elements", 1),
+                        "counter_total" => ("psa_collections_counter_total", 1),
+                        "counter_most_common" => ("psa_collections_counter_most_common", 1),
+                        "counter_most_common_n" => ("psa_collections_counter_most_common_n", 2),
+                        "defaultdict_get" => ("psa_collections_defaultdict_get", 3),
+                        "deque_append" => ("psa_collections_deque_append", 2),
+                        "deque_append_maxlen" => ("psa_collections_deque_append_maxlen", 3),
+                        "deque_appendleft" => ("psa_collections_deque_appendleft", 2),
+                        "deque_appendleft_maxlen" => {
+                            ("psa_collections_deque_appendleft_maxlen", 3)
+                        }
+                        "deque_pop" => ("psa_collections_deque_pop", 1),
+                        "deque_popleft" => ("psa_collections_deque_popleft", 1),
+                        "deque_extend" => ("psa_collections_deque_extend", 2),
+                        "deque_extendleft" => ("psa_collections_deque_extendleft", 2),
+                        "deque_rotate" => ("psa_collections_deque_rotate", 2),
+                        "deque_count" => ("psa_collections_deque_count", 2),
+                        "deque_remove" => ("psa_collections_deque_remove", 2),
+                        "deque_clear" => ("psa_collections_deque_clear", 1),
+                        "chainmap_get" => ("psa_collections_chainmap_get", 2),
+                        "chainmap_get_default" => ("psa_collections_chainmap_get_default", 3),
+                        "chainmap_set" => ("psa_collections_chainmap_set", 3),
+                        "chainmap_del" => ("psa_collections_chainmap_del", 2),
+                        "chainmap_keys" => ("psa_collections_chainmap_keys", 1),
+                        "chainmap_new_child" => ("psa_collections_chainmap_new_child", 2),
+                        "chainmap_parents" => ("psa_collections_chainmap_parents", 1),
+                        "ordereddict_move_to_end" => {
+                            ("psa_collections_ordereddict_move_to_end", 2)
+                        }
+                        "ordereddict_move_to_end_first" => {
+                            ("psa_collections_ordereddict_move_to_end_first", 2)
+                        }
+                        _ => {
+                            return Err(eerr(
+                                line,
+                                &format!(
+                                    "psa_std module `collections` has no function `{}` in v1 (Counter / defaultdict / deque / ChainMap / OrderedDict / namedtuple / counter_* / defaultdict_get / deque_* / chainmap_* / ordereddict_move_to_end*)",
+                                    method
+                                ),
+                            ))
+                        }
+                    };
+                    // `deque` alone among the constructors has
+                    // a zero-argument form.
+                    let (sla_fn, arity) = if method == "deque" && args.is_empty() {
+                        ("psa_collections_deque_new_empty", 0)
+                    } else {
+                        (sla_fn, arity)
+                    };
+                    if args.len() != arity {
+                        return Err(eerr(
+                            line,
+                            &format!(
+                                "collections.{} takes exactly {} positional argument(s) in v1",
+                                method, arity
+                            ),
+                        ));
+                    }
+                    let mut acodes: Vec<String> = Vec::new();
+                    for a in args {
+                        acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                    }
+                    self.used_dyn = true;
+                    self.used_psa_collections = true;
+                    return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                }
+                // psa_std batch 3: `itertools.<fn>(...)`,
+                // same shape as the math intercept above.
+                // Callable arguments arrive as tag-7/9 dyn
+                // values through emit_dyn_value.
+                if self.std_itertools && obj == "itertools" && ctx.lookup(obj).is_none() {
+                    let (sla_fn, arity): (&str, usize) = match method.as_str() {
+                        "chain" => ("psa_itertools_chain", 2),
+                        "chain_from_iterable" => ("psa_itertools_chain_from_iterable", 1),
+                        "islice" => ("psa_itertools_islice_stop", 2),
+                        "repeat" => ("psa_itertools_repeat", 2),
+                        "accumulate" => ("psa_itertools_accumulate", 1),
+                        "accumulate_init" => ("psa_itertools_accumulate_init", 2),
+                        "takewhile" => ("psa_itertools_takewhile", 2),
+                        "dropwhile" => ("psa_itertools_dropwhile", 2),
+                        "compress" => ("psa_itertools_compress", 2),
+                        "starmap" => ("psa_itertools_starmap", 2),
+                        "tee" => ("psa_itertools_tee2", 1),
+                        "pairwise" => ("psa_itertools_pairwise", 1),
+                        "zip_longest" => ("psa_itertools_zip_longest", 3),
+                        "groupby" => ("psa_itertools_groupby", 1),
+                        "product" => ("psa_itertools_product", 2),
+                        "product_from" => ("psa_itertools_product_from", 1),
+                        "permutations" => ("psa_itertools_permutations_full", 1),
+                        "combinations" => ("psa_itertools_combinations", 2),
+                        "combinations_with_replacement" => {
+                            ("psa_itertools_combinations_with_replacement", 2)
+                        }
+                        "count" => ("psa_itertools_count", 2),
+                        "cycle" => ("psa_itertools_cycle", 1),
+                        _ => {
+                            return Err(eerr(
+                                line,
+                                &format!(
+                                    "psa_std module `itertools` has no function `{}` in v1 (chain / chain_from_iterable / islice / repeat / accumulate / accumulate_init / takewhile / dropwhile / compress / starmap / tee / pairwise / zip_longest / groupby / product / product_from / permutations / combinations / combinations_with_replacement / count / cycle)",
+                                    method
+                                ),
+                            ))
+                        }
+                    };
+                    // Arity-keyed entries, following the
+                    // string.capwords precedent.
+                    let sla_fn = match (method.as_str(), args.len()) {
+                        ("islice", 3) => "psa_itertools_islice_start_stop",
+                        ("islice", 4) => "psa_itertools_islice_start_stop_step",
+                        ("accumulate", 2) => "psa_itertools_accumulate_fn",
+                        ("groupby", 2) => "psa_itertools_groupby_key",
+                        ("permutations", 2) => "psa_itertools_permutations",
+                        _ => sla_fn,
+                    };
+                    let arity_ok = match method.as_str() {
+                        "islice" => args.len() == 2 || args.len() == 3 || args.len() == 4,
+                        "accumulate" | "groupby" | "permutations" => {
+                            args.len() == 1 || args.len() == 2
+                        }
+                        _ => args.len() == arity,
+                    };
+                    if !arity_ok {
+                        return Err(eerr(
+                            line,
+                            &format!(
+                                "itertools.{} does not take {} positional argument(s) in v1",
+                                method,
+                                args.len()
+                            ),
+                        ));
+                    }
+                    let mut acodes: Vec<String> = Vec::new();
+                    for a in args {
+                        acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                    }
+                    self.used_dyn = true;
+                    self.used_psa_itertools = true;
+                    return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                }
+                // psa_std batch 3: `functools.<fn>(...)`,
+                // same shape as the math intercept above.
+                // Only reduce is a real function; the factory
+                // names are wired deliberately and panic
+                // 77148 at run time (registered gap).
+                if self.std_functools && obj == "functools" && ctx.lookup(obj).is_none() {
+                    let (sla_fn, arity): (&str, usize) = match method.as_str() {
+                        "reduce" => ("psa_functools_reduce", 2),
+                        "partial" => ("psa_functools_partial", 2),
+                        "lru_cache" => ("psa_functools_lru_cache", 1),
+                        "cache" => ("psa_functools_cache", 1),
+                        "cmp_to_key" => ("psa_functools_cmp_to_key", 1),
+                        "total_ordering" => ("psa_functools_total_ordering", 1),
+                        "singledispatch" => ("psa_functools_singledispatch", 1),
+                        "wraps" => ("psa_functools_wraps", 1),
+                        _ => {
+                            return Err(eerr(
+                                line,
+                                &format!(
+                                    "psa_std module `functools` has no function `{}` in v1 (reduce / partial / lru_cache / cache / cmp_to_key / total_ordering / singledispatch / wraps)",
+                                    method
+                                ),
+                            ))
+                        }
+                    };
+                    let sla_fn = if method == "reduce" && args.len() == 3 {
+                        "psa_functools_reduce_init"
+                    } else {
+                        sla_fn
+                    };
+                    if args.len() != arity && !(method == "reduce" && args.len() == 3) {
+                        return Err(eerr(
+                            line,
+                            &format!(
+                                "functools.{} takes exactly {} positional argument(s) in v1",
+                                method, arity
+                            ),
+                        ));
+                    }
+                    let mut acodes: Vec<String> = Vec::new();
+                    for a in args {
+                        acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                    }
+                    self.used_dyn = true;
+                    self.used_psa_functools = true;
+                    return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                }
+                // psa_std batch 3: `bisect.<fn>(...)`. Every
+                // entry point takes (a, x, lo, hi) at the SLA
+                // level with CPython's defaults made
+                // explicit, so the intercept accepts 2..4
+                // positional arguments and pads the missing
+                // trailing ones (lo -> __psa_box_int(0),
+                // hi -> __psa_m_none()).
+                if self.std_bisect && obj == "bisect" && ctx.lookup(obj).is_none() {
+                    let sla_fn: &str = match method.as_str() {
+                        "bisect_left" => "psa_bisect_bisect_left",
+                        "bisect_right" => "psa_bisect_bisect_right",
+                        "bisect" => "psa_bisect_bisect",
+                        "insort_left" => "psa_bisect_insort_left",
+                        "insort_right" => "psa_bisect_insort_right",
+                        "insort" => "psa_bisect_insort",
+                        _ => {
+                            return Err(eerr(
+                                line,
+                                &format!(
+                                    "psa_std module `bisect` has no function `{}` in v1 (bisect_left / bisect_right / bisect / insort_left / insort_right / insort)",
+                                    method
+                                ),
+                            ))
+                        }
+                    };
+                    if args.len() < 2 || args.len() > 4 {
+                        return Err(eerr(
+                            line,
+                            &format!(
+                                "bisect.{} takes two to four positional arguments in v1 (the key= keyword is not covered)",
+                                method
+                            ),
+                        ));
+                    }
+                    let mut acodes: Vec<String> = Vec::new();
+                    for a in args {
+                        acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                    }
+                    if acodes.len() == 2 {
+                        acodes.push("__psa_box_int(0)".to_string());
+                    }
+                    if acodes.len() == 3 {
+                        acodes.push("__psa_m_none()".to_string());
+                    }
+                    self.used_dyn = true;
+                    self.used_psa_bisect = true;
+                    return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                }
+                // psa_std batch 3: `heapq.<fn>(...)`, same
+                // shape as the math intercept above.
+                if self.std_heapq && obj == "heapq" && ctx.lookup(obj).is_none() {
+                    let (sla_fn, arity): (&str, usize) = match method.as_str() {
+                        "heappush" => ("psa_heapq_heappush", 2),
+                        "heappop" => ("psa_heapq_heappop", 1),
+                        "heapify" => ("psa_heapq_heapify", 1),
+                        "heapreplace" => ("psa_heapq_heapreplace", 2),
+                        "heappushpop" => ("psa_heapq_heappushpop", 2),
+                        "nlargest" => ("psa_heapq_nlargest", 2),
+                        "nsmallest" => ("psa_heapq_nsmallest", 2),
+                        _ => {
+                            return Err(eerr(
+                                line,
+                                &format!(
+                                    "psa_std module `heapq` has no function `{}` in v1 (heappush / heappop / heapify / heapreplace / heappushpop / nlargest / nsmallest)",
+                                    method
+                                ),
+                            ))
+                        }
+                    };
+                    if args.len() != arity {
+                        return Err(eerr(
+                            line,
+                            &format!(
+                                "heapq.{} takes exactly {} positional argument(s) in v1 (the key= keyword is not covered)",
+                                method, arity
+                            ),
+                        ));
+                    }
+                    let mut acodes: Vec<String> = Vec::new();
+                    for a in args {
+                        acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                    }
+                    self.used_dyn = true;
+                    self.used_psa_heapq = true;
+                    return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                }
+                // psa_std batch 3: `base64.<fn>(...)`, same
+                // shape as the math intercept above. The
+                // two-argument casefold forms of b32decode /
+                // b16decode fold at emit time for a literal
+                // bool argument only (the intercept returns
+                // one expression and cannot branch on a
+                // runtime value -- BATCH-WIRING.md R7);
+                // anything else is a loud error.
+                if self.std_base64 && obj == "base64" && ctx.lookup(obj).is_none() {
+                    let (sla_fn, arity): (&str, usize) = match method.as_str() {
+                        "b64encode" => ("psa_base64_b64encode", 1),
+                        "b64decode" => ("psa_base64_b64decode", 1),
+                        "standard_b64encode" => ("psa_base64_standard_b64encode", 1),
+                        "standard_b64decode" => ("psa_base64_standard_b64decode", 1),
+                        "urlsafe_b64encode" => ("psa_base64_urlsafe_b64encode", 1),
+                        "urlsafe_b64decode" => ("psa_base64_urlsafe_b64decode", 1),
+                        "b32encode" => ("psa_base64_b32encode", 1),
+                        "b32decode" => ("psa_base64_b32decode", 1),
+                        "b16encode" => ("psa_base64_b16encode", 1),
+                        "b16decode" => ("psa_base64_b16decode", 1),
+                        _ => {
+                            return Err(eerr(
+                                line,
+                                &format!(
+                                    "psa_std module `base64` has no function `{}` in v1 (b64encode / b64decode / standard_b64encode / standard_b64decode / urlsafe_b64encode / urlsafe_b64decode / b32encode / b32decode / b16encode / b16decode)",
+                                    method
+                                ),
+                            ))
+                        }
+                    };
+                    let casefold_form =
+                        (method == "b32decode" || method == "b16decode") && args.len() == 2;
+                    let sla_fn = if casefold_form {
+                        match &args[1] {
+                            Expr::Bool(true) => {
+                                if method == "b32decode" {
+                                    "psa_base64_b32decode_casefold"
+                                } else {
+                                    "psa_base64_b16decode_casefold"
+                                }
+                            }
+                            Expr::Bool(false) => sla_fn,
+                            _ => {
+                                return Err(eerr(
+                                    line,
+                                    &format!(
+                                        "base64.{} casefold argument must be a literal bool in v1",
+                                        method
+                                    ),
+                                ))
+                            }
+                        }
+                    } else {
+                        sla_fn
+                    };
+                    if args.len() != arity && !casefold_form {
+                        return Err(eerr(
+                            line,
+                            &format!(
+                                "base64.{} takes exactly {} positional argument(s) in v1",
+                                method, arity
+                            ),
+                        ));
+                    }
+                    let mut acodes: Vec<String> = Vec::new();
+                    let emit_n = if casefold_form { 1 } else { args.len() };
+                    for a in args.iter().take(emit_n) {
+                        acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                    }
+                    self.used_dyn = true;
+                    self.used_psa_base64 = true;
+                    return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                }
+                // psa_std batch 3: `random.<fn>(...)`.
+                // Default padding materialises missing
+                // arguments as runtime box calls, as in the
+                // bisect intercept. Only the positional forms
+                // of `choices` are wired: the keyword forms
+                // (k= / cum_weights=) are not implementable
+                // on the current parser (MethodCall carries
+                // no kwargs -- BATCH-WIRING.md R1) and fail
+                // at parse time; a positional None weights
+                // means unweighted, as in CPython.
+                if self.std_random && obj == "random" && ctx.lookup(obj).is_none() {
+                    match method.as_str() {
+                        "seed" | "random" | "getrandbits" | "randbytes" | "randrange"
+                        | "randint" | "choice" | "shuffle" | "sample" | "choices"
+                        | "uniform" | "triangular" => {}
+                        _ => {
+                            return Err(eerr(
+                                line,
+                                &format!(
+                                    "psa_std module `random` has no function `{}` in v1 (seed / random / getrandbits / randbytes / randrange / randint / choice / shuffle / sample / choices / uniform / triangular)",
+                                    method
+                                ),
+                            ))
+                        }
+                    }
+                    let mut acodes: Vec<String> = Vec::new();
+                    for a in args {
+                        acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                    }
+                    let sla_fn: &str = match method.as_str() {
+                        "seed" => {
+                            if args.len() > 1 {
+                                return Err(eerr(
+                                    line,
+                                    "random.seed takes zero or one positional argument in v1",
+                                ));
+                            }
+                            if acodes.is_empty() {
+                                acodes.push("__psa_m_none()".to_string());
+                            }
+                            "psa_random_seed"
+                        }
+                        "random" => {
+                            if !args.is_empty() {
+                                return Err(eerr(
+                                    line,
+                                    "random.random takes no arguments in v1",
+                                ));
+                            }
+                            "psa_random_random"
+                        }
+                        "getrandbits" | "randbytes" | "choice" | "shuffle" => {
+                            if args.len() != 1 {
+                                return Err(eerr(
+                                    line,
+                                    &format!(
+                                        "random.{} takes exactly one positional argument in v1",
+                                        method
+                                    ),
+                                ));
+                            }
+                            match method.as_str() {
+                                "getrandbits" => "psa_random_getrandbits",
+                                "randbytes" => "psa_random_randbytes",
+                                "choice" => "psa_random_choice",
+                                _ => "psa_random_shuffle",
+                            }
+                        }
+                        "randint" | "sample" | "uniform" => {
+                            if args.len() != 2 {
+                                return Err(eerr(
+                                    line,
+                                    &format!(
+                                        "random.{} takes exactly two positional arguments in v1",
+                                        method
+                                    ),
+                                ));
+                            }
+                            match method.as_str() {
+                                "randint" => "psa_random_randint",
+                                "sample" => "psa_random_sample",
+                                _ => "psa_random_uniform",
+                            }
+                        }
+                        "randrange" => match args.len() {
+                            1 => "psa_random_randrange1",
+                            2 => "psa_random_randrange2",
+                            3 => "psa_random_randrange3",
+                            _ => {
+                                return Err(eerr(
+                                    line,
+                                    "random.randrange takes one to three positional arguments in v1",
+                                ))
+                            }
+                        },
+                        "choices" => match args.len() {
+                            1 => {
+                                acodes.push("__psa_box_int(1)".to_string());
+                                "psa_random_choices_k"
+                            }
+                            2 => {
+                                if matches!(args[1], Expr::NoneLit) {
+                                    acodes.truncate(1);
+                                    acodes.push("__psa_box_int(1)".to_string());
+                                    "psa_random_choices_k"
+                                } else {
+                                    acodes.push("__psa_box_int(1)".to_string());
+                                    "psa_random_choices_w"
+                                }
+                            }
+                            3 => {
+                                if matches!(args[1], Expr::NoneLit) {
+                                    let kcode = acodes.pop().unwrap();
+                                    acodes.truncate(1);
+                                    acodes.push(kcode);
+                                    "psa_random_choices_k"
+                                } else {
+                                    "psa_random_choices_w"
+                                }
+                            }
+                            _ => {
+                                return Err(eerr(
+                                    line,
+                                    "random.choices takes one to three positional arguments in v1 (the k= / cum_weights= keyword forms are not covered)",
+                                ))
+                            }
+                        },
+                        "triangular" => {
+                            if args.len() > 3 {
+                                return Err(eerr(
+                                    line,
+                                    "random.triangular takes zero to three positional arguments in v1",
+                                ));
+                            }
+                            let pads = [
+                                "__psa_box_float(0.0)",
+                                "__psa_box_float(1.0)",
+                                "__psa_m_none()",
+                            ];
+                            while acodes.len() < 3 {
+                                let p = pads[acodes.len()];
+                                acodes.push(p.to_string());
+                            }
+                            "psa_random_triangular"
+                        }
+                        _ => unreachable!(),
+                    };
+                    self.used_dyn = true;
+                    self.used_psa_random = true;
+                    return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                }
+                // psa_std batch 3: `re.<fn>(...)`. CPython's
+                // flags argument defaults to 0; the intercept
+                // implements the defaulting by appending a
+                // boxed int 0 to the shorter forms (the
+                // decision WIRING-re.md leaves to the batch,
+                // recorded in BATCH-WIRING.md). The flag
+                // constants are zero-argument calls, as
+                // std-module attribute reads are not wired.
+                // There is deliberately no `compile` entry:
+                // it hits the unknown-name error.
+                if self.std_re && obj == "re" && ctx.lookup(obj).is_none() {
+                    let (sla_fn, arity): (&str, usize) = match method.as_str() {
+                        "match" => ("psa_re_match", 3),
+                        "search" => ("psa_re_search", 3),
+                        "fullmatch" => ("psa_re_fullmatch", 3),
+                        "findall" => ("psa_re_findall", 3),
+                        "split" => ("psa_re_split", 3),
+                        "split_maxsplit" => ("psa_re_split_maxsplit", 4),
+                        "sub" => ("psa_re_sub", 4),
+                        "sub_count" => ("psa_re_sub_count", 5),
+                        "subn" => ("psa_re_subn", 4),
+                        "subn_count" => ("psa_re_subn_count", 5),
+                        "escape" => ("psa_re_escape", 1),
+                        "IGNORECASE" => ("psa_re_ignorecase", 0),
+                        "MULTILINE" => ("psa_re_multiline", 0),
+                        "DOTALL" => ("psa_re_dotall", 0),
+                        "ASCII" => ("psa_re_ascii", 0),
+                        "VERBOSE" => ("psa_re_verbose", 0),
+                        _ => {
+                            return Err(eerr(
+                                line,
+                                &format!(
+                                    "psa_std module `re` has no function `{}` in v1 (match / search / fullmatch / findall / split / split_maxsplit / sub / sub_count / subn / subn_count / escape / IGNORECASE / MULTILINE / DOTALL / ASCII / VERBOSE; compile is not covered)",
+                                    method
+                                ),
+                            ))
+                        }
+                    };
+                    let defaultable = matches!(
+                        method.as_str(),
+                        "match" | "search" | "fullmatch" | "findall" | "split" | "sub"
+                            | "subn"
+                    );
+                    if args.len() != arity && !(defaultable && args.len() == arity - 1) {
+                        return Err(eerr(
+                            line,
+                            &format!(
+                                "re.{} takes {} positional argument(s) in v1{}",
+                                method,
+                                arity,
+                                if defaultable {
+                                    " (flags may be omitted)"
+                                } else {
+                                    ""
+                                }
+                            ),
+                        ));
+                    }
+                    let mut acodes: Vec<String> = Vec::new();
+                    for a in args {
+                        acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                    }
+                    if defaultable && acodes.len() == arity - 1 {
+                        acodes.push("__psa_box_int(0)".to_string());
+                    }
+                    self.used_dyn = true;
+                    self.used_psa_re = true;
+                    return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                }
+                // psa_std net group: `socket.<fn>(...)`.
+                // Module-level functions only; method calls
+                // on socket objects held in variables await
+                // std-object tracking (GAP-net.md N-1). The
+                // constants are zero-argument calls, as
+                // std-module attribute reads are not wired
+                // (N-2). `socket.socket(family)` pads
+                // SOCK_STREAM (boxed int 1) per
+                // WIRING-socket.md.
+                if self.std_socket && obj == "socket" && ctx.lookup(obj).is_none() {
+                    match method.as_str() {
+                        "socket" | "create_connection" | "gethostname" | "gethostbyname"
+                        | "gethostbyname_ex" | "gethostbyaddr" | "getaddrinfo"
+                        | "getnameinfo" | "socketpair" | "fromfd" | "inet_aton"
+                        | "inet_ntoa" | "inet_pton" | "inet_ntop" | "AF_INET" | "AF_INET6"
+                        | "SOCK_STREAM" | "SOCK_DGRAM" | "SOL_SOCKET" => {}
+                        _ => {
+                            return Err(eerr(
+                                line,
+                                &format!(
+                                    "psa_std module `socket` has no function `{}` in v1 (socket / create_connection / gethostname / gethostbyname / gethostbyname_ex / gethostbyaddr / getaddrinfo / getnameinfo / socketpair / fromfd / inet_aton / inet_ntoa / inet_pton / inet_ntop / AF_INET / AF_INET6 / SOCK_STREAM / SOCK_DGRAM / SOL_SOCKET; object methods such as connect / send / recv are not covered)",
+                                    method
+                                ),
+                            ))
+                        }
+                    }
+                    let mut acodes: Vec<String> = Vec::new();
+                    for a in args {
+                        acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                    }
+                    let sla_fn: &str = match method.as_str() {
+                        "socket" => match args.len() {
+                            0 => "psa_socket_new_default",
+                            1 => {
+                                acodes.push("__psa_box_int(1)".to_string());
+                                "psa_socket_new"
+                            }
+                            2 => "psa_socket_new",
+                            _ => {
+                                return Err(eerr(
+                                    line,
+                                    "socket.socket takes zero to two positional arguments in v1",
+                                ))
+                            }
+                        },
+                        "create_connection" => match args.len() {
+                            1 => "psa_socket_create_connection_addr",
+                            2 => "psa_socket_create_connection_addr_timeout",
+                            _ => {
+                                return Err(eerr(
+                                    line,
+                                    "socket.create_connection takes one or two positional arguments in v1",
+                                ))
+                            }
+                        },
+                        "gethostname" | "socketpair" | "AF_INET" | "AF_INET6" | "SOCK_STREAM"
+                        | "SOCK_DGRAM" | "SOL_SOCKET" => {
+                            if !args.is_empty() {
+                                return Err(eerr(
+                                    line,
+                                    &format!("socket.{} takes no arguments in v1", method),
+                                ));
+                            }
+                            match method.as_str() {
+                                "gethostname" => "psa_socket_gethostname",
+                                "socketpair" => "psa_socket_socketpair",
+                                "AF_INET" => "psa_socket_af_inet",
+                                "AF_INET6" => "psa_socket_af_inet6",
+                                "SOCK_STREAM" => "psa_socket_sock_stream",
+                                "SOCK_DGRAM" => "psa_socket_sock_dgram",
+                                _ => "psa_socket_sol_socket",
+                            }
+                        }
+                        "gethostbyname" | "gethostbyname_ex" | "gethostbyaddr" | "fromfd"
+                        | "inet_aton" | "inet_ntoa" => {
+                            if args.len() != 1 {
+                                return Err(eerr(
+                                    line,
+                                    &format!(
+                                        "socket.{} takes exactly one positional argument in v1",
+                                        method
+                                    ),
+                                ));
+                            }
+                            match method.as_str() {
+                                "gethostbyname" => "psa_socket_gethostbyname",
+                                "gethostbyname_ex" => "psa_socket_gethostbyname_ex",
+                                "gethostbyaddr" => "psa_socket_gethostbyaddr",
+                                "fromfd" => "psa_socket_fromfd",
+                                "inet_aton" => "psa_socket_inet_aton",
+                                _ => "psa_socket_inet_ntoa",
+                            }
+                        }
+                        "getaddrinfo" | "getnameinfo" | "inet_pton" | "inet_ntop" => {
+                            if args.len() != 2 {
+                                return Err(eerr(
+                                    line,
+                                    &format!(
+                                        "socket.{} takes exactly two positional arguments in v1",
+                                        method
+                                    ),
+                                ));
+                            }
+                            match method.as_str() {
+                                "getaddrinfo" => "psa_socket_getaddrinfo",
+                                "getnameinfo" => "psa_socket_getnameinfo",
+                                "inet_pton" => "psa_socket_inet_pton",
+                                _ => "psa_socket_inet_ntop",
+                            }
+                        }
+                        _ => unreachable!(),
+                    };
+                    self.used_dyn = true;
+                    self.used_psa_socket = true;
+                    return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                }
+                // psa_std net group: `urllib.<fn>(...)`.
+                // urllib.parse and urllib.request are
+                // flattened into this one module
+                // (WIRING-urllib.md); the submodule
+                // spellings are not wired. hostname / port
+                // are spelled hostname_of / port_of, as
+                // std-module attribute reads are not wired.
+                // Response and Request object methods
+                // await std-object tracking (GAP-net.md
+                // N-1); the function forms live in
+                // urllib.sla and are harness-verified.
+                if self.std_urllib && obj == "urllib" && ctx.lookup(obj).is_none() {
+                    match method.as_str() {
+                        "urlsplit" | "urlunsplit" | "urljoin" | "quote" | "quote_plus"
+                        | "unquote" | "unquote_plus" | "urlencode" | "parse_qs" | "parse_qsl"
+                        | "hostname_of" | "port_of" | "urlopen" | "Request" => {}
+                        _ => {
+                            return Err(eerr(
+                                line,
+                                &format!(
+                                    "psa_std module `urllib` has no function `{}` in v1 (urlsplit / urlunsplit / urljoin / quote / quote_plus / unquote / unquote_plus / urlencode / parse_qs / parse_qsl / hostname_of / port_of / urlopen / Request; object methods such as read / getcode / getheader are not covered)",
+                                    method
+                                ),
+                            ))
+                        }
+                    }
+                    let mut acodes: Vec<String> = Vec::new();
+                    for a in args {
+                        acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                    }
+                    let sla_fn: &str = match method.as_str() {
+                        "urlsplit" | "urlunsplit" | "unquote" | "unquote_plus" | "hostname_of"
+                        | "port_of" => {
+                            if args.len() != 1 {
+                                return Err(eerr(
+                                    line,
+                                    &format!(
+                                        "urllib.{} takes exactly one positional argument in v1",
+                                        method
+                                    ),
+                                ));
+                            }
+                            match method.as_str() {
+                                "urlsplit" => "psa_urllib_parse_urlsplit",
+                                "urlunsplit" => "psa_urllib_parse_urlunsplit",
+                                "unquote" => "psa_urllib_parse_unquote",
+                                "unquote_plus" => "psa_urllib_parse_unquote_plus",
+                                "hostname_of" => "psa_urllib_parse_hostname",
+                                _ => "psa_urllib_parse_port",
+                            }
+                        }
+                        "urljoin" => {
+                            if args.len() != 2 {
+                                return Err(eerr(
+                                    line,
+                                    "urllib.urljoin takes exactly two positional arguments in v1",
+                                ));
+                            }
+                            "psa_urllib_parse_urljoin"
+                        }
+                        "quote" => match args.len() {
+                            1 => "psa_urllib_parse_quote",
+                            2 => "psa_urllib_parse_quote_safe",
+                            _ => {
+                                return Err(eerr(
+                                    line,
+                                    "urllib.quote takes one or two positional arguments in v1",
+                                ))
+                            }
+                        },
+                        "quote_plus" => match args.len() {
+                            1 => "psa_urllib_parse_quote_plus",
+                            2 => "psa_urllib_parse_quote_plus_safe",
+                            _ => {
+                                return Err(eerr(
+                                    line,
+                                    "urllib.quote_plus takes one or two positional arguments in v1",
+                                ))
+                            }
+                        },
+                        "urlencode" => match args.len() {
+                            1 => "psa_urllib_parse_urlencode",
+                            2 => "psa_urllib_parse_urlencode_doseq",
+                            _ => {
+                                return Err(eerr(
+                                    line,
+                                    "urllib.urlencode takes one or two positional arguments in v1",
+                                ))
+                            }
+                        },
+                        "parse_qs" => match args.len() {
+                            1 => "psa_urllib_parse_parse_qs",
+                            2 => "psa_urllib_parse_parse_qs_kb",
+                            _ => {
+                                return Err(eerr(
+                                    line,
+                                    "urllib.parse_qs takes one or two positional arguments in v1",
+                                ))
+                            }
+                        },
+                        "parse_qsl" => match args.len() {
+                            1 => "psa_urllib_parse_parse_qsl",
+                            2 => "psa_urllib_parse_parse_qsl_kb",
+                            _ => {
+                                return Err(eerr(
+                                    line,
+                                    "urllib.parse_qsl takes one or two positional arguments in v1",
+                                ))
+                            }
+                        },
+                        "urlopen" => match args.len() {
+                            1 => "psa_urllib_urlopen",
+                            2 => "psa_urllib_urlopen_data",
+                            3 => "psa_urllib_urlopen_full",
+                            _ => {
+                                return Err(eerr(
+                                    line,
+                                    "urllib.urlopen takes one to three positional arguments in v1",
+                                ))
+                            }
+                        },
+                        "Request" => match args.len() {
+                            1 => "psa_urllib_request_new",
+                            2 => "psa_urllib_request_new_data",
+                            3 => {
+                                acodes.push("__psa_m_none()".to_string());
+                                "psa_urllib_request_new_full"
+                            }
+                            4 => "psa_urllib_request_new_full",
+                            _ => {
+                                return Err(eerr(
+                                    line,
+                                    "urllib.Request takes one to four positional arguments in v1",
+                                ))
+                            }
+                        },
+                        _ => unreachable!(),
+                    };
+                    self.used_dyn = true;
+                    self.used_psa_urllib = true;
+                    return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                }
                 // D6: a method call on an imported module:
                 // `foo.bar(...)` is a call of the module def
                 // `foo.bar`; `foo.Klass(...)` constructs a
@@ -6472,6 +7768,1170 @@ impl Emitter {
                                 self.used_dyn = true;
                                 self.used_psa_json = true;
                                 return Ok((format!("{}({})", sla_fn, acode), Ty::Dyn));
+                            }
+                        }
+                    }
+                }
+                // psa_std L1 batch 2: the Call(Attr) form of
+                // the math / string intercepts, mirroring the
+                // json block above (same entry points, same
+                // arity rules, keywords refused).
+                if self.std_math || self.std_string {
+                    if let Expr::Attr(base, mname) = &**callee {
+                        if let Expr::Name(n) = &**base {
+                            if n == "math" && self.std_math && ctx.lookup(n).is_none() {
+                                let (sla_fn, arity): (&str, usize) = match mname.as_str() {
+                                    "floor" => ("psa_math_floor", 1),
+                                    "ceil" => ("psa_math_ceil", 1),
+                                    "trunc" => ("psa_math_trunc", 1),
+                                    "fabs" => ("psa_math_fabs", 1),
+                                    "sqrt" => ("psa_math_sqrt", 1),
+                                    "sin" => ("psa_math_sin", 1),
+                                    "cos" => ("psa_math_cos", 1),
+                                    "degrees" => ("psa_math_degrees", 1),
+                                    "radians" => ("psa_math_radians", 1),
+                                    "factorial" => ("psa_math_factorial", 1),
+                                    "isqrt" => ("psa_math_isqrt", 1),
+                                    "gcd" => ("psa_math_gcd", 2),
+                                    "lcm" => ("psa_math_lcm", 2),
+                                    "comb" => ("psa_math_comb", 2),
+                                    "perm" => ("psa_math_perm", 2),
+                                    "pow" => ("psa_math_pow", 2),
+                                    "isclose" => ("psa_math_isclose", 2),
+                                    _ => {
+                                        return Err(eerr(
+                                            line,
+                                            &format!(
+                                                "psa_std module `math` has no function `{}` in v1 (floor / ceil / trunc / fabs / sqrt / sin / cos / degrees / radians / factorial / isqrt / gcd / lcm / comb / perm / pow / isclose)",
+                                                mname
+                                            ),
+                                        ))
+                                    }
+                                };
+                                if args.len() != arity || !kwargs.is_empty() {
+                                    return Err(eerr(
+                                        line,
+                                        &format!(
+                                            "math.{} takes exactly {} positional argument(s) in v1",
+                                            mname, arity
+                                        ),
+                                    ));
+                                }
+                                let mut acodes: Vec<String> = Vec::new();
+                                for a in args {
+                                    acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                                }
+                                self.used_dyn = true;
+                                self.used_psa_math = true;
+                                return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                            }
+                            if n == "string" && self.std_string && ctx.lookup(n).is_none() {
+                                if mname != "capwords" {
+                                    return Err(eerr(
+                                        line,
+                                        &format!(
+                                            "psa_std module `string` has no function `{}` in v1 (capwords; the constants are values, not functions)",
+                                            mname
+                                        ),
+                                    ));
+                                }
+                                if (args.len() != 1 && args.len() != 2) || !kwargs.is_empty() {
+                                    return Err(eerr(
+                                        line,
+                                        "string.capwords takes one or two positional arguments in v1",
+                                    ));
+                                }
+                                let mut acodes: Vec<String> = Vec::new();
+                                for a in args {
+                                    acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                                }
+                                self.used_dyn = true;
+                                self.used_psa_string = true;
+                                let sla_fn = if args.len() == 2 {
+                                    "psa_string_capwords_sep"
+                                } else {
+                                    "psa_string_capwords"
+                                };
+                                return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                            }
+                        }
+                    }
+                }
+                // psa_std batch 3: the Call(Attr) forms of
+                // the csv / logging / argparse intercepts,
+                // mirroring the MethodCall blocks above (same
+                // entry points, same arity rules, keywords
+                // refused).
+                if self.std_csv || self.std_logging || self.std_argparse {
+                    if let Expr::Attr(base, mname) = &**callee {
+                        if let Expr::Name(n) = &**base {
+                            if n == "csv" && self.std_csv && ctx.lookup(n).is_none() {
+                                let (sla_fn, arity): (&str, usize) = match mname.as_str() {
+                                    "reads" => ("psa_csv_reads", 1),
+                                    "reads_d" => ("psa_csv_reads_d", 2),
+                                    "reader" => ("psa_csv_reader", 1),
+                                    "reader_d" => ("psa_csv_reader_d", 2),
+                                    "writes" => ("psa_csv_writes", 1),
+                                    "writes_d" => ("psa_csv_writes_d", 2),
+                                    "write_rows" => ("psa_csv_write_rows", 3),
+                                    _ => {
+                                        return Err(eerr(
+                                            line,
+                                            &format!(
+                                                "psa_std module `csv` has no function `{}` in v1 (reads / reads_d / reader / reader_d / writes / writes_d / write_rows)",
+                                                mname
+                                            ),
+                                        ))
+                                    }
+                                };
+                                if args.len() != arity || !kwargs.is_empty() {
+                                    return Err(eerr(
+                                        line,
+                                        &format!(
+                                            "csv.{} takes exactly {} positional argument(s) in v1",
+                                            mname, arity
+                                        ),
+                                    ));
+                                }
+                                let mut acodes: Vec<String> = Vec::new();
+                                for a in args {
+                                    acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                                }
+                                self.used_dyn = true;
+                                self.used_psa_csv = true;
+                                if mname == "write_rows" {
+                                    self.used_file = true;
+                                }
+                                return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                            }
+                            if n == "logging" && self.std_logging && ctx.lookup(n).is_none() {
+                                if !kwargs.is_empty() {
+                                    return Err(eerr(
+                                        line,
+                                        &format!(
+                                            "logging.{} takes positional arguments only in v1 (the Call form refuses keywords)",
+                                            mname
+                                        ),
+                                    ));
+                                }
+                                let root_fn: Option<&str> = match mname.as_str() {
+                                    "debug" => Some("psa_logging_root_debug"),
+                                    "info" => Some("psa_logging_root_info"),
+                                    "warning" => Some("psa_logging_root_warning"),
+                                    "error" => Some("psa_logging_root_error"),
+                                    "critical" => Some("psa_logging_root_critical"),
+                                    _ => None,
+                                };
+                                if let Some(sla_fn) = root_fn {
+                                    if args.is_empty() {
+                                        return Err(eerr(
+                                            line,
+                                            &format!(
+                                                "logging.{} takes at least one positional argument (the message) in v1",
+                                                mname
+                                            ),
+                                        ));
+                                    }
+                                    let msgcode = self.emit_dyn_value(ctx, &args[0], line)?;
+                                    let argscode = if args.len() == 1 {
+                                        "__psa_m_none()".to_string()
+                                    } else {
+                                        self.emit_dyn_value(
+                                            ctx,
+                                            &Expr::ListLit(args[1..].to_vec()),
+                                            line,
+                                        )?
+                                    };
+                                    self.used_dyn = true;
+                                    self.used_psa_logging = true;
+                                    return Ok((
+                                        format!("{}({}, {})", sla_fn, msgcode, argscode),
+                                        Ty::Dyn,
+                                    ));
+                                }
+                                if mname == "log" {
+                                    if args.len() < 2 {
+                                        return Err(eerr(
+                                            line,
+                                            "logging.log takes at least two positional arguments (level, message) in v1",
+                                        ));
+                                    }
+                                    let levelcode = self.emit_dyn_value(ctx, &args[0], line)?;
+                                    let msgcode = self.emit_dyn_value(ctx, &args[1], line)?;
+                                    let argscode = if args.len() == 2 {
+                                        "__psa_m_none()".to_string()
+                                    } else {
+                                        self.emit_dyn_value(
+                                            ctx,
+                                            &Expr::ListLit(args[2..].to_vec()),
+                                            line,
+                                        )?
+                                    };
+                                    self.used_dyn = true;
+                                    self.used_psa_logging = true;
+                                    return Ok((
+                                        format!(
+                                            "psa_logging_root_log({}, {}, {})",
+                                            levelcode, msgcode, argscode
+                                        ),
+                                        Ty::Dyn,
+                                    ));
+                                }
+                                let (sla_fn, arity): (&str, usize) = match mname.as_str() {
+                                    "getLogger" => ("psa_logging_get_logger", 1),
+                                    "set_level" => ("psa_logging_set_level", 2),
+                                    "get_effective_level" => {
+                                        ("psa_logging_get_effective_level", 1)
+                                    }
+                                    "basicConfig" => ("psa_logging_basic_config", 2),
+                                    "basicConfig_force" => {
+                                        ("psa_logging_basic_config_force", 2)
+                                    }
+                                    "level_debug" => ("psa_logging_level_debug", 0),
+                                    "level_info" => ("psa_logging_level_info", 0),
+                                    "level_warning" => ("psa_logging_level_warning", 0),
+                                    "level_error" => ("psa_logging_level_error", 0),
+                                    "level_critical" => ("psa_logging_level_critical", 0),
+                                    _ => {
+                                        return Err(eerr(
+                                            line,
+                                            &format!(
+                                                "psa_std module `logging` has no function `{}` in v1 (getLogger / set_level / get_effective_level / basicConfig / basicConfig_force / log / debug / info / warning / error / critical / level_debug / level_info / level_warning / level_error / level_critical)",
+                                                mname
+                                            ),
+                                        ))
+                                    }
+                                };
+                                if args.len() != arity {
+                                    return Err(eerr(
+                                        line,
+                                        &format!(
+                                            "logging.{} takes exactly {} positional argument(s) in v1",
+                                            mname, arity
+                                        ),
+                                    ));
+                                }
+                                let mut acodes: Vec<String> = Vec::new();
+                                for a in args {
+                                    acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                                }
+                                self.used_dyn = true;
+                                self.used_psa_logging = true;
+                                return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                            }
+                            if n == "argparse" && self.std_argparse && ctx.lookup(n).is_none() {
+                                if mname != "ArgumentParser" {
+                                    return Err(eerr(
+                                        line,
+                                        &format!(
+                                            "psa_std module `argparse` has no function `{}` in v1 (ArgumentParser)",
+                                            mname
+                                        ),
+                                    ));
+                                }
+                                if (args.len() != 1 && args.len() != 2) || !kwargs.is_empty() {
+                                    return Err(eerr(
+                                        line,
+                                        "argparse.ArgumentParser takes one or two positional arguments (prog, description) in v1",
+                                    ));
+                                }
+                                let mut acodes: Vec<String> = Vec::new();
+                                for a in args {
+                                    acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                                }
+                                if acodes.len() == 1 {
+                                    acodes.push("__psa_m_none()".to_string());
+                                }
+                                self.used_dyn = true;
+                                self.used_psa_argparse = true;
+                                return Ok((
+                                    format!("psa_argparse_new_parser({})", acodes.join(", ")),
+                                    Ty::Dyn,
+                                ));
+                            }
+                        }
+                    }
+                }
+                // psa_std batch 3: the Call(Attr) forms of
+                // the collections / itertools / functools
+                // intercepts, mirroring the MethodCall blocks
+                // above (keywords refused).
+                if self.std_collections || self.std_itertools || self.std_functools {
+                    if let Expr::Attr(base, mname) = &**callee {
+                        if let Expr::Name(n) = &**base {
+                            if n == "collections" && self.std_collections && ctx.lookup(n).is_none() {
+                                let (sla_fn, arity): (&str, usize) = match mname.as_str() {
+                                    "Counter" => ("psa_collections_counter_any", 1),
+                                    "defaultdict" => ("psa_collections_defaultdict_new", 1),
+                                    "deque" => ("psa_collections_deque_new", 1),
+                                    "ChainMap" => ("psa_collections_chainmap_new", 1),
+                                    "OrderedDict" => ("psa_collections_ordereddict_any", 1),
+                                    "namedtuple" => ("psa_collections_namedtuple", 2),
+                                    "counter_dict" => ("psa_collections_counter_dict", 1),
+                                    "counter_get" => ("psa_collections_counter_get", 2),
+                                    "counter_update" => ("psa_collections_counter_update", 2),
+                                    "counter_subtract" => {
+                                        ("psa_collections_counter_subtract", 2)
+                                    }
+                                    "counter_add" => ("psa_collections_counter_add", 2),
+                                    "counter_sub" => ("psa_collections_counter_sub", 2),
+                                    "counter_and" => ("psa_collections_counter_and", 2),
+                                    "counter_or" => ("psa_collections_counter_or", 2),
+                                    "counter_elements" => {
+                                        ("psa_collections_counter_elements", 1)
+                                    }
+                                    "counter_total" => ("psa_collections_counter_total", 1),
+                                    "counter_most_common" => {
+                                        ("psa_collections_counter_most_common", 1)
+                                    }
+                                    "counter_most_common_n" => {
+                                        ("psa_collections_counter_most_common_n", 2)
+                                    }
+                                    "defaultdict_get" => {
+                                        ("psa_collections_defaultdict_get", 3)
+                                    }
+                                    "deque_append" => ("psa_collections_deque_append", 2),
+                                    "deque_append_maxlen" => {
+                                        ("psa_collections_deque_append_maxlen", 3)
+                                    }
+                                    "deque_appendleft" => {
+                                        ("psa_collections_deque_appendleft", 2)
+                                    }
+                                    "deque_appendleft_maxlen" => {
+                                        ("psa_collections_deque_appendleft_maxlen", 3)
+                                    }
+                                    "deque_pop" => ("psa_collections_deque_pop", 1),
+                                    "deque_popleft" => ("psa_collections_deque_popleft", 1),
+                                    "deque_extend" => ("psa_collections_deque_extend", 2),
+                                    "deque_extendleft" => {
+                                        ("psa_collections_deque_extendleft", 2)
+                                    }
+                                    "deque_rotate" => ("psa_collections_deque_rotate", 2),
+                                    "deque_count" => ("psa_collections_deque_count", 2),
+                                    "deque_remove" => ("psa_collections_deque_remove", 2),
+                                    "deque_clear" => ("psa_collections_deque_clear", 1),
+                                    "chainmap_get" => ("psa_collections_chainmap_get", 2),
+                                    "chainmap_get_default" => {
+                                        ("psa_collections_chainmap_get_default", 3)
+                                    }
+                                    "chainmap_set" => ("psa_collections_chainmap_set", 3),
+                                    "chainmap_del" => ("psa_collections_chainmap_del", 2),
+                                    "chainmap_keys" => ("psa_collections_chainmap_keys", 1),
+                                    "chainmap_new_child" => {
+                                        ("psa_collections_chainmap_new_child", 2)
+                                    }
+                                    "chainmap_parents" => {
+                                        ("psa_collections_chainmap_parents", 1)
+                                    }
+                                    "ordereddict_move_to_end" => {
+                                        ("psa_collections_ordereddict_move_to_end", 2)
+                                    }
+                                    "ordereddict_move_to_end_first" => {
+                                        ("psa_collections_ordereddict_move_to_end_first", 2)
+                                    }
+                                    _ => {
+                                        return Err(eerr(
+                                            line,
+                                            &format!(
+                                                "psa_std module `collections` has no function `{}` in v1 (Counter / defaultdict / deque / ChainMap / OrderedDict / namedtuple / counter_* / defaultdict_get / deque_* / chainmap_* / ordereddict_move_to_end*)",
+                                                mname
+                                            ),
+                                        ))
+                                    }
+                                };
+                                let (sla_fn, arity) = if mname == "deque" && args.is_empty() {
+                                    ("psa_collections_deque_new_empty", 0)
+                                } else {
+                                    (sla_fn, arity)
+                                };
+                                if args.len() != arity || !kwargs.is_empty() {
+                                    return Err(eerr(
+                                        line,
+                                        &format!(
+                                            "collections.{} takes exactly {} positional argument(s) in v1",
+                                            mname, arity
+                                        ),
+                                    ));
+                                }
+                                let mut acodes: Vec<String> = Vec::new();
+                                for a in args {
+                                    acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                                }
+                                self.used_dyn = true;
+                                self.used_psa_collections = true;
+                                return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                            }
+                            if n == "itertools" && self.std_itertools && ctx.lookup(n).is_none() {
+                                let (sla_fn, arity): (&str, usize) = match mname.as_str() {
+                                    "chain" => ("psa_itertools_chain", 2),
+                                    "chain_from_iterable" => {
+                                        ("psa_itertools_chain_from_iterable", 1)
+                                    }
+                                    "islice" => ("psa_itertools_islice_stop", 2),
+                                    "repeat" => ("psa_itertools_repeat", 2),
+                                    "accumulate" => ("psa_itertools_accumulate", 1),
+                                    "accumulate_init" => ("psa_itertools_accumulate_init", 2),
+                                    "takewhile" => ("psa_itertools_takewhile", 2),
+                                    "dropwhile" => ("psa_itertools_dropwhile", 2),
+                                    "compress" => ("psa_itertools_compress", 2),
+                                    "starmap" => ("psa_itertools_starmap", 2),
+                                    "tee" => ("psa_itertools_tee2", 1),
+                                    "pairwise" => ("psa_itertools_pairwise", 1),
+                                    "zip_longest" => ("psa_itertools_zip_longest", 3),
+                                    "groupby" => ("psa_itertools_groupby", 1),
+                                    "product" => ("psa_itertools_product", 2),
+                                    "product_from" => ("psa_itertools_product_from", 1),
+                                    "permutations" => ("psa_itertools_permutations_full", 1),
+                                    "combinations" => ("psa_itertools_combinations", 2),
+                                    "combinations_with_replacement" => {
+                                        ("psa_itertools_combinations_with_replacement", 2)
+                                    }
+                                    "count" => ("psa_itertools_count", 2),
+                                    "cycle" => ("psa_itertools_cycle", 1),
+                                    _ => {
+                                        return Err(eerr(
+                                            line,
+                                            &format!(
+                                                "psa_std module `itertools` has no function `{}` in v1 (chain / chain_from_iterable / islice / repeat / accumulate / accumulate_init / takewhile / dropwhile / compress / starmap / tee / pairwise / zip_longest / groupby / product / product_from / permutations / combinations / combinations_with_replacement / count / cycle)",
+                                                mname
+                                            ),
+                                        ))
+                                    }
+                                };
+                                let sla_fn = match (mname.as_str(), args.len()) {
+                                    ("islice", 3) => "psa_itertools_islice_start_stop",
+                                    ("islice", 4) => "psa_itertools_islice_start_stop_step",
+                                    ("accumulate", 2) => "psa_itertools_accumulate_fn",
+                                    ("groupby", 2) => "psa_itertools_groupby_key",
+                                    ("permutations", 2) => "psa_itertools_permutations",
+                                    _ => sla_fn,
+                                };
+                                let arity_ok = match mname.as_str() {
+                                    "islice" => {
+                                        args.len() == 2 || args.len() == 3 || args.len() == 4
+                                    }
+                                    "accumulate" | "groupby" | "permutations" => {
+                                        args.len() == 1 || args.len() == 2
+                                    }
+                                    _ => args.len() == arity,
+                                };
+                                if !arity_ok || !kwargs.is_empty() {
+                                    return Err(eerr(
+                                        line,
+                                        &format!(
+                                            "itertools.{} does not take {} positional argument(s) in v1",
+                                            mname,
+                                            args.len()
+                                        ),
+                                    ));
+                                }
+                                let mut acodes: Vec<String> = Vec::new();
+                                for a in args {
+                                    acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                                }
+                                self.used_dyn = true;
+                                self.used_psa_itertools = true;
+                                return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                            }
+                            if n == "functools" && self.std_functools && ctx.lookup(n).is_none() {
+                                let (sla_fn, arity): (&str, usize) = match mname.as_str() {
+                                    "reduce" => ("psa_functools_reduce", 2),
+                                    "partial" => ("psa_functools_partial", 2),
+                                    "lru_cache" => ("psa_functools_lru_cache", 1),
+                                    "cache" => ("psa_functools_cache", 1),
+                                    "cmp_to_key" => ("psa_functools_cmp_to_key", 1),
+                                    "total_ordering" => ("psa_functools_total_ordering", 1),
+                                    "singledispatch" => ("psa_functools_singledispatch", 1),
+                                    "wraps" => ("psa_functools_wraps", 1),
+                                    _ => {
+                                        return Err(eerr(
+                                            line,
+                                            &format!(
+                                                "psa_std module `functools` has no function `{}` in v1 (reduce / partial / lru_cache / cache / cmp_to_key / total_ordering / singledispatch / wraps)",
+                                                mname
+                                            ),
+                                        ))
+                                    }
+                                };
+                                let sla_fn = if mname == "reduce" && args.len() == 3 {
+                                    "psa_functools_reduce_init"
+                                } else {
+                                    sla_fn
+                                };
+                                if (args.len() != arity
+                                    && !(mname == "reduce" && args.len() == 3))
+                                    || !kwargs.is_empty()
+                                {
+                                    return Err(eerr(
+                                        line,
+                                        &format!(
+                                            "functools.{} takes exactly {} positional argument(s) in v1",
+                                            mname, arity
+                                        ),
+                                    ));
+                                }
+                                let mut acodes: Vec<String> = Vec::new();
+                                for a in args {
+                                    acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                                }
+                                self.used_dyn = true;
+                                self.used_psa_functools = true;
+                                return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                            }
+                        }
+                    }
+                }
+                // psa_std batch 3: the Call(Attr) forms of
+                // the bisect / heapq / base64 / random / re
+                // intercepts, mirroring the MethodCall blocks
+                // above (keywords refused). The net group
+                // (socket / urllib) mirrors are appended
+                // after the re block below.
+                if self.std_bisect || self.std_heapq || self.std_base64 || self.std_random
+                    || self.std_re || self.std_socket || self.std_urllib
+                {
+                    if let Expr::Attr(base, mname) = &**callee {
+                        if let Expr::Name(n) = &**base {
+                            if n == "bisect" && self.std_bisect && ctx.lookup(n).is_none() {
+                                let sla_fn: &str = match mname.as_str() {
+                                    "bisect_left" => "psa_bisect_bisect_left",
+                                    "bisect_right" => "psa_bisect_bisect_right",
+                                    "bisect" => "psa_bisect_bisect",
+                                    "insort_left" => "psa_bisect_insort_left",
+                                    "insort_right" => "psa_bisect_insort_right",
+                                    "insort" => "psa_bisect_insort",
+                                    _ => {
+                                        return Err(eerr(
+                                            line,
+                                            &format!(
+                                                "psa_std module `bisect` has no function `{}` in v1 (bisect_left / bisect_right / bisect / insort_left / insort_right / insort)",
+                                                mname
+                                            ),
+                                        ))
+                                    }
+                                };
+                                if (args.len() < 2 || args.len() > 4) || !kwargs.is_empty() {
+                                    return Err(eerr(
+                                        line,
+                                        &format!(
+                                            "bisect.{} takes two to four positional arguments in v1 (the key= keyword is not covered)",
+                                            mname
+                                        ),
+                                    ));
+                                }
+                                let mut acodes: Vec<String> = Vec::new();
+                                for a in args {
+                                    acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                                }
+                                if acodes.len() == 2 {
+                                    acodes.push("__psa_box_int(0)".to_string());
+                                }
+                                if acodes.len() == 3 {
+                                    acodes.push("__psa_m_none()".to_string());
+                                }
+                                self.used_dyn = true;
+                                self.used_psa_bisect = true;
+                                return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                            }
+                            if n == "heapq" && self.std_heapq && ctx.lookup(n).is_none() {
+                                let (sla_fn, arity): (&str, usize) = match mname.as_str() {
+                                    "heappush" => ("psa_heapq_heappush", 2),
+                                    "heappop" => ("psa_heapq_heappop", 1),
+                                    "heapify" => ("psa_heapq_heapify", 1),
+                                    "heapreplace" => ("psa_heapq_heapreplace", 2),
+                                    "heappushpop" => ("psa_heapq_heappushpop", 2),
+                                    "nlargest" => ("psa_heapq_nlargest", 2),
+                                    "nsmallest" => ("psa_heapq_nsmallest", 2),
+                                    _ => {
+                                        return Err(eerr(
+                                            line,
+                                            &format!(
+                                                "psa_std module `heapq` has no function `{}` in v1 (heappush / heappop / heapify / heapreplace / heappushpop / nlargest / nsmallest)",
+                                                mname
+                                            ),
+                                        ))
+                                    }
+                                };
+                                if args.len() != arity || !kwargs.is_empty() {
+                                    return Err(eerr(
+                                        line,
+                                        &format!(
+                                            "heapq.{} takes exactly {} positional argument(s) in v1 (the key= keyword is not covered)",
+                                            mname, arity
+                                        ),
+                                    ));
+                                }
+                                let mut acodes: Vec<String> = Vec::new();
+                                for a in args {
+                                    acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                                }
+                                self.used_dyn = true;
+                                self.used_psa_heapq = true;
+                                return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                            }
+                            if n == "base64" && self.std_base64 && ctx.lookup(n).is_none() {
+                                let (sla_fn, arity): (&str, usize) = match mname.as_str() {
+                                    "b64encode" => ("psa_base64_b64encode", 1),
+                                    "b64decode" => ("psa_base64_b64decode", 1),
+                                    "standard_b64encode" => {
+                                        ("psa_base64_standard_b64encode", 1)
+                                    }
+                                    "standard_b64decode" => {
+                                        ("psa_base64_standard_b64decode", 1)
+                                    }
+                                    "urlsafe_b64encode" => {
+                                        ("psa_base64_urlsafe_b64encode", 1)
+                                    }
+                                    "urlsafe_b64decode" => {
+                                        ("psa_base64_urlsafe_b64decode", 1)
+                                    }
+                                    "b32encode" => ("psa_base64_b32encode", 1),
+                                    "b32decode" => ("psa_base64_b32decode", 1),
+                                    "b16encode" => ("psa_base64_b16encode", 1),
+                                    "b16decode" => ("psa_base64_b16decode", 1),
+                                    _ => {
+                                        return Err(eerr(
+                                            line,
+                                            &format!(
+                                                "psa_std module `base64` has no function `{}` in v1 (b64encode / b64decode / standard_b64encode / standard_b64decode / urlsafe_b64encode / urlsafe_b64decode / b32encode / b32decode / b16encode / b16decode)",
+                                                mname
+                                            ),
+                                        ))
+                                    }
+                                };
+                                let casefold_form = (mname == "b32decode"
+                                    || mname == "b16decode")
+                                    && args.len() == 2;
+                                let sla_fn = if casefold_form {
+                                    match &args[1] {
+                                        Expr::Bool(true) => {
+                                            if mname == "b32decode" {
+                                                "psa_base64_b32decode_casefold"
+                                            } else {
+                                                "psa_base64_b16decode_casefold"
+                                            }
+                                        }
+                                        Expr::Bool(false) => sla_fn,
+                                        _ => {
+                                            return Err(eerr(
+                                                line,
+                                                &format!(
+                                                    "base64.{} casefold argument must be a literal bool in v1",
+                                                    mname
+                                                ),
+                                            ))
+                                        }
+                                    }
+                                } else {
+                                    sla_fn
+                                };
+                                if (args.len() != arity && !casefold_form)
+                                    || !kwargs.is_empty()
+                                {
+                                    return Err(eerr(
+                                        line,
+                                        &format!(
+                                            "base64.{} takes exactly {} positional argument(s) in v1",
+                                            mname, arity
+                                        ),
+                                    ));
+                                }
+                                let mut acodes: Vec<String> = Vec::new();
+                                let emit_n = if casefold_form { 1 } else { args.len() };
+                                for a in args.iter().take(emit_n) {
+                                    acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                                }
+                                self.used_dyn = true;
+                                self.used_psa_base64 = true;
+                                return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                            }
+                            if n == "random" && self.std_random && ctx.lookup(n).is_none() {
+                                if !kwargs.is_empty() {
+                                    return Err(eerr(
+                                        line,
+                                        &format!(
+                                            "random.{} takes positional arguments only in v1 (the Call form refuses keywords)",
+                                            mname
+                                        ),
+                                    ));
+                                }
+                                match mname.as_str() {
+                                    "seed" | "random" | "getrandbits" | "randbytes"
+                                    | "randrange" | "randint" | "choice" | "shuffle"
+                                    | "sample" | "choices" | "uniform" | "triangular" => {}
+                                    _ => {
+                                        return Err(eerr(
+                                            line,
+                                            &format!(
+                                                "psa_std module `random` has no function `{}` in v1 (seed / random / getrandbits / randbytes / randrange / randint / choice / shuffle / sample / choices / uniform / triangular)",
+                                                mname
+                                            ),
+                                        ))
+                                    }
+                                }
+                                let mut acodes: Vec<String> = Vec::new();
+                                for a in args {
+                                    acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                                }
+                                let sla_fn: &str = match mname.as_str() {
+                                    "seed" => {
+                                        if args.len() > 1 {
+                                            return Err(eerr(
+                                                line,
+                                                "random.seed takes zero or one positional argument in v1",
+                                            ));
+                                        }
+                                        if acodes.is_empty() {
+                                            acodes.push("__psa_m_none()".to_string());
+                                        }
+                                        "psa_random_seed"
+                                    }
+                                    "random" => {
+                                        if !args.is_empty() {
+                                            return Err(eerr(
+                                                line,
+                                                "random.random takes no arguments in v1",
+                                            ));
+                                        }
+                                        "psa_random_random"
+                                    }
+                                    "getrandbits" | "randbytes" | "choice" | "shuffle" => {
+                                        if args.len() != 1 {
+                                            return Err(eerr(
+                                                line,
+                                                &format!(
+                                                    "random.{} takes exactly one positional argument in v1",
+                                                    mname
+                                                ),
+                                            ));
+                                        }
+                                        match mname.as_str() {
+                                            "getrandbits" => "psa_random_getrandbits",
+                                            "randbytes" => "psa_random_randbytes",
+                                            "choice" => "psa_random_choice",
+                                            _ => "psa_random_shuffle",
+                                        }
+                                    }
+                                    "randint" | "sample" | "uniform" => {
+                                        if args.len() != 2 {
+                                            return Err(eerr(
+                                                line,
+                                                &format!(
+                                                    "random.{} takes exactly two positional arguments in v1",
+                                                    mname
+                                                ),
+                                            ));
+                                        }
+                                        match mname.as_str() {
+                                            "randint" => "psa_random_randint",
+                                            "sample" => "psa_random_sample",
+                                            _ => "psa_random_uniform",
+                                        }
+                                    }
+                                    "randrange" => match args.len() {
+                                        1 => "psa_random_randrange1",
+                                        2 => "psa_random_randrange2",
+                                        3 => "psa_random_randrange3",
+                                        _ => {
+                                            return Err(eerr(
+                                                line,
+                                                "random.randrange takes one to three positional arguments in v1",
+                                            ))
+                                        }
+                                    },
+                                    "choices" => match args.len() {
+                                        1 => {
+                                            acodes.push("__psa_box_int(1)".to_string());
+                                            "psa_random_choices_k"
+                                        }
+                                        2 => {
+                                            if matches!(args[1], Expr::NoneLit) {
+                                                acodes.truncate(1);
+                                                acodes.push("__psa_box_int(1)".to_string());
+                                                "psa_random_choices_k"
+                                            } else {
+                                                acodes.push("__psa_box_int(1)".to_string());
+                                                "psa_random_choices_w"
+                                            }
+                                        }
+                                        3 => {
+                                            if matches!(args[1], Expr::NoneLit) {
+                                                let kcode = acodes.pop().unwrap();
+                                                acodes.truncate(1);
+                                                acodes.push(kcode);
+                                                "psa_random_choices_k"
+                                            } else {
+                                                "psa_random_choices_w"
+                                            }
+                                        }
+                                        _ => {
+                                            return Err(eerr(
+                                                line,
+                                                "random.choices takes one to three positional arguments in v1 (the k= / cum_weights= keyword forms are not covered)",
+                                            ))
+                                        }
+                                    },
+                                    "triangular" => {
+                                        if args.len() > 3 {
+                                            return Err(eerr(
+                                                line,
+                                                "random.triangular takes zero to three positional arguments in v1",
+                                            ));
+                                        }
+                                        let pads = [
+                                            "__psa_box_float(0.0)",
+                                            "__psa_box_float(1.0)",
+                                            "__psa_m_none()",
+                                        ];
+                                        while acodes.len() < 3 {
+                                            let p = pads[acodes.len()];
+                                            acodes.push(p.to_string());
+                                        }
+                                        "psa_random_triangular"
+                                    }
+                                    _ => unreachable!(),
+                                };
+                                self.used_dyn = true;
+                                self.used_psa_random = true;
+                                return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                            }
+                            if n == "re" && self.std_re && ctx.lookup(n).is_none() {
+                                let (sla_fn, arity): (&str, usize) = match mname.as_str() {
+                                    "match" => ("psa_re_match", 3),
+                                    "search" => ("psa_re_search", 3),
+                                    "fullmatch" => ("psa_re_fullmatch", 3),
+                                    "findall" => ("psa_re_findall", 3),
+                                    "split" => ("psa_re_split", 3),
+                                    "split_maxsplit" => ("psa_re_split_maxsplit", 4),
+                                    "sub" => ("psa_re_sub", 4),
+                                    "sub_count" => ("psa_re_sub_count", 5),
+                                    "subn" => ("psa_re_subn", 4),
+                                    "subn_count" => ("psa_re_subn_count", 5),
+                                    "escape" => ("psa_re_escape", 1),
+                                    "IGNORECASE" => ("psa_re_ignorecase", 0),
+                                    "MULTILINE" => ("psa_re_multiline", 0),
+                                    "DOTALL" => ("psa_re_dotall", 0),
+                                    "ASCII" => ("psa_re_ascii", 0),
+                                    "VERBOSE" => ("psa_re_verbose", 0),
+                                    _ => {
+                                        return Err(eerr(
+                                            line,
+                                            &format!(
+                                                "psa_std module `re` has no function `{}` in v1 (match / search / fullmatch / findall / split / split_maxsplit / sub / sub_count / subn / subn_count / escape / IGNORECASE / MULTILINE / DOTALL / ASCII / VERBOSE; compile is not covered)",
+                                                mname
+                                            ),
+                                        ))
+                                    }
+                                };
+                                let defaultable = matches!(
+                                    mname.as_str(),
+                                    "match" | "search" | "fullmatch" | "findall" | "split"
+                                        | "sub" | "subn"
+                                );
+                                if (args.len() != arity
+                                    && !(defaultable && args.len() == arity - 1))
+                                    || !kwargs.is_empty()
+                                {
+                                    return Err(eerr(
+                                        line,
+                                        &format!(
+                                            "re.{} takes {} positional argument(s) in v1{}",
+                                            mname,
+                                            arity,
+                                            if defaultable {
+                                                " (flags may be omitted)"
+                                            } else {
+                                                ""
+                                            }
+                                        ),
+                                    ));
+                                }
+                                let mut acodes: Vec<String> = Vec::new();
+                                for a in args {
+                                    acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                                }
+                                if defaultable && acodes.len() == arity - 1 {
+                                    acodes.push("__psa_box_int(0)".to_string());
+                                }
+                                self.used_dyn = true;
+                                self.used_psa_re = true;
+                                return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                            }
+                            // psa_std net group: `socket.<fn>(...)`.
+                            // Module-level functions only; mname calls
+                            // on socket objects held in variables await
+                            // std-object tracking (GAP-net.md N-1). The
+                            // constants are zero-argument calls, as
+                            // std-module attribute reads are not wired
+                            // (N-2). `socket.socket(family)` pads
+                            // SOCK_STREAM (boxed int 1) per
+                            // WIRING-socket.md.
+                            if n == "socket" && self.std_socket && ctx.lookup(n).is_none() {
+                                if !kwargs.is_empty() {
+                                    return Err(eerr(
+                                        line,
+                                        &format!(
+                                            "socket.{} takes positional arguments only in v1 (the Call form refuses keywords)",
+                                            mname
+                                        ),
+                                    ));
+                                }
+                                match mname.as_str() {
+                                    "socket" | "create_connection" | "gethostname" | "gethostbyname"
+                                    | "gethostbyname_ex" | "gethostbyaddr" | "getaddrinfo"
+                                    | "getnameinfo" | "socketpair" | "fromfd" | "inet_aton"
+                                    | "inet_ntoa" | "inet_pton" | "inet_ntop" | "AF_INET" | "AF_INET6"
+                                    | "SOCK_STREAM" | "SOCK_DGRAM" | "SOL_SOCKET" => {}
+                                    _ => {
+                                        return Err(eerr(
+                                            line,
+                                            &format!(
+                                                "psa_std module `socket` has no function `{}` in v1 (socket / create_connection / gethostname / gethostbyname / gethostbyname_ex / gethostbyaddr / getaddrinfo / getnameinfo / socketpair / fromfd / inet_aton / inet_ntoa / inet_pton / inet_ntop / AF_INET / AF_INET6 / SOCK_STREAM / SOCK_DGRAM / SOL_SOCKET; object methods such as connect / send / recv are not covered)",
+                                                mname
+                                            ),
+                                        ))
+                                    }
+                                }
+                                let mut acodes: Vec<String> = Vec::new();
+                                for a in args {
+                                    acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                                }
+                                let sla_fn: &str = match mname.as_str() {
+                                    "socket" => match args.len() {
+                                        0 => "psa_socket_new_default",
+                                        1 => {
+                                            acodes.push("__psa_box_int(1)".to_string());
+                                            "psa_socket_new"
+                                        }
+                                        2 => "psa_socket_new",
+                                        _ => {
+                                            return Err(eerr(
+                                                line,
+                                                "socket.socket takes zero to two positional arguments in v1",
+                                            ))
+                                        }
+                                    },
+                                    "create_connection" => match args.len() {
+                                        1 => "psa_socket_create_connection_addr",
+                                        2 => "psa_socket_create_connection_addr_timeout",
+                                        _ => {
+                                            return Err(eerr(
+                                                line,
+                                                "socket.create_connection takes one or two positional arguments in v1",
+                                            ))
+                                        }
+                                    },
+                                    "gethostname" | "socketpair" | "AF_INET" | "AF_INET6" | "SOCK_STREAM"
+                                    | "SOCK_DGRAM" | "SOL_SOCKET" => {
+                                        if !args.is_empty() {
+                                            return Err(eerr(
+                                                line,
+                                                &format!("socket.{} takes no arguments in v1", mname),
+                                            ));
+                                        }
+                                        match mname.as_str() {
+                                            "gethostname" => "psa_socket_gethostname",
+                                            "socketpair" => "psa_socket_socketpair",
+                                            "AF_INET" => "psa_socket_af_inet",
+                                            "AF_INET6" => "psa_socket_af_inet6",
+                                            "SOCK_STREAM" => "psa_socket_sock_stream",
+                                            "SOCK_DGRAM" => "psa_socket_sock_dgram",
+                                            _ => "psa_socket_sol_socket",
+                                        }
+                                    }
+                                    "gethostbyname" | "gethostbyname_ex" | "gethostbyaddr" | "fromfd"
+                                    | "inet_aton" | "inet_ntoa" => {
+                                        if args.len() != 1 {
+                                            return Err(eerr(
+                                                line,
+                                                &format!(
+                                                    "socket.{} takes exactly one positional argument in v1",
+                                                    mname
+                                                ),
+                                            ));
+                                        }
+                                        match mname.as_str() {
+                                            "gethostbyname" => "psa_socket_gethostbyname",
+                                            "gethostbyname_ex" => "psa_socket_gethostbyname_ex",
+                                            "gethostbyaddr" => "psa_socket_gethostbyaddr",
+                                            "fromfd" => "psa_socket_fromfd",
+                                            "inet_aton" => "psa_socket_inet_aton",
+                                            _ => "psa_socket_inet_ntoa",
+                                        }
+                                    }
+                                    "getaddrinfo" | "getnameinfo" | "inet_pton" | "inet_ntop" => {
+                                        if args.len() != 2 {
+                                            return Err(eerr(
+                                                line,
+                                                &format!(
+                                                    "socket.{} takes exactly two positional arguments in v1",
+                                                    mname
+                                                ),
+                                            ));
+                                        }
+                                        match mname.as_str() {
+                                            "getaddrinfo" => "psa_socket_getaddrinfo",
+                                            "getnameinfo" => "psa_socket_getnameinfo",
+                                            "inet_pton" => "psa_socket_inet_pton",
+                                            _ => "psa_socket_inet_ntop",
+                                        }
+                                    }
+                                    _ => unreachable!(),
+                                };
+                                self.used_dyn = true;
+                                self.used_psa_socket = true;
+                                return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                            }
+                            // psa_std net group: `urllib.<fn>(...)`.
+                            // urllib.parse and urllib.request are
+                            // flattened into this one module
+                            // (WIRING-urllib.md); the submodule
+                            // spellings are not wired. hostname / port
+                            // are spelled hostname_of / port_of, as
+                            // std-module attribute reads are not wired.
+                            // Response and Request object methods
+                            // await std-object tracking (GAP-net.md
+                            // N-1); the function forms live in
+                            // urllib.sla and are harness-verified.
+                            if n == "urllib" && self.std_urllib && ctx.lookup(n).is_none() {
+                                if !kwargs.is_empty() {
+                                    return Err(eerr(
+                                        line,
+                                        &format!(
+                                            "urllib.{} takes positional arguments only in v1 (the Call form refuses keywords)",
+                                            mname
+                                        ),
+                                    ));
+                                }
+                                match mname.as_str() {
+                                    "urlsplit" | "urlunsplit" | "urljoin" | "quote" | "quote_plus"
+                                    | "unquote" | "unquote_plus" | "urlencode" | "parse_qs" | "parse_qsl"
+                                    | "hostname_of" | "port_of" | "urlopen" | "Request" => {}
+                                    _ => {
+                                        return Err(eerr(
+                                            line,
+                                            &format!(
+                                                "psa_std module `urllib` has no function `{}` in v1 (urlsplit / urlunsplit / urljoin / quote / quote_plus / unquote / unquote_plus / urlencode / parse_qs / parse_qsl / hostname_of / port_of / urlopen / Request; object methods such as read / getcode / getheader are not covered)",
+                                                mname
+                                            ),
+                                        ))
+                                    }
+                                }
+                                let mut acodes: Vec<String> = Vec::new();
+                                for a in args {
+                                    acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                                }
+                                let sla_fn: &str = match mname.as_str() {
+                                    "urlsplit" | "urlunsplit" | "unquote" | "unquote_plus" | "hostname_of"
+                                    | "port_of" => {
+                                        if args.len() != 1 {
+                                            return Err(eerr(
+                                                line,
+                                                &format!(
+                                                    "urllib.{} takes exactly one positional argument in v1",
+                                                    mname
+                                                ),
+                                            ));
+                                        }
+                                        match mname.as_str() {
+                                            "urlsplit" => "psa_urllib_parse_urlsplit",
+                                            "urlunsplit" => "psa_urllib_parse_urlunsplit",
+                                            "unquote" => "psa_urllib_parse_unquote",
+                                            "unquote_plus" => "psa_urllib_parse_unquote_plus",
+                                            "hostname_of" => "psa_urllib_parse_hostname",
+                                            _ => "psa_urllib_parse_port",
+                                        }
+                                    }
+                                    "urljoin" => {
+                                        if args.len() != 2 {
+                                            return Err(eerr(
+                                                line,
+                                                "urllib.urljoin takes exactly two positional arguments in v1",
+                                            ));
+                                        }
+                                        "psa_urllib_parse_urljoin"
+                                    }
+                                    "quote" => match args.len() {
+                                        1 => "psa_urllib_parse_quote",
+                                        2 => "psa_urllib_parse_quote_safe",
+                                        _ => {
+                                            return Err(eerr(
+                                                line,
+                                                "urllib.quote takes one or two positional arguments in v1",
+                                            ))
+                                        }
+                                    },
+                                    "quote_plus" => match args.len() {
+                                        1 => "psa_urllib_parse_quote_plus",
+                                        2 => "psa_urllib_parse_quote_plus_safe",
+                                        _ => {
+                                            return Err(eerr(
+                                                line,
+                                                "urllib.quote_plus takes one or two positional arguments in v1",
+                                            ))
+                                        }
+                                    },
+                                    "urlencode" => match args.len() {
+                                        1 => "psa_urllib_parse_urlencode",
+                                        2 => "psa_urllib_parse_urlencode_doseq",
+                                        _ => {
+                                            return Err(eerr(
+                                                line,
+                                                "urllib.urlencode takes one or two positional arguments in v1",
+                                            ))
+                                        }
+                                    },
+                                    "parse_qs" => match args.len() {
+                                        1 => "psa_urllib_parse_parse_qs",
+                                        2 => "psa_urllib_parse_parse_qs_kb",
+                                        _ => {
+                                            return Err(eerr(
+                                                line,
+                                                "urllib.parse_qs takes one or two positional arguments in v1",
+                                            ))
+                                        }
+                                    },
+                                    "parse_qsl" => match args.len() {
+                                        1 => "psa_urllib_parse_parse_qsl",
+                                        2 => "psa_urllib_parse_parse_qsl_kb",
+                                        _ => {
+                                            return Err(eerr(
+                                                line,
+                                                "urllib.parse_qsl takes one or two positional arguments in v1",
+                                            ))
+                                        }
+                                    },
+                                    "urlopen" => match args.len() {
+                                        1 => "psa_urllib_urlopen",
+                                        2 => "psa_urllib_urlopen_data",
+                                        3 => "psa_urllib_urlopen_full",
+                                        _ => {
+                                            return Err(eerr(
+                                                line,
+                                                "urllib.urlopen takes one to three positional arguments in v1",
+                                            ))
+                                        }
+                                    },
+                                    "Request" => match args.len() {
+                                        1 => "psa_urllib_request_new",
+                                        2 => "psa_urllib_request_new_data",
+                                        3 => {
+                                            acodes.push("__psa_m_none()".to_string());
+                                            "psa_urllib_request_new_full"
+                                        }
+                                        4 => "psa_urllib_request_new_full",
+                                        _ => {
+                                            return Err(eerr(
+                                                line,
+                                                "urllib.Request takes one to four positional arguments in v1",
+                                            ))
+                                        }
+                                    },
+                                    _ => unreachable!(),
+                                };
+                                self.used_dyn = true;
+                                self.used_psa_urllib = true;
+                                return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
                             }
                         }
                     }
@@ -8044,6 +10504,74 @@ fn fmt_f64(v: f64) -> String {
 /// spliced into programs that call json.dumps / json.loads.
 const PSA_JSON_SLA: &str = include_str!("../../../psa-std/json.sla");
 
+/// psa_std math module text (psa-std/math.sla in the repo),
+/// spliced into programs that call math.<fn>.
+const PSA_MATH_SLA: &str = include_str!("../../../psa-std/math.sla");
+
+/// psa_std string module text (psa-std/string.sla in the
+/// repo), spliced into programs that call string.capwords.
+const PSA_STRING_SLA: &str = include_str!("../../../psa-std/string.sla");
+
+/// psa_std csv module text (psa-std/csv.sla in the repo),
+/// spliced into programs that call csv.<fn>.
+const PSA_CSV_SLA: &str = include_str!("../../../psa-std/csv.sla");
+
+/// psa_std logging module text (psa-std/logging.sla in
+/// the repo), spliced into programs that call
+/// logging.<fn>. The text carries its own @import lines.
+const PSA_LOGGING_SLA: &str = include_str!("../../../psa-std/logging.sla");
+
+/// psa_std argparse module text (psa-std/argparse.sla in
+/// the repo), spliced into programs that call
+/// argparse.ArgumentParser. The text carries its own
+/// @import lines.
+const PSA_ARGPARSE_SLA: &str = include_str!("../../../psa-std/argparse.sla");
+
+/// psa_std collections module text
+/// (psa-std/collections.sla in the repo), spliced into
+/// programs that call collections.<fn>.
+const PSA_COLLECTIONS_SLA: &str = include_str!("../../../psa-std/collections.sla");
+
+/// psa_std itertools module text (psa-std/itertools.sla
+/// in the repo), spliced into programs that call
+/// itertools.<fn>.
+const PSA_ITERTOOLS_SLA: &str = include_str!("../../../psa-std/itertools.sla");
+
+/// psa_std functools module text (psa-std/functools.sla
+/// in the repo), spliced into programs that call
+/// functools.<fn>.
+const PSA_FUNCTOOLS_SLA: &str = include_str!("../../../psa-std/functools.sla");
+
+/// psa_std bisect module text (psa-std/bisect.sla in the
+/// repo), spliced into programs that call bisect.<fn>.
+const PSA_BISECT_SLA: &str = include_str!("../../../psa-std/bisect.sla");
+
+/// psa_std heapq module text (psa-std/heapq.sla in the
+/// repo), spliced into programs that call heapq.<fn>.
+const PSA_HEAPQ_SLA: &str = include_str!("../../../psa-std/heapq.sla");
+
+/// psa_std base64 module text (psa-std/base64.sla in the
+/// repo), spliced into programs that call base64.<fn>.
+const PSA_BASE64_SLA: &str = include_str!("../../../psa-std/base64.sla");
+
+/// psa_std random module text (psa-std/random.sla in the
+/// repo), spliced into programs that call random.<fn>.
+const PSA_RANDOM_SLA: &str = include_str!("../../../psa-std/random.sla");
+
+/// psa_std re module text (psa-std/re.sla in the repo),
+/// spliced into programs that call re.<fn>.
+const PSA_RE_SLA: &str = include_str!("../../../psa-std/re.sla");
+
+/// psa_std socket module text (psa-std/socket.sla in
+/// the repo), spliced into programs that call
+/// socket.<fn>.
+const PSA_SOCKET_SLA: &str = include_str!("../../../psa-std/socket.sla");
+
+/// psa_std urllib module text (psa-std/urllib.sla in
+/// the repo), spliced into programs that call
+/// urllib.<fn>.
+const PSA_URLLIB_SLA: &str = include_str!("../../../psa-std/urllib.sla");
+
 const DYN_RUNTIME: &str = r#"fn __psa_box_int(x: i64) -> PsaVal {
     return PsaVal { tag: 0, ipay: x, fpay: 0.0 };
 }
@@ -8362,7 +10890,7 @@ fn __psa_print_dyn(v: PsaVal) -> i32 {
     if v.tag == 12 { __psa_print_str(__psa_file_str(v)); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
     if v.tag == 13 { __psa_print_str(__psa_str_of(v)); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
     if v.tag == 14 { __psa_print_str(__psa_str_of(v)); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
-    if v.tag == 0 { println("{}", v.ipay); return 0; };
+    if v.tag == 0 { __psa_print_i64(v.ipay); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
     if v.tag == 2 {
         if v.ipay != 0 { println("True"); } else { println("False"); };
         return 0;

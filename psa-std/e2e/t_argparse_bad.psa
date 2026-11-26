@@ -1,0 +1,4 @@
+import argparse
+p = argparse.ArgumentParser("demo", "a demo program")
+p.add_argument("name")
+print("unreachable")

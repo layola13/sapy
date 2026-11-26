@@ -1,0 +1,300 @@
+@import "sa_std/time.sai"
+
+// psa_std datetime (feasibility landing): the exact
+// calendar core of CPython's datetime over PsaVal,
+// plus the UTC field surface the sa_std time externs
+// provide. See README-datetime.md for the contract
+// and GAP-datetime.md for what is blocked and why.
+// Panic code: 77163 invalid date / time value
+// (CPython ValueError: month or day out of range,
+// year outside 1..9999, ordinal out of range, a
+// field of the wrong type or a tuple of the wrong
+// shape where a date / datetime is required).
+//
+// Representation: a date is a tag-10 tuple of three
+// ints (year, month, day); a datetime is a tag-10
+// tuple of seven ints (year, month, day, hour,
+// minute, second, microsecond). These are plain
+// tuples, NOT class instances: there are no methods
+// and no attribute access (the stdlib class surface
+// does not exist yet -- GAP-datetime.md). All
+// calendar arithmetic is exact integer math
+// (Howard Hinnant's civil algorithms), independent
+// of the host clock; the sa_time_* getters over
+// unix milliseconds are used only for the
+// from-unix-ms and now surfaces, where they are the
+// same UTC field extraction CPython performs for
+// tz-aware UTC values.
+
+fn __psa_datetime_int(v: PsaVal) -> i64 {
+    if v.tag == 0 { return v.ipay; };
+    if v.tag == 2 { return v.ipay; };
+    panic(77163);
+}
+
+fn __psa_datetime_is_leap(y: i64) -> bool {
+    if y % 4 != 0 { return false; };
+    if y % 100 != 0 { return true; };
+    return y % 400 == 0;
+}
+
+fn __psa_datetime_dim(y: i64, m: i64) -> i64 {
+    // Days in month; m must be in 1..12 (checked by
+    // the caller).
+    if m == 2 {
+        if __psa_datetime_is_leap(y) { return 29; };
+        return 28;
+    };
+    if m == 4 { return 30; };
+    if m == 6 { return 30; };
+    if m == 9 { return 30; };
+    if m == 11 { return 30; };
+    return 31;
+}
+
+fn __psa_datetime_check_date(y: i64, m: i64, d: i64) -> void {
+    if y < 1 { panic(77163); };
+    if y > 9999 { panic(77163); };
+    if m < 1 { panic(77163); };
+    if m > 12 { panic(77163); };
+    if d < 1 { panic(77163); };
+    if d > __psa_datetime_dim(y, m) { panic(77163); };
+    return;
+}
+
+fn __psa_datetime_days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    // Days since 1970-01-01 (Hinnant's algorithm;
+    // exact for the full CPython year range).
+    let yy = y;
+    if m <= 2 { yy = yy - 1; };
+    let era = yy;
+    if era < 0 { era = (yy - 399) / 400; } else { era = yy / 400; };
+    let yoe = yy - era * 400;
+    let mp = m;
+    if mp > 2 { mp = mp - 3; } else { mp = mp + 9; };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+fn __psa_datetime_civil_from_days(z: i64) -> PsaVal {
+    // Inverse of days_from_civil; returns a
+    // (year, month, day) tag-10 tuple.
+    let zz = z + 719468;
+    let era = zz;
+    if era < 0 { era = (zz - 146096) / 146097; } else { era = zz / 146097; };
+    let doe = zz - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp;
+    if mp < 10 { m = mp + 3; } else { m = mp - 9; };
+    let yy = y;
+    if m <= 2 { yy = y + 1; };
+    let t = __psa_tuple_new();
+    __psa_tuple_push(t, __psa_box_int(yy));
+    __psa_tuple_push(t, __psa_box_int(m));
+    __psa_tuple_push(t, __psa_box_int(d));
+    return t;
+}
+
+fn __psa_datetime_date_fields(v: PsaVal) -> (i64, i64, i64) {
+    if v.tag != 10 { panic(77163); };
+    if __psa_vec_len_h(v.ipay as ptr) != 3 { panic(77163); };
+    let y = __psa_datetime_int(__psa_tuple_get(v, 0));
+    let m = __psa_datetime_int(__psa_tuple_get(v, 1));
+    let d = __psa_datetime_int(__psa_tuple_get(v, 2));
+    __psa_datetime_check_date(y, m, d);
+    return (y, m, d);
+}
+
+fn __psa_datetime_mk_date(y: i64, m: i64, d: i64) -> PsaVal {
+    let t = __psa_tuple_new();
+    __psa_tuple_push(t, __psa_box_int(y));
+    __psa_tuple_push(t, __psa_box_int(m));
+    __psa_tuple_push(t, __psa_box_int(d));
+    return t;
+}
+
+// ---- date surface ----
+
+fn psa_datetime_is_leap_year(y: PsaVal) -> PsaVal {
+    // calendar.isleap over a CPython-range year.
+    let yy = __psa_datetime_int(y);
+    if yy < 1 { panic(77163); };
+    if yy > 9999 { panic(77163); };
+    return __psa_box_bool(__psa_datetime_is_leap(yy));
+}
+
+fn psa_datetime_days_in_month(y: PsaVal, m: PsaVal) -> PsaVal {
+    let yy = __psa_datetime_int(y);
+    let mm = __psa_datetime_int(m);
+    if yy < 1 { panic(77163); };
+    if yy > 9999 { panic(77163); };
+    if mm < 1 { panic(77163); };
+    if mm > 12 { panic(77163); };
+    return __psa_box_int(__psa_datetime_dim(yy, mm));
+}
+
+fn psa_datetime_date_new(y: PsaVal, m: PsaVal, d: PsaVal) -> PsaVal {
+    // datetime.date(year, month, day), validated
+    // exactly as CPython validates.
+    let yy = __psa_datetime_int(y);
+    let mm = __psa_datetime_int(m);
+    let dd = __psa_datetime_int(d);
+    __psa_datetime_check_date(yy, mm, dd);
+    return __psa_datetime_mk_date(yy, mm, dd);
+}
+
+fn psa_datetime_date_to_ordinal(date: PsaVal) -> PsaVal {
+    // date.toordinal(): 0001-01-01 is ordinal 1.
+    let (y, m, d) = __psa_datetime_date_fields(date);
+    return __psa_box_int(__psa_datetime_days_from_civil(y, m, d) + 719163);
+}
+
+fn psa_datetime_date_from_ordinal(n: PsaVal) -> PsaVal {
+    // date.fromordinal(n): n in 1..3652059.
+    let ord = __psa_datetime_int(n);
+    if ord < 1 { panic(77163); };
+    if ord > 3652059 { panic(77163); };
+    return __psa_datetime_civil_from_days(ord - 719163);
+}
+
+fn psa_datetime_date_weekday(date: PsaVal) -> PsaVal {
+    // date.weekday(): Monday 0 .. Sunday 6.
+    // Ordinal 1 (0001-01-01) was a Monday.
+    let (y, m, d) = __psa_datetime_date_fields(date);
+    let ord = __psa_datetime_days_from_civil(y, m, d) + 719163;
+    return __psa_box_int((ord - 1) % 7);
+}
+
+fn psa_datetime_date_add_days(date: PsaVal, n: PsaVal) -> PsaVal {
+    // date + timedelta(days=n), as a date; the
+    // result must stay inside the CPython range.
+    let (y, m, d) = __psa_datetime_date_fields(date);
+    let ord = __psa_datetime_days_from_civil(y, m, d) + 719163 + __psa_datetime_int(n);
+    if ord < 1 { panic(77163); };
+    if ord > 3652059 { panic(77163); };
+    return __psa_datetime_civil_from_days(ord - 719163);
+}
+
+fn psa_datetime_date_diff_days(a: PsaVal, b: PsaVal) -> PsaVal {
+    // (a - b).days for two dates.
+    let (ay, am, ad) = __psa_datetime_date_fields(a);
+    let (by, bm, bd) = __psa_datetime_date_fields(b);
+    let da = __psa_datetime_days_from_civil(ay, am, ad);
+    let db = __psa_datetime_days_from_civil(by, bm, bd);
+    return __psa_box_int(da - db);
+}
+
+// ---- datetime surface (UTC field extraction) ----
+
+fn psa_datetime_datetime_new(y: PsaVal, mo: PsaVal, d: PsaVal, h: PsaVal, mi: PsaVal, s: PsaVal, us: PsaVal) -> PsaVal {
+    // datetime.datetime(y, mo, d, h, mi, s, us),
+    // validated exactly as CPython validates.
+    let yy = __psa_datetime_int(y);
+    let mm = __psa_datetime_int(mo);
+    let dd = __psa_datetime_int(d);
+    let hh = __psa_datetime_int(h);
+    let mn = __psa_datetime_int(mi);
+    let ss = __psa_datetime_int(s);
+    let uu = __psa_datetime_int(us);
+    __psa_datetime_check_date(yy, mm, dd);
+    if hh < 0 { panic(77163); };
+    if hh > 23 { panic(77163); };
+    if mn < 0 { panic(77163); };
+    if mn > 59 { panic(77163); };
+    if ss < 0 { panic(77163); };
+    if ss > 59 { panic(77163); };
+    if uu < 0 { panic(77163); };
+    if uu > 999999 { panic(77163); };
+    let t = __psa_tuple_new();
+    __psa_tuple_push(t, __psa_box_int(yy));
+    __psa_tuple_push(t, __psa_box_int(mm));
+    __psa_tuple_push(t, __psa_box_int(dd));
+    __psa_tuple_push(t, __psa_box_int(hh));
+    __psa_tuple_push(t, __psa_box_int(mn));
+    __psa_tuple_push(t, __psa_box_int(ss));
+    __psa_tuple_push(t, __psa_box_int(uu));
+    return t;
+}
+
+fn __psa_datetime_dt_fields(v: PsaVal) -> (i64, i64, i64, i64, i64, i64, i64) {
+    if v.tag != 10 { panic(77163); };
+    if __psa_vec_len_h(v.ipay as ptr) != 7 { panic(77163); };
+    let y = __psa_datetime_int(__psa_tuple_get(v, 0));
+    let mo = __psa_datetime_int(__psa_tuple_get(v, 1));
+    let d = __psa_datetime_int(__psa_tuple_get(v, 2));
+    let h = __psa_datetime_int(__psa_tuple_get(v, 3));
+    let mi = __psa_datetime_int(__psa_tuple_get(v, 4));
+    let s = __psa_datetime_int(__psa_tuple_get(v, 5));
+    let us = __psa_datetime_int(__psa_tuple_get(v, 6));
+    __psa_datetime_check_date(y, mo, d);
+    if h < 0 { panic(77163); };
+    if h > 23 { panic(77163); };
+    if mi < 0 { panic(77163); };
+    if mi > 59 { panic(77163); };
+    if s < 0 { panic(77163); };
+    if s > 59 { panic(77163); };
+    if us < 0 { panic(77163); };
+    if us > 999999 { panic(77163); };
+    return (y, mo, d, h, mi, s, us);
+}
+
+fn psa_datetime_datetime_to_unix_ms(dt: PsaVal) -> PsaVal {
+    // The datetime's fields read as UTC, as unix
+    // milliseconds. (CPython's naive .timestamp()
+    // reads fields as *local* time; the local
+    // timezone surface does not exist in sa_std --
+    // GAP-datetime.md. The microsecond field is
+    // truncated to whole milliseconds.)
+    let (y, mo, d, h, mi, s, us) = __psa_datetime_dt_fields(dt);
+    let days = __psa_datetime_days_from_civil(y, mo, d);
+    let ms = days * 86400000 + ((h * 60 + mi) * 60 + s) * 1000 + us / 1000;
+    return __psa_box_int(ms);
+}
+
+fn psa_datetime_datetime_from_unix_ms(msv: PsaVal) -> PsaVal {
+    // UTC field extraction over unix milliseconds
+    // via the sa_std time getters (the same fields
+    // CPython computes for a tz-aware UTC datetime).
+    let ms = __psa_datetime_int(msv);
+    let t = __psa_tuple_new();
+    __psa_tuple_push(t, __psa_box_int(sa_time_get_full_year(ms)));
+    __psa_tuple_push(t, __psa_box_int(sa_time_get_month(ms) + 1));
+    __psa_tuple_push(t, __psa_box_int(sa_time_get_date(ms)));
+    __psa_tuple_push(t, __psa_box_int(sa_time_get_hours(ms)));
+    __psa_tuple_push(t, __psa_box_int(sa_time_get_minutes(ms)));
+    __psa_tuple_push(t, __psa_box_int(sa_time_get_seconds(ms)));
+    __psa_tuple_push(t, __psa_box_int(sa_time_get_milliseconds(ms) * 1000));
+    return t;
+}
+
+fn psa_datetime_now_unix_ms() -> PsaVal {
+    // The current unix time in milliseconds
+    // (sa_time_unix_ms), for callers that need a
+    // clock reading without a datetime object.
+    return __psa_box_int(sa_time_unix_ms());
+}
+
+fn psa_datetime_utcnow() -> PsaVal {
+    // datetime.datetime.utcnow() as a fields tuple
+    // (UTC, millisecond precision from the host
+    // clock surface).
+    return psa_datetime_datetime_from_unix_ms(__psa_box_int(sa_time_unix_ms()));
+}
+
+fn psa_datetime_today_utc() -> PsaVal {
+    // The current UTC date as a date tuple. (This
+    // is NOT date.today(), which is the *local*
+    // date; the local timezone surface does not
+    // exist in sa_std -- GAP-datetime.md.)
+    let dt = psa_datetime_utcnow();
+    let t = __psa_tuple_new();
+    __psa_tuple_push(t, __psa_tuple_get(dt, 0));
+    __psa_tuple_push(t, __psa_tuple_get(dt, 1));
+    __psa_tuple_push(t, __psa_tuple_get(dt, 2));
+    return t;
+}

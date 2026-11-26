@@ -1,0 +1,14 @@
+import socket
+
+print(socket.AF_INET)
+print(socket.AF_INET6)
+print(socket.SOCK_STREAM)
+print(socket.SOCK_DGRAM)
+print(socket.SOL_SOCKET)
+print(socket.gethostname())
+print(socket.gethostbyname("localhost"))
+print(socket.inet_ntoa(socket.inet_aton("127.0.0.1")))
+print(socket.inet_ntop(socket.AF_INET, socket.inet_pton(socket.AF_INET, "192.168.0.1")))
+s = socket.socket()
+t = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+print("done")

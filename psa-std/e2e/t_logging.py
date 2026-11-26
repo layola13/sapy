@@ -1,0 +1,11 @@
+import logging
+logging.warning("early warning")
+logging.basicConfig(level=logging.DEBUG, format="%(levelname)s:%(name)s:%(message)s")
+print(logging.getLogger().getEffectiveLevel())
+logging.debug("x=%s y=%d", "hi", 42)
+child = logging.getLogger("app.db")
+print(child.getEffectiveLevel())
+child.setLevel(logging.ERROR)
+print(child.getEffectiveLevel())
+logging.warning("root warn")
+logging.error("root err %s", "now")

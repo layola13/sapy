@@ -1,0 +1,643 @@
+@import "sa_std/globals.sai"
+@import "sa_std/io.sai"
+@import "sa_std/time.sai"
+
+// psa_std logging (L1): the honest subset of
+// CPython's logging module over PsaVal. See
+// README-logging.md for the module contract and
+// the registered divergences. Panic codes: 77165
+// argument of the wrong type (CPython TypeError:
+// a non-logger where a logger is required, a level
+// that is neither int nor str), 77166 a formatting
+// or level-name error (CPython ValueError /
+// KeyError / TypeError at format time: an unknown
+// level name, an unknown %(name)s placeholder, a
+// %-spec the surface does not carry, a % argument
+// count mismatch, %f -- float text is blocked
+// upstream by defect (xxiii)).
+//
+// Logger records are tag-5 dicts (the stdlib class
+// surface cannot host real Logger objects -- see
+// README-logging.md), kept in a process-wide
+// registry in the sa_std globals cell
+// "psa.logreg", with the basicConfig state in
+// "psa.logcfg" -- the same globals-cell machinery
+// the class registry (psa.clsattrs) uses. There is
+// exactly one implicit handler: stderr, with the
+// configured format. Effective levels walk the
+// dotted logger hierarchy exactly as CPython's
+// Logger.getEffectiveLevel does; the root logger's
+// fallback level is WARNING (30).
+
+fn __psa_logging_none() -> PsaVal {
+    return PsaVal { tag: 3, ipay: 0, fpay: 0.0 };
+}
+
+fn __psa_logging_reg() -> PsaVal {
+    let out = [0u64; 1];
+    let rc = sa_global_u64_get(STR_PTR("psa.logreg"), STR_LEN("psa.logreg"), &out[0]);
+    if rc == 0 { return PsaVal { tag: 5, ipay: out[0] as i64, fpay: 0.0 }; };
+    let reg = __psa_dict_new();
+    let already = [0u64; 1];
+    let rc2 = sa_global_u64_set_once(STR_PTR("psa.logreg"), STR_LEN("psa.logreg"), reg.ipay as u64, &already[0]);
+    if rc2 == 0 {
+        if already[0] == 0 { return reg; };
+    };
+    let out2 = [0u64; 1];
+    let rc3 = sa_global_u64_get(STR_PTR("psa.logreg"), STR_LEN("psa.logreg"), &out2[0]);
+    if rc3 != 0 { return reg; };
+    return PsaVal { tag: 5, ipay: out2[0] as i64, fpay: 0.0 };
+}
+
+fn __psa_logging_cfg() -> PsaVal {
+    let out = [0u64; 1];
+    let rc = sa_global_u64_get(STR_PTR("psa.logcfg"), STR_LEN("psa.logcfg"), &out[0]);
+    if rc == 0 { return PsaVal { tag: 5, ipay: out[0] as i64, fpay: 0.0 }; };
+    let cfg = __psa_dict_new();
+    __psa_dict_set(cfg, __psa_logging_lit_set(), __psa_box_bool(false));
+    __psa_dict_set(cfg, __psa_logging_lit_fmt(), __psa_logging_lit_last_resort_fmt());
+    let already = [0u64; 1];
+    let rc2 = sa_global_u64_set_once(STR_PTR("psa.logcfg"), STR_LEN("psa.logcfg"), cfg.ipay as u64, &already[0]);
+    if rc2 == 0 {
+        if already[0] == 0 { return cfg; };
+    };
+    let out2 = [0u64; 1];
+    let rc3 = sa_global_u64_get(STR_PTR("psa.logcfg"), STR_LEN("psa.logcfg"), &out2[0]);
+    if rc3 != 0 { return cfg; };
+    return PsaVal { tag: 5, ipay: out2[0] as i64, fpay: 0.0 };
+}
+
+// ---- levels ----
+
+fn psa_logging_level_debug() -> PsaVal { return __psa_box_int(10); }
+fn psa_logging_level_info() -> PsaVal { return __psa_box_int(20); }
+fn psa_logging_level_warning() -> PsaVal { return __psa_box_int(30); }
+fn psa_logging_level_error() -> PsaVal { return __psa_box_int(40); }
+fn psa_logging_level_critical() -> PsaVal { return __psa_box_int(50); }
+
+fn __psa_logging_level_name(no: i64) -> PsaVal {
+    if no == 10 { return __psa_logging_lit_debug(); };
+    if no == 20 { return __psa_logging_lit_info(); };
+    if no == 30 { return __psa_logging_lit_warning(); };
+    if no == 40 { return __psa_logging_lit_error(); };
+    if no == 50 { return __psa_logging_lit_critical(); };
+    if no == 0 { return __psa_logging_lit_notset(); };
+    let s = __psa_logging_lit_level_prefix();
+    return __psa_str_append_str(s, __psa_str_from_i64(no));
+}
+
+fn __psa_logging_level_of(v: PsaVal) -> i64 {
+    // A level argument: an int, or one of CPython's
+    // level names (WARN and FATAL are CPython's
+    // aliases for WARNING and CRITICAL).
+    if v.tag == 0 { return v.ipay; };
+    if v.tag == 2 { return v.ipay; };
+    if v.tag == 6 {
+        if __psa_str_eq(v, __psa_logging_lit_debug()) { return 10; };
+        if __psa_str_eq(v, __psa_logging_lit_info()) { return 20; };
+        if __psa_str_eq(v, __psa_logging_lit_warning()) { return 30; };
+        if __psa_str_eq(v, __psa_logging_lit_warn()) { return 30; };
+        if __psa_str_eq(v, __psa_logging_lit_error()) { return 40; };
+        if __psa_str_eq(v, __psa_logging_lit_critical()) { return 50; };
+        if __psa_str_eq(v, __psa_logging_lit_fatal()) { return 50; };
+        if __psa_str_eq(v, __psa_logging_lit_notset()) { return 0; };
+        panic(77166);
+    };
+    panic(77165);
+}
+
+// ---- logger records ----
+
+fn __psa_logging_gate(v: PsaVal) -> void {
+    if v.tag != 5 { panic(77165); };
+    if !(__psa_dict_contains(v, __psa_logging_lit_marker())) { panic(77165); };
+    return;
+}
+
+fn __psa_logging_root_rec() -> PsaVal {
+    let reg = __psa_logging_reg();
+    let key = __psa_str_new();
+    if __psa_dict_contains(reg, key) { return __psa_dict_get(reg, key); };
+    let rec = __psa_dict_new();
+    __psa_dict_set(rec, __psa_logging_lit_marker(), __psa_box_bool(true));
+    __psa_dict_set(rec, __psa_logging_lit_name(), key);
+    __psa_dict_set(rec, __psa_logging_lit_level(), __psa_logging_none());
+    __psa_dict_set(reg, key, rec);
+    return rec;
+}
+
+fn psa_logging_get_logger(name: PsaVal) -> PsaVal {
+    // logging.getLogger(name): None, "" and "root"
+    // all name the root logger in CPython.
+    if name.tag == 3 { return __psa_logging_root_rec(); };
+    if name.tag != 6 { panic(77165); };
+    if __psa_str_bytes_len(name) == 0 { return __psa_logging_root_rec(); };
+    if __psa_str_eq(name, __psa_logging_lit_root()) { return __psa_logging_root_rec(); };
+    let reg = __psa_logging_reg();
+    if __psa_dict_contains(reg, name) { return __psa_dict_get(reg, name); };
+    let rec = __psa_dict_new();
+    __psa_dict_set(rec, __psa_logging_lit_marker(), __psa_box_bool(true));
+    __psa_dict_set(rec, __psa_logging_lit_name(), name);
+    __psa_dict_set(rec, __psa_logging_lit_level(), __psa_logging_none());
+    __psa_dict_set(reg, name, rec);
+    return rec;
+}
+
+fn psa_logging_set_level(logger: PsaVal, level: PsaVal) -> PsaVal {
+    // Logger.setLevel(level): an int or a level
+    // name; None is not accepted (CPython raises
+    // TypeError there too).
+    __psa_logging_gate(logger);
+    let no = __psa_logging_level_of(level);
+    __psa_dict_set(logger, __psa_logging_lit_level(), __psa_box_int(no));
+    return __psa_logging_none();
+}
+
+fn __psa_logging_parent_name(name: PsaVal) -> PsaVal {
+    // "a.b.c" -> "a.b"; "a" -> "" (the root).
+    let n = __psa_str_bytes_len(name);
+    let i = n - 1;
+    while i >= 0 {
+        if __psa_bytes_get_h(name.ipay as ptr, i) == 46u8 {
+            return __psa_str_sub_bytes(name, 0, i);
+        };
+        i = i - 1;
+    }
+    return __psa_str_new();
+}
+
+fn __psa_logging_effective(logger: PsaVal) -> i64 {
+    // Walk this logger, then its ancestors by
+    // dotted name, then the root; the first set
+    // level wins. Fallback is WARNING (30), the
+    // root logger's CPython default.
+    let reg = __psa_logging_reg();
+    let cur = __psa_dict_get(logger, __psa_logging_lit_name());
+    while true {
+        let rec = logger;
+        if __psa_str_eq(cur, __psa_dict_get(logger, __psa_logging_lit_name())) {
+            rec = logger;
+        } else {
+            if __psa_dict_contains(reg, cur) {
+                rec = __psa_dict_get(reg, cur);
+            } else {
+                rec = __psa_logging_none();
+            };
+        };
+        if rec.tag == 5 {
+            let lv = __psa_dict_get(rec, __psa_logging_lit_level());
+            if lv.tag == 0 { return lv.ipay; };
+        };
+        if __psa_str_bytes_len(cur) == 0 { return 30; };
+        cur = __psa_logging_parent_name(cur);
+    }
+    return 30;
+}
+
+fn psa_logging_get_effective_level(logger: PsaVal) -> PsaVal {
+    __psa_logging_gate(logger);
+    return __psa_box_int(__psa_logging_effective(logger));
+}
+
+// ---- basicConfig ----
+
+fn psa_logging_basic_config(level: PsaVal, fmt: PsaVal) -> PsaVal {
+    // logging.basicConfig(level=..., format=...):
+    // a no-op (returning False here) when logging
+    // is already configured, as CPython's is when
+    // the root logger already has handlers. The
+    // level lands on the root logger, as in
+    // CPython.
+    let cfg = __psa_logging_cfg();
+    if __psa_dict_get(cfg, __psa_logging_lit_set()).ipay != 0 {
+        return __psa_box_bool(false);
+    };
+    __psa_dict_set(cfg, __psa_logging_lit_set(), __psa_box_bool(true));
+    if fmt.tag == 6 {
+        __psa_dict_set(cfg, __psa_logging_lit_fmt(), fmt);
+    } else {
+        if fmt.tag != 3 { panic(77165); };
+        __psa_dict_set(cfg, __psa_logging_lit_fmt(), __psa_logging_lit_basic_fmt());
+    };
+    if level.tag != 3 {
+        let root = __psa_logging_root_rec();
+        __psa_dict_set(root, __psa_logging_lit_level(), __psa_box_int(__psa_logging_level_of(level)));
+    };
+    return __psa_box_bool(true);
+}
+
+fn psa_logging_basic_config_force(level: PsaVal, fmt: PsaVal) -> PsaVal {
+    // basicConfig(..., force=True): always applies.
+    let cfg = __psa_logging_cfg();
+    __psa_dict_set(cfg, __psa_logging_lit_set(), __psa_box_bool(false));
+    return psa_logging_basic_config(level, fmt);
+}
+
+// ---- message formatting (msg % args) ----
+
+fn __psa_logging_percent(msg: PsaVal, args: PsaVal) -> PsaVal {
+    // CPython's record.getMessage(): str(msg) % args
+    // when args are present. Supported specs: %s
+    // (str()), %r (repr()), %d / %i (int, floats
+    // truncate as CPython's do), %%. Width /
+    // precision specs and %f are refused loudly
+    // (77166): %f needs float text, blocked by
+    // defect (xxiii).
+    let base = __psa_str_of(msg);
+    if args.tag == 3 { return base; };
+    if args.tag != 4 { panic(77165); };
+    let na = __psa_list_len(args);
+    if na == 0 { return base; };
+    let out = __psa_str_new();
+    let n = __psa_str_bytes_len(base);
+    let ai: i64 = 0;
+    let i: i64 = 0;
+    while i < n {
+        let b = __psa_bytes_get_h(base.ipay as ptr, i) as i64;
+        if b != 37 {
+            out = __psa_str_push(out, b as u8);
+            i = i + 1;
+            continue;
+        };
+        if i + 1 >= n { panic(77166); };
+        let spec = __psa_bytes_get_h(base.ipay as ptr, i + 1) as i64;
+        if spec == 37 {
+            out = __psa_str_push(out, 37u8);
+            i = i + 2;
+            continue;
+        };
+        if ai >= na { panic(77166); };
+        let a = __psa_list_get(args, ai);
+        ai = ai + 1;
+        if spec == 115 {
+            out = __psa_str_append_str(out, __psa_str_of(a));
+            i = i + 2;
+            continue;
+        };
+        if spec == 114 {
+            out = __psa_str_append_str(out, __psa_repr_of(a));
+            i = i + 2;
+            continue;
+        };
+        if spec == 100 || spec == 105 {
+            if a.tag == 0 || a.tag == 2 {
+                out = __psa_str_append_str(out, __psa_str_from_i64(a.ipay));
+                i = i + 2;
+                continue;
+            };
+            if a.tag == 1 {
+                out = __psa_str_append_str(out, __psa_str_from_i64(a.fpay as i64));
+                i = i + 2;
+                continue;
+            };
+            panic(77166);
+        };
+        panic(77166);
+    }
+    if ai < na { panic(77166); };
+    return out;
+}
+
+// ---- record formatting + emit ----
+
+fn __psa_logging_pad(v: i64, width: i64) -> PsaVal {
+    let s = __psa_str_from_i64(v);
+    let out = __psa_str_new();
+    let missing = width - __psa_str_bytes_len(s);
+    let i: i64 = 0;
+    while i < missing {
+        out = __psa_str_push(out, 48u8);
+        i = i + 1;
+    }
+    return __psa_str_append_str(out, s);
+}
+
+fn __psa_logging_asctime() -> PsaVal {
+    // CPython's default datefmt rendering
+    // "YYYY-MM-DD HH:MM:SS,mmm" -- over UTC fields
+    // (sa_std has no local-time surface; the
+    // divergence is registered in README-logging.md).
+    let ms = sa_time_unix_ms();
+    let out = __psa_str_new();
+    out = __psa_str_append_str(out, __psa_logging_pad(sa_time_get_full_year(ms), 4));
+    out = __psa_str_push(out, 45u8);
+    out = __psa_str_append_str(out, __psa_logging_pad(sa_time_get_month(ms) + 1, 2));
+    out = __psa_str_push(out, 45u8);
+    out = __psa_str_append_str(out, __psa_logging_pad(sa_time_get_date(ms), 2));
+    out = __psa_str_push(out, 32u8);
+    out = __psa_str_append_str(out, __psa_logging_pad(sa_time_get_hours(ms), 2));
+    out = __psa_str_push(out, 58u8);
+    out = __psa_str_append_str(out, __psa_logging_pad(sa_time_get_minutes(ms), 2));
+    out = __psa_str_push(out, 58u8);
+    out = __psa_str_append_str(out, __psa_logging_pad(sa_time_get_seconds(ms), 2));
+    out = __psa_str_push(out, 44u8);
+    out = __psa_str_append_str(out, __psa_logging_pad(sa_time_get_milliseconds(ms), 3));
+    return out;
+}
+
+fn __psa_logging_display_name(logger: PsaVal) -> PsaVal {
+    let nm = __psa_dict_get(logger, __psa_logging_lit_name());
+    if __psa_str_bytes_len(nm) == 0 { return __psa_logging_lit_root(); };
+    return nm;
+}
+
+fn __psa_logging_expand(fmt: PsaVal, logger: PsaVal, levelno: i64, message: PsaVal) -> PsaVal {
+    // Expand the %(name)s / %(name)d placeholders
+    // of a logging format string. Supported names:
+    // message, levelname, levelno, name, asctime
+    // (asctime is computed only when referenced).
+    // Anything else is 77166 (CPython raises
+    // KeyError / ValueError at format time).
+    let out = __psa_str_new();
+    let n = __psa_str_bytes_len(fmt);
+    let i: i64 = 0;
+    while i < n {
+        let b = __psa_bytes_get_h(fmt.ipay as ptr, i) as i64;
+        if b != 37 {
+            out = __psa_str_push(out, b as u8);
+            i = i + 1;
+            continue;
+        };
+        if i + 1 >= n { panic(77166); };
+        let open = __psa_bytes_get_h(fmt.ipay as ptr, i + 1) as i64;
+        if open != 40 { panic(77166); };
+        let j = i + 2;
+        let key = __psa_str_new();
+        let closed = false;
+        while j < n {
+            let kb = __psa_bytes_get_h(fmt.ipay as ptr, j) as i64;
+            if kb == 41 { closed = true; break; };
+            key = __psa_str_push(key, kb as u8);
+            j = j + 1;
+        }
+        if !(closed) { panic(77166); };
+        if j + 1 >= n { panic(77166); };
+        let conv = __psa_bytes_get_h(fmt.ipay as ptr, j + 1) as i64;
+        if conv != 115 {
+            if conv != 100 { panic(77166); };
+        };
+        let val = __psa_logging_none();
+        let is_int = false;
+        if __psa_str_eq(key, __psa_logging_lit_message()) { val = message; };
+        if __psa_str_eq(key, __psa_logging_lit_levelname()) { val = __psa_logging_level_name(levelno); };
+        if __psa_str_eq(key, __psa_logging_lit_name()) { val = __psa_logging_display_name(logger); };
+        if __psa_str_eq(key, __psa_logging_lit_asctime()) { val = __psa_logging_asctime(); };
+        if __psa_str_eq(key, __psa_logging_lit_levelno()) { val = __psa_box_int(levelno); is_int = true; };
+        if val.tag == 3 { panic(77166); };
+        if conv == 100 {
+            if !(is_int) { panic(77166); };
+            out = __psa_str_append_str(out, __psa_str_from_i64(val.ipay));
+        } else {
+            if is_int {
+                out = __psa_str_append_str(out, __psa_str_from_i64(val.ipay));
+            } else {
+                out = __psa_str_append_str(out, val);
+            };
+        };
+        i = j + 2;
+    }
+    return out;
+}
+
+fn __psa_logging_write_stderr(line: PsaVal) -> void {
+    // Chunked stderr write, mirroring
+    // __psa_print_str's stdout chunking but onto
+    // the sa_std stderr handle.
+    let h = sa_io_stderr();
+    let n = __psa_str_bytes_len(line);
+    let buf = [0u8; 256];
+    let base: i64 = 0;
+    while base < n {
+        let chunk = n - base;
+        if chunk > 256 { chunk = 256; };
+        let k: i64 = 0;
+        while k < chunk { buf[k] = __psa_bytes_get_h(line.ipay as ptr, base + k); k = k + 1; }
+        let rc: i32 = sa_io_write_all(h, PTR_BYTE_ADD(&buf, 0), chunk as u64);
+        base = base + chunk;
+    }
+    return;
+}
+
+fn __psa_logging_emit(logger: PsaVal, levelno: i64, msg: PsaVal, args: PsaVal) -> bool {
+    if levelno < __psa_logging_effective(logger) { return false; };
+    let cfg = __psa_logging_cfg();
+    let fmt = __psa_dict_get(cfg, __psa_logging_lit_fmt());
+    let message = __psa_logging_percent(msg, args);
+    let line = __psa_logging_expand(fmt, logger, levelno, message);
+    line = __psa_str_push(line, 10u8);
+    __psa_logging_write_stderr(line);
+    return true;
+}
+
+fn psa_logging_log(logger: PsaVal, level: PsaVal, msg: PsaVal, args: PsaVal) -> PsaVal {
+    __psa_logging_gate(logger);
+    let no = __psa_logging_level_of(level);
+    let done = __psa_logging_emit(logger, no, msg, args);
+    return __psa_logging_none();
+}
+
+fn psa_logging_debug(logger: PsaVal, msg: PsaVal, args: PsaVal) -> PsaVal {
+    __psa_logging_gate(logger);
+    let done = __psa_logging_emit(logger, 10, msg, args);
+    return __psa_logging_none();
+}
+
+fn psa_logging_info(logger: PsaVal, msg: PsaVal, args: PsaVal) -> PsaVal {
+    __psa_logging_gate(logger);
+    let done = __psa_logging_emit(logger, 20, msg, args);
+    return __psa_logging_none();
+}
+
+fn psa_logging_warning(logger: PsaVal, msg: PsaVal, args: PsaVal) -> PsaVal {
+    __psa_logging_gate(logger);
+    let done = __psa_logging_emit(logger, 30, msg, args);
+    return __psa_logging_none();
+}
+
+fn psa_logging_error(logger: PsaVal, msg: PsaVal, args: PsaVal) -> PsaVal {
+    __psa_logging_gate(logger);
+    let done = __psa_logging_emit(logger, 40, msg, args);
+    return __psa_logging_none();
+}
+
+fn psa_logging_critical(logger: PsaVal, msg: PsaVal, args: PsaVal) -> PsaVal {
+    __psa_logging_gate(logger);
+    let done = __psa_logging_emit(logger, 50, msg, args);
+    return __psa_logging_none();
+}
+
+// Module-level (root logger) forms: CPython's
+// logging.debug(...) and friends operate on the
+// root logger.
+
+fn __psa_logging_ensure_config() -> void {
+    // CPython's module-level logging functions call
+    // basicConfig() when the root logger has no
+    // handlers yet, so the first root-level call in
+    // a program establishes the default configuration
+    // (BASIC_FORMAT; root level untouched) and any
+    // later explicit basicConfig without force is a
+    // no-op. Logger-method calls do not do this --
+    // they fall back to the last-resort handler --
+    // so the hook lives only in the root_* forms.
+    let cfg = __psa_logging_cfg();
+    if __psa_dict_get(cfg, __psa_logging_lit_set()).ipay == 0 {
+        let applied = psa_logging_basic_config(__psa_logging_none(), __psa_logging_none());
+    };
+    return;
+}
+
+fn psa_logging_root_log(level: PsaVal, msg: PsaVal, args: PsaVal) -> PsaVal {
+    __psa_logging_ensure_config();
+    return psa_logging_log(__psa_logging_root_rec(), level, msg, args);
+}
+
+fn psa_logging_root_debug(msg: PsaVal, args: PsaVal) -> PsaVal {
+    __psa_logging_ensure_config();
+    return psa_logging_debug(__psa_logging_root_rec(), msg, args);
+}
+
+fn psa_logging_root_info(msg: PsaVal, args: PsaVal) -> PsaVal {
+    __psa_logging_ensure_config();
+    return psa_logging_info(__psa_logging_root_rec(), msg, args);
+}
+
+fn psa_logging_root_warning(msg: PsaVal, args: PsaVal) -> PsaVal {
+    __psa_logging_ensure_config();
+    return psa_logging_warning(__psa_logging_root_rec(), msg, args);
+}
+
+fn psa_logging_root_error(msg: PsaVal, args: PsaVal) -> PsaVal {
+    __psa_logging_ensure_config();
+    return psa_logging_error(__psa_logging_root_rec(), msg, args);
+}
+
+fn psa_logging_root_critical(msg: PsaVal, args: PsaVal) -> PsaVal {
+    __psa_logging_ensure_config();
+    return psa_logging_critical(__psa_logging_root_rec(), msg, args);
+}
+fn __psa_logging_lit_name() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 110u8); s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 109u8); s = __psa_str_push(s, 101u8);
+    return s;
+}
+
+fn __psa_logging_lit_level() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 108u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 118u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 108u8);
+    return s;
+}
+
+fn __psa_logging_lit_fmt() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 102u8); s = __psa_str_push(s, 109u8); s = __psa_str_push(s, 116u8);
+    return s;
+}
+
+fn __psa_logging_lit_set() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 116u8);
+    return s;
+}
+
+fn __psa_logging_lit_marker() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 95u8); s = __psa_str_push(s, 95u8); s = __psa_str_push(s, 112u8); s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 95u8); s = __psa_str_push(s, 108u8); s = __psa_str_push(s, 111u8); s = __psa_str_push(s, 103u8); s = __psa_str_push(s, 103u8); s = __psa_str_push(s, 105u8); s = __psa_str_push(s, 110u8); s = __psa_str_push(s, 103u8); s = __psa_str_push(s, 95u8); s = __psa_str_push(s, 108u8); s = __psa_str_push(s, 111u8); s = __psa_str_push(s, 103u8); s = __psa_str_push(s, 103u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 114u8);
+    return s;
+}
+
+fn __psa_logging_lit_debug() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 68u8); s = __psa_str_push(s, 69u8); s = __psa_str_push(s, 66u8); s = __psa_str_push(s, 85u8); s = __psa_str_push(s, 71u8);
+    return s;
+}
+
+fn __psa_logging_lit_info() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 73u8); s = __psa_str_push(s, 78u8); s = __psa_str_push(s, 70u8); s = __psa_str_push(s, 79u8);
+    return s;
+}
+
+fn __psa_logging_lit_warning() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 87u8); s = __psa_str_push(s, 65u8); s = __psa_str_push(s, 82u8); s = __psa_str_push(s, 78u8); s = __psa_str_push(s, 73u8); s = __psa_str_push(s, 78u8); s = __psa_str_push(s, 71u8);
+    return s;
+}
+
+fn __psa_logging_lit_error() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 69u8); s = __psa_str_push(s, 82u8); s = __psa_str_push(s, 82u8); s = __psa_str_push(s, 79u8); s = __psa_str_push(s, 82u8);
+    return s;
+}
+
+fn __psa_logging_lit_critical() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 67u8); s = __psa_str_push(s, 82u8); s = __psa_str_push(s, 73u8); s = __psa_str_push(s, 84u8); s = __psa_str_push(s, 73u8); s = __psa_str_push(s, 67u8); s = __psa_str_push(s, 65u8); s = __psa_str_push(s, 76u8);
+    return s;
+}
+
+fn __psa_logging_lit_warn() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 87u8); s = __psa_str_push(s, 65u8); s = __psa_str_push(s, 82u8); s = __psa_str_push(s, 78u8);
+    return s;
+}
+
+fn __psa_logging_lit_fatal() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 70u8); s = __psa_str_push(s, 65u8); s = __psa_str_push(s, 84u8); s = __psa_str_push(s, 65u8); s = __psa_str_push(s, 76u8);
+    return s;
+}
+
+fn __psa_logging_lit_notset() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 78u8); s = __psa_str_push(s, 79u8); s = __psa_str_push(s, 84u8); s = __psa_str_push(s, 83u8); s = __psa_str_push(s, 69u8); s = __psa_str_push(s, 84u8);
+    return s;
+}
+
+fn __psa_logging_lit_level_prefix() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 76u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 118u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 108u8); s = __psa_str_push(s, 32u8);
+    return s;
+}
+
+fn __psa_logging_lit_root() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 114u8); s = __psa_str_push(s, 111u8); s = __psa_str_push(s, 111u8); s = __psa_str_push(s, 116u8);
+    return s;
+}
+
+fn __psa_logging_lit_message() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 109u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 103u8); s = __psa_str_push(s, 101u8);
+    return s;
+}
+
+fn __psa_logging_lit_levelname() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 108u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 118u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 108u8); s = __psa_str_push(s, 110u8); s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 109u8); s = __psa_str_push(s, 101u8);
+    return s;
+}
+
+fn __psa_logging_lit_levelno() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 108u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 118u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 108u8); s = __psa_str_push(s, 110u8); s = __psa_str_push(s, 111u8);
+    return s;
+}
+
+fn __psa_logging_lit_asctime() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 99u8); s = __psa_str_push(s, 116u8); s = __psa_str_push(s, 105u8); s = __psa_str_push(s, 109u8); s = __psa_str_push(s, 101u8);
+    return s;
+}
+
+fn __psa_logging_lit_basic_fmt() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 37u8); s = __psa_str_push(s, 40u8); s = __psa_str_push(s, 108u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 118u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 108u8); s = __psa_str_push(s, 110u8); s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 109u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 41u8); s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 58u8); s = __psa_str_push(s, 37u8); s = __psa_str_push(s, 40u8); s = __psa_str_push(s, 110u8); s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 109u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 41u8); s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 58u8); s = __psa_str_push(s, 37u8); s = __psa_str_push(s, 40u8); s = __psa_str_push(s, 109u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 103u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 41u8); s = __psa_str_push(s, 115u8);
+    return s;
+}
+
+fn __psa_logging_lit_last_resort_fmt() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 37u8); s = __psa_str_push(s, 40u8); s = __psa_str_push(s, 109u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 97u8); s = __psa_str_push(s, 103u8); s = __psa_str_push(s, 101u8); s = __psa_str_push(s, 41u8); s = __psa_str_push(s, 115u8);
+    return s;
+}

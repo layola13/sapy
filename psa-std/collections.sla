@@ -1,0 +1,755 @@
+// psa_std collections (L1): the honest subset of
+// CPython's collections module over PsaVal. See
+// README-collections.md for the module contract.
+// Panic codes: 77140 argument of the wrong type
+// (CPython TypeError), 77141 bad value / missing key /
+// empty-container pop (CPython ValueError / KeyError /
+// IndexError), 77146 argument not callable, 77148
+// registered-gap loud refusal, 77149 non-iterable
+// argument (shared psa_std codes, see README.md).
+//
+// Shape rule (the psa_std v1 stance, same as string's
+// constants-as-functions): collections' names are
+// classes in CPython, and psa_std modules are function
+// sets, so each class is a factory entry point plus
+// operation functions over a plain dyn container:
+//   Counter      -> tag-5 dict of counts
+//   defaultdict  -> tag-5 dict; the factory is passed
+//                   at access time (a PsaVal dict has no
+//                   slot to store it -- see the README
+//                   fragment; the divergence is in the
+//                   API shape, never in results)
+//   deque        -> tag-4 list; maxlen is passed to the
+//                   bounded operations (same reason)
+//   ChainMap     -> tag-4 list of tag-5 dicts
+//   OrderedDict  -> tag-5 dict (psa dicts are already
+//                   insertion-ordered, D3)
+//   namedtuple   -> NOT representable (a factory that
+//                   mints a new class/callable); the
+//                   entry point panics 77148 loudly.
+// Bounds-guarded reads never ride on && / || (eager in
+// SLA, probe P4); no silent approximations anywhere.
+
+fn __psa_collections_none() -> PsaVal {
+    return PsaVal { tag: 3, ipay: 0, fpay: 0.0 };
+}
+
+fn __psa_collections_items(v: PsaVal) -> PsaVal {
+    // Materialize any iterable (list / tuple / set /
+    // dict keys / str code points / a drained
+    // generator) to a fresh list.
+    if v.tag == 4 || v.tag == 5 || v.tag == 6 || v.tag == 10 || v.tag == 11 || v.tag == 13 {
+        return __psa_list_from(__psa_iter_source(v));
+    };
+    panic(77149);
+}
+
+fn __psa_collections_int(v: PsaVal) -> i64 {
+    if v.tag == 0 { return v.ipay; };
+    if v.tag == 2 { return v.ipay; };
+    panic(77140);
+}
+
+fn __psa_collections_callable(f: PsaVal) -> void {
+    if f.tag == 7 { return; };
+    if f.tag == 9 { return; };
+    panic(77146);
+}
+
+fn __psa_collections_dict(v: PsaVal) -> void {
+    if v.tag != 5 { panic(77140); };
+    return;
+}
+
+// ---- Counter ----
+
+fn psa_collections_counter(it: PsaVal) -> PsaVal {
+    // Counter(iterable): counts of hashable elements,
+    // keys in first-seen order (psa dict order).
+    let xs = __psa_collections_items(it);
+    let out = __psa_dict_new();
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        let x = __psa_vec_get_h(xs.ipay as ptr, i);
+        if __psa_dict_contains(out, x) {
+            let c = __psa_dict_get(out, x);
+            __psa_dict_set(out, x, __psa_box_int(c.ipay + 1));
+        } else {
+            __psa_dict_set(out, x, __psa_box_int(1));
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+fn psa_collections_counter_dict(d: PsaVal) -> PsaVal {
+    // Counter(mapping): a copy of the mapping's counts.
+    __psa_collections_dict(d);
+    let out = __psa_dict_new();
+    let n = __psa_dict_len(d);
+    let i: i64 = 0;
+    while i < n {
+        let k = __psa_dict_key_at(d, i);
+        let v = __psa_dict_val_at(d, i);
+        if v.tag != 0 {
+            if v.tag != 2 { panic(77140); };
+        };
+        __psa_dict_set(out, k, __psa_box_int(v.ipay));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn psa_collections_counter_get(c: PsaVal, k: PsaVal) -> PsaVal {
+    // Counter[k] with Counter's __missing__: 0 for an
+    // absent key, and the key is NOT inserted.
+    __psa_collections_dict(c);
+    if __psa_dict_contains(c, k) {
+        return __psa_dict_get(c, k);
+    };
+    return __psa_box_int(0);
+}
+
+fn __psa_collections_counter_add_into(c: PsaVal, xs: PsaVal, sign: i64) -> void {
+    // Shared body of update (sign +1) and subtract
+    // (sign -1) over a materialized element list.
+    // Counts may go zero or negative and are kept
+    // (the method forms, unlike the operators).
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        let x = __psa_vec_get_h(xs.ipay as ptr, i);
+        let cur: i64 = 0;
+        if __psa_dict_contains(c, x) {
+            cur = __psa_dict_get(c, x).ipay;
+        };
+        __psa_dict_set(c, x, __psa_box_int(cur + sign));
+        i = i + 1;
+    }
+    return;
+}
+
+fn psa_collections_counter_update(c: PsaVal, it: PsaVal) -> PsaVal {
+    // Counter.update(iterable): add counts in place.
+    __psa_collections_dict(c);
+    __psa_collections_counter_add_into(c, __psa_collections_items(it), 1);
+    return __psa_collections_none();
+}
+
+fn psa_collections_counter_subtract(c: PsaVal, it: PsaVal) -> PsaVal {
+    // Counter.subtract(iterable): subtract counts in
+    // place, keeping zero and negative counts.
+    __psa_collections_dict(c);
+    __psa_collections_counter_add_into(c, __psa_collections_items(it), -1);
+    return __psa_collections_none();
+}
+
+fn __psa_collections_counter_combine(a: PsaVal, b: PsaVal, mode: i64) -> PsaVal {
+    // The operator forms. mode 0: + (sum), 1: -
+    // (difference), 2: & (min), 3: | (max). All four
+    // drop zero and negative results (CPython). Key
+    // order: a's surviving keys in a's order, then b's
+    // new keys in b's order.
+    __psa_collections_dict(a);
+    __psa_collections_dict(b);
+    let out = __psa_dict_new();
+    let na = __psa_dict_len(a);
+    let i: i64 = 0;
+    while i < na {
+        let k = __psa_dict_key_at(a, i);
+        let va = __psa_dict_val_at(a, i).ipay;
+        let vb: i64 = 0;
+        if __psa_dict_contains(b, k) {
+            vb = __psa_dict_get(b, k).ipay;
+        };
+        let r = va;
+        if mode == 1 { r = va - vb; };
+        if mode == 2 {
+            r = va;
+            if vb < r { r = vb; };
+        };
+        if mode == 3 {
+            r = va;
+            if vb > r { r = vb; };
+        };
+        if mode == 0 { r = va + vb; };
+        if r > 0 {
+            __psa_dict_set(out, k, __psa_box_int(r));
+        };
+        i = i + 1;
+    }
+    if mode != 1 {
+        if mode != 2 {
+            // + and | also carry b's new keys; - and &
+            // never introduce keys from b.
+            let nb = __psa_dict_len(b);
+            let j: i64 = 0;
+            while j < nb {
+                let k = __psa_dict_key_at(b, j);
+                if !(__psa_dict_contains(a, k)) {
+                    let vb = __psa_dict_val_at(b, j).ipay;
+                    if vb > 0 {
+                        __psa_dict_set(out, k, __psa_box_int(vb));
+                    };
+                };
+                j = j + 1;
+            }
+        };
+    };
+    return out;
+}
+
+fn psa_collections_counter_add(a: PsaVal, b: PsaVal) -> PsaVal {
+    return __psa_collections_counter_combine(a, b, 0);
+}
+
+fn psa_collections_counter_sub(a: PsaVal, b: PsaVal) -> PsaVal {
+    return __psa_collections_counter_combine(a, b, 1);
+}
+
+fn psa_collections_counter_and(a: PsaVal, b: PsaVal) -> PsaVal {
+    return __psa_collections_counter_combine(a, b, 2);
+}
+
+fn psa_collections_counter_or(a: PsaVal, b: PsaVal) -> PsaVal {
+    return __psa_collections_counter_combine(a, b, 3);
+}
+
+fn psa_collections_counter_elements(c: PsaVal) -> PsaVal {
+    // Counter.elements(): each key repeated count
+    // times, in key order; zero and negative counts
+    // are skipped (CPython).
+    __psa_collections_dict(c);
+    let out = __psa_list_new();
+    let n = __psa_dict_len(c);
+    let i: i64 = 0;
+    while i < n {
+        let k = __psa_dict_key_at(c, i);
+        let cnt = __psa_dict_val_at(c, i).ipay;
+        let j: i64 = 0;
+        while j < cnt {
+            __psa_list_push(out, k);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn psa_collections_counter_total(c: PsaVal) -> PsaVal {
+    // Counter.total() (CPython 3.10+): sum of counts.
+    __psa_collections_dict(c);
+    let s: i64 = 0;
+    let n = __psa_dict_len(c);
+    let i: i64 = 0;
+    while i < n {
+        s = s + __psa_dict_val_at(c, i).ipay;
+        i = i + 1;
+    }
+    return __psa_box_int(s);
+}
+
+fn __psa_collections_most_common_sorted(c: PsaVal) -> PsaVal {
+    // List of (key, count) tuples sorted by count
+    // descending; ties keep first-seen order (the
+    // insertion sort below is stable: it shifts only
+    // on a strictly smaller count).
+    let out = __psa_list_new();
+    let n = __psa_dict_len(c);
+    let i: i64 = 0;
+    while i < n {
+        let t = __psa_tuple_new();
+        __psa_tuple_push(t, __psa_dict_key_at(c, i));
+        __psa_tuple_push(t, __psa_dict_val_at(c, i));
+        __psa_list_push(out, t);
+        i = i + 1;
+    }
+    let m = __psa_vec_len_h(out.ipay as ptr);
+    let a: i64 = 1;
+    while a < m {
+        let item = __psa_vec_get_h(out.ipay as ptr, a);
+        let ic = __psa_tuple_get(item, 1).ipay;
+        let b = a;
+        while b > 0 {
+            let prev = __psa_vec_get_h(out.ipay as ptr, b - 1);
+            if __psa_tuple_get(prev, 1).ipay < ic {
+                __psa_vec_set_h(out.ipay as ptr, b, prev);
+                b = b - 1;
+            } else {
+                break;
+            };
+        }
+        __psa_vec_set_h(out.ipay as ptr, b, item);
+        a = a + 1;
+    }
+    return out;
+}
+
+fn psa_collections_counter_most_common(c: PsaVal) -> PsaVal {
+    // Counter.most_common() with no n: all entries.
+    __psa_collections_dict(c);
+    return __psa_collections_most_common_sorted(c);
+}
+
+fn psa_collections_counter_most_common_n(c: PsaVal, nv: PsaVal) -> PsaVal {
+    // Counter.most_common(n): the n most common;
+    // n <= 0 yields an empty list (CPython, verified:
+    // most_common(-1) == []).
+    __psa_collections_dict(c);
+    let n = __psa_collections_int(nv);
+    let all = __psa_collections_most_common_sorted(c);
+    let out = __psa_list_new();
+    if n <= 0 { return out; };
+    let m = __psa_vec_len_h(all.ipay as ptr);
+    let i: i64 = 0;
+    while i < m {
+        if i < n {
+            __psa_list_push(out, __psa_vec_get_h(all.ipay as ptr, i));
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+fn psa_collections_counter_any(v: PsaVal) -> PsaVal {
+    // The wiring-level Counter(x): CPython's one
+    // constructor accepts an iterable OR a mapping;
+    // dispatch on the argument's tag.
+    if v.tag == 5 { return psa_collections_counter_dict(v); };
+    return psa_collections_counter(v);
+}
+
+fn psa_collections_ordereddict_any(v: PsaVal) -> PsaVal {
+    // The wiring-level OrderedDict(x): a mapping
+    // copies, anything else is read as pairs.
+    if v.tag == 5 { return psa_collections_ordereddict_of(v); };
+    return psa_collections_ordereddict_pairs(v);
+}
+
+// ---- defaultdict ----
+
+fn psa_collections_defaultdict_new(factory: PsaVal) -> PsaVal {
+    // defaultdict(factory): an empty dict. The
+    // factory is validated (None or callable) but
+    // NOT stored -- a PsaVal dict has no slot for
+    // it; it is passed again at access time (see
+    // psa_collections_defaultdict_get). Registered
+    // API-shape divergence in README-collections.md.
+    if factory.tag == 3 { return __psa_dict_new(); };
+    __psa_collections_callable(factory);
+    return __psa_dict_new();
+}
+
+fn psa_collections_defaultdict_get(d: PsaVal, factory: PsaVal, k: PsaVal) -> PsaVal {
+    // defaultdict[k] semantics: present key returns
+    // its value; a missing key calls factory(),
+    // stores and returns the result; a None factory
+    // makes a missing key CPython's KeyError (77141).
+    __psa_collections_dict(d);
+    if __psa_dict_contains(d, k) {
+        return __psa_dict_get(d, k);
+    };
+    if factory.tag == 3 { panic(77141); };
+    __psa_collections_callable(factory);
+    let v = __psa_call_value(factory, __psa_list_new());
+    __psa_dict_set(d, k, v);
+    return v;
+}
+
+// ---- deque (a tag-4 list; maxlen passed per call) ----
+
+fn psa_collections_deque_new(it: PsaVal) -> PsaVal {
+    // deque(iterable): a fresh list copy.
+    return __psa_collections_items(it);
+}
+
+fn psa_collections_deque_new_empty() -> PsaVal {
+    return __psa_list_new();
+}
+
+fn __psa_collections_deque_insert0(d: PsaVal, x: PsaVal) -> void {
+    // Insert x at the front, in place: grow by one
+    // slot, shift right, write index 0.
+    let p = d.ipay as ptr;
+    let n = __psa_vec_len_h(p);
+    __psa_vec_push_h(p, x);
+    let i = n;
+    while i > 0 {
+        __psa_vec_set_h(p, i, __psa_vec_get_h(p, i - 1));
+        i = i - 1;
+    }
+    __psa_vec_set_h(p, 0, x);
+    return;
+}
+
+fn __psa_collections_deque_check_maxlen(m: PsaVal) -> i64 {
+    // maxlen as an int, or -1 for the unbounded form
+    // (None). A negative maxlen is CPython's
+    // ValueError at deque construction.
+    if m.tag == 3 { return -1; };
+    let n = __psa_collections_int(m);
+    if n < 0 { panic(77141); };
+    return n;
+}
+
+fn psa_collections_deque_append(d: PsaVal, x: PsaVal) -> PsaVal {
+    if d.tag != 4 { panic(77140); };
+    __psa_list_push(d, x);
+    return __psa_collections_none();
+}
+
+fn psa_collections_deque_append_maxlen(d: PsaVal, x: PsaVal, m: PsaVal) -> PsaVal {
+    // deque.append with a maxlen: a full deque drops
+    // from the left; maxlen 0 discards everything.
+    if d.tag != 4 { panic(77140); };
+    let cap = __psa_collections_deque_check_maxlen(m);
+    if cap == 0 { return __psa_collections_none(); };
+    if cap > 0 {
+        if __psa_vec_len_h(d.ipay as ptr) >= cap {
+            __psa_vec_remove_h(d.ipay as ptr, 0);
+        };
+    };
+    __psa_list_push(d, x);
+    return __psa_collections_none();
+}
+
+fn psa_collections_deque_appendleft(d: PsaVal, x: PsaVal) -> PsaVal {
+    if d.tag != 4 { panic(77140); };
+    __psa_collections_deque_insert0(d, x);
+    return __psa_collections_none();
+}
+
+fn psa_collections_deque_appendleft_maxlen(d: PsaVal, x: PsaVal, m: PsaVal) -> PsaVal {
+    // deque.appendleft with a maxlen: a full deque
+    // drops from the right.
+    if d.tag != 4 { panic(77140); };
+    let cap = __psa_collections_deque_check_maxlen(m);
+    if cap == 0 { return __psa_collections_none(); };
+    if cap > 0 {
+        let n = __psa_vec_len_h(d.ipay as ptr);
+        if n >= cap {
+            __psa_vec_truncate_h(d.ipay as ptr, n - 1);
+        };
+    };
+    __psa_collections_deque_insert0(d, x);
+    return __psa_collections_none();
+}
+
+fn psa_collections_deque_pop(d: PsaVal) -> PsaVal {
+    // deque.pop(): rightmost element; an empty deque
+    // is CPython's IndexError (77141).
+    if d.tag != 4 { panic(77140); };
+    let n = __psa_vec_len_h(d.ipay as ptr);
+    if n == 0 { panic(77141); };
+    return __psa_vec_remove_h(d.ipay as ptr, n - 1);
+}
+
+fn psa_collections_deque_popleft(d: PsaVal) -> PsaVal {
+    if d.tag != 4 { panic(77140); };
+    if __psa_vec_len_h(d.ipay as ptr) == 0 { panic(77141); };
+    return __psa_vec_remove_h(d.ipay as ptr, 0);
+}
+
+fn psa_collections_deque_extend(d: PsaVal, it: PsaVal) -> PsaVal {
+    if d.tag != 4 { panic(77140); };
+    let xs = __psa_collections_items(it);
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        __psa_list_push(d, __psa_vec_get_h(xs.ipay as ptr, i));
+        i = i + 1;
+    }
+    return __psa_collections_none();
+}
+
+fn psa_collections_deque_extendleft(d: PsaVal, it: PsaVal) -> PsaVal {
+    // extendleft appends each element to the left in
+    // iteration order, so the iterable ends up
+    // reversed at the front (CPython).
+    if d.tag != 4 { panic(77140); };
+    let xs = __psa_collections_items(it);
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        __psa_collections_deque_insert0(d, __psa_vec_get_h(xs.ipay as ptr, i));
+        i = i + 1;
+    }
+    return __psa_collections_none();
+}
+
+fn psa_collections_deque_rotate(d: PsaVal, nv: PsaVal) -> PsaVal {
+    // deque.rotate(n): rotate right by n (negative
+    // rotates left); n is taken modulo the length.
+    if d.tag != 4 { panic(77140); };
+    let n0 = __psa_collections_int(nv);
+    let len = __psa_vec_len_h(d.ipay as ptr);
+    if len == 0 { return __psa_collections_none(); };
+    let n = n0 % len;
+    let steps = n;
+    if steps < 0 { steps = steps + len; };
+    let i: i64 = 0;
+    while i < steps {
+        let x = __psa_vec_remove_h(d.ipay as ptr, len - 1);
+        __psa_collections_deque_insert0(d, x);
+        i = i + 1;
+    }
+    return __psa_collections_none();
+}
+
+fn psa_collections_deque_count(d: PsaVal, x: PsaVal) -> PsaVal {
+    // deque.count(x): occurrences under dyn equality.
+    if d.tag != 4 { panic(77140); };
+    let n = __psa_vec_len_h(d.ipay as ptr);
+    let c: i64 = 0;
+    let i: i64 = 0;
+    while i < n {
+        if __psa_dyn_eq(__psa_vec_get_h(d.ipay as ptr, i), x) {
+            c = c + 1;
+        };
+        i = i + 1;
+    }
+    return __psa_box_int(c);
+}
+
+fn psa_collections_deque_remove(d: PsaVal, x: PsaVal) -> PsaVal {
+    // deque.remove(x): first occurrence; a missing
+    // value is CPython's ValueError (77141).
+    if d.tag != 4 { panic(77140); };
+    let n = __psa_vec_len_h(d.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        if __psa_dyn_eq(__psa_vec_get_h(d.ipay as ptr, i), x) {
+            __psa_vec_remove_h(d.ipay as ptr, i);
+            return __psa_collections_none();
+        };
+        i = i + 1;
+    }
+    panic(77141);
+}
+
+fn psa_collections_deque_clear(d: PsaVal) -> PsaVal {
+    if d.tag != 4 { panic(77140); };
+    __psa_vec_truncate_h(d.ipay as ptr, 0);
+    return __psa_collections_none();
+}
+
+// ---- ChainMap (a tag-4 list of tag-5 dicts) ----
+
+fn psa_collections_chainmap_new(maps: PsaVal) -> PsaVal {
+    // ChainMap(*maps): the maps in lookup order.
+    // ChainMap() itself holds one empty dict, so an
+    // empty maps list yields [ {} ].
+    let xs = __psa_collections_items(maps);
+    let out = __psa_list_new();
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        let m = __psa_vec_get_h(xs.ipay as ptr, i);
+        __psa_collections_dict(m);
+        __psa_list_push(out, m);
+        i = i + 1;
+    }
+    if n == 0 {
+        __psa_list_push(out, __psa_dict_new());
+    };
+    return out;
+}
+
+fn __psa_collections_chainmap_check(cm: PsaVal) -> void {
+    if cm.tag != 4 { panic(77140); };
+    return;
+}
+
+fn psa_collections_chainmap_get(cm: PsaVal, k: PsaVal) -> PsaVal {
+    // ChainMap[k]: the first map holding k wins; a
+    // key in no map is CPython's KeyError (77141).
+    __psa_collections_chainmap_check(cm);
+    let n = __psa_vec_len_h(cm.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        let m = __psa_vec_get_h(cm.ipay as ptr, i);
+        if __psa_dict_contains(m, k) {
+            return __psa_dict_get(m, k);
+        };
+        i = i + 1;
+    }
+    panic(77141);
+}
+
+fn psa_collections_chainmap_get_default(cm: PsaVal, k: PsaVal, dv: PsaVal) -> PsaVal {
+    // Mapping.get over a ChainMap: default instead
+    // of the KeyError panic.
+    __psa_collections_chainmap_check(cm);
+    let n = __psa_vec_len_h(cm.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        let m = __psa_vec_get_h(cm.ipay as ptr, i);
+        if __psa_dict_contains(m, k) {
+            return __psa_dict_get(m, k);
+        };
+        i = i + 1;
+    }
+    return dv;
+}
+
+fn psa_collections_chainmap_set(cm: PsaVal, k: PsaVal, v: PsaVal) -> PsaVal {
+    // ChainMap[k] = v writes to the FIRST map only.
+    __psa_collections_chainmap_check(cm);
+    if __psa_vec_len_h(cm.ipay as ptr) == 0 { panic(77141); };
+    let m = __psa_vec_get_h(cm.ipay as ptr, 0);
+    __psa_dict_set(m, k, v);
+    return __psa_collections_none();
+}
+
+fn psa_collections_chainmap_del(cm: PsaVal, k: PsaVal) -> PsaVal {
+    // del ChainMap[k] deletes from the FIRST map
+    // only; a key absent there is a KeyError even
+    // when a later map holds it (CPython).
+    __psa_collections_chainmap_check(cm);
+    if __psa_vec_len_h(cm.ipay as ptr) == 0 { panic(77141); };
+    let m = __psa_vec_get_h(cm.ipay as ptr, 0);
+    if !(__psa_dict_contains(m, k)) { panic(77141); };
+    __psa_dict_del(m, k);
+    return __psa_collections_none();
+}
+
+fn psa_collections_chainmap_keys(cm: PsaVal) -> PsaVal {
+    // ChainMap key iteration (CPython, verified):
+    // maps are scanned last-to-first, each in its own
+    // order, and a key already yielded is skipped --
+    // so the surviving position of a duplicated key
+    // is its LAST map's, while its value (chainmap_
+    // get) comes from the FIRST map holding it.
+    __psa_collections_chainmap_check(cm);
+    let out = __psa_list_new();
+    let seen = __psa_dict_new();
+    let n = __psa_vec_len_h(cm.ipay as ptr);
+    let i = n - 1;
+    while i >= 0 {
+        let m = __psa_vec_get_h(cm.ipay as ptr, i);
+        let cnt = __psa_dict_len(m);
+        let j: i64 = 0;
+        while j < cnt {
+            let k = __psa_dict_key_at(m, j);
+            if !(__psa_dict_contains(seen, k)) {
+                __psa_dict_set(seen, k, __psa_box_bool(true));
+                __psa_list_push(out, k);
+            };
+            j = j + 1;
+        }
+        i = i - 1;
+    }
+    return out;
+}
+
+fn psa_collections_chainmap_new_child(cm: PsaVal, m: PsaVal) -> PsaVal {
+    // ChainMap.new_child(m): a new ChainMap with m
+    // in front; the receiver is not mutated.
+    __psa_collections_chainmap_check(cm);
+    __psa_collections_dict(m);
+    let out = __psa_list_new();
+    __psa_list_push(out, m);
+    let n = __psa_vec_len_h(cm.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        __psa_list_push(out, __psa_vec_get_h(cm.ipay as ptr, i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn psa_collections_chainmap_parents(cm: PsaVal) -> PsaVal {
+    // ChainMap.parents: all maps but the first.
+    __psa_collections_chainmap_check(cm);
+    let out = __psa_list_new();
+    let n = __psa_vec_len_h(cm.ipay as ptr);
+    let i: i64 = 1;
+    while i < n {
+        __psa_list_push(out, __psa_vec_get_h(cm.ipay as ptr, i));
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---- OrderedDict (psa dicts are already ordered) ----
+
+fn psa_collections_ordereddict_of(d: PsaVal) -> PsaVal {
+    // OrderedDict(mapping): an order-preserving copy
+    // (identical to a plain psa dict copy -- the
+    // runtime dict is insertion-ordered, D3).
+    __psa_collections_dict(d);
+    let out = __psa_dict_new();
+    let n = __psa_dict_len(d);
+    let i: i64 = 0;
+    while i < n {
+        __psa_dict_set(out, __psa_dict_key_at(d, i), __psa_dict_val_at(d, i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn psa_collections_ordereddict_pairs(pairs: PsaVal) -> PsaVal {
+    // OrderedDict([(k, v), ...]): build from a list
+    // of 2-element tuples / lists, in order; a
+    // repeated key keeps its first position with the
+    // last value (dict assignment semantics).
+    let xs = __psa_collections_items(pairs);
+    let out = __psa_dict_new();
+    let n = __psa_vec_len_h(xs.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        let p = __psa_vec_get_h(xs.ipay as ptr, i);
+        let kv = __psa_collections_items(p);
+        if __psa_vec_len_h(kv.ipay as ptr) != 2 { panic(77141); };
+        __psa_dict_set(out, __psa_vec_get_h(kv.ipay as ptr, 0), __psa_vec_get_h(kv.ipay as ptr, 1));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn psa_collections_ordereddict_move_to_end(d: PsaVal, k: PsaVal) -> PsaVal {
+    // OrderedDict.move_to_end(k) (last=True form):
+    // delete + reinsert moves the key to the end in
+    // place; a missing key is KeyError (77141).
+    __psa_collections_dict(d);
+    if !(__psa_dict_contains(d, k)) { panic(77141); };
+    let v = __psa_dict_get(d, k);
+    __psa_dict_del(d, k);
+    __psa_dict_set(d, k, v);
+    return __psa_collections_none();
+}
+
+fn psa_collections_ordereddict_move_to_end_first(d: PsaVal, k: PsaVal) -> PsaVal {
+    // move_to_end(k, last=False): returns a NEW dict
+    // with k first (a dict's storage cannot be
+    // prepended in place); a missing key is 77141.
+    __psa_collections_dict(d);
+    if !(__psa_dict_contains(d, k)) { panic(77141); };
+    let out = __psa_dict_new();
+    __psa_dict_set(out, k, __psa_dict_get(d, k));
+    let n = __psa_dict_len(d);
+    let i: i64 = 0;
+    while i < n {
+        let kk = __psa_dict_key_at(d, i);
+        if !(__psa_key_eq(kk, k)) {
+            __psa_dict_set(out, kk, __psa_dict_val_at(d, i));
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---- namedtuple: registered gap, loud refusal ----
+
+fn psa_collections_namedtuple(name: PsaVal, fields: PsaVal) -> PsaVal {
+    // namedtuple is a factory that mints a new class
+    // (a new callable type with attribute access).
+    // psa values cannot mint types: function values
+    // are fixed ids (tag 7) and classes are emitted
+    // per program (tag 8). There is no honest
+    // representation, so the entry point refuses
+    // loudly instead of faking one. Use a dict or a
+    // psa class in the program itself.
+    panic(77148);
+}

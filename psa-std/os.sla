@@ -1,0 +1,255 @@
+@import "sa_std/env.sai"
+@import "sa_std/fs.sai"
+@import "sa_std/process.sai"
+
+// psa_std os (feasibility landing): the subset of
+// CPython's os module the sa_std env / fs / process
+// externs honestly carry, over PsaVal. See
+// README-os.md for the contract and GAP-os.md for
+// what is blocked and why. Panic code: 77164 for
+// the module's whole error surface (CPython
+// OSError on a failed host call; a non-str where a
+// path or a name is required; a path or an env name
+// or value longer than the 1000-byte staging limit
+// the runtime itself uses for open()).
+//
+// Path, name and value strings are staged through
+// a 1000-byte stack buffer exactly as the runtime's
+// __psa_open does; longer inputs panic 77164 rather
+// than truncate. Buffer handles returned by the
+// env externs are read byte by byte (PTR_BYTE_AT)
+// into a dyn str and freed before returning.
+
+fn __psa_os_str(v: PsaVal) -> void {
+    if v.tag != 6 { panic(77164); };
+    return;
+}
+
+fn __psa_os_env_str(h: u64) -> PsaVal {
+    // An env buffer handle -> dyn str.
+    let p: ptr = sa_env_buffer_data(h);
+    let n = sa_env_buffer_len(h) as i64;
+    let out = __psa_str_new();
+    let i: i64 = 0;
+    while i < n {
+        out = __psa_str_push(out, PTR_BYTE_AT(p, i as u64));
+        i = i + 1;
+    }
+    let fr: i32 = sa_env_buffer_free(h);
+    return out;
+}
+
+fn psa_os_getcwd() -> PsaVal {
+    // os.getcwd()
+    let h = sa_env_current_dir();
+    if h == 0 { panic(77164); };
+    return __psa_os_env_str(h);
+}
+
+fn psa_os_chdir(path: PsaVal) -> PsaVal {
+    // os.chdir(path)
+    __psa_os_str(path);
+    let n = __psa_str_bytes_len(path);
+    if n > 1000 { panic(77164); };
+    let buf = [0u8; 1000];
+    let i: i64 = 0;
+    while i < n { buf[i] = __psa_bytes_get_h(path.ipay as ptr, i); i = i + 1; }
+    let rc: i32 = sa_env_set_current_dir(PTR_BYTE_ADD(&buf, 0), n as u64);
+    if rc != 0 { panic(77164); };
+    return PsaVal { tag: 3, ipay: 0, fpay: 0.0 };
+}
+
+fn psa_os_getenv(name: PsaVal) -> PsaVal {
+    // os.getenv(name): the value, or None when the
+    // variable is not set (an empty value is a
+    // value, and returns the empty str).
+    __psa_os_str(name);
+    let n = __psa_str_bytes_len(name);
+    if n > 1000 { panic(77164); };
+    let buf = [0u8; 1000];
+    let i: i64 = 0;
+    while i < n { buf[i] = __psa_bytes_get_h(name.ipay as ptr, i); i = i + 1; }
+    let h = sa_env_get(PTR_BYTE_ADD(&buf, 0), n as u64);
+    if h == 0 { return PsaVal { tag: 3, ipay: 0, fpay: 0.0 }; };
+    return __psa_os_env_str(h);
+}
+
+fn psa_os_getenv_or(name: PsaVal, fallback: PsaVal) -> PsaVal {
+    // os.getenv(name, fallback)
+    let v = psa_os_getenv(name);
+    if v.tag == 3 { return fallback; };
+    return v;
+}
+
+fn psa_os_setenv(name: PsaVal, value: PsaVal) -> PsaVal {
+    // os.environ[name] = value (putenv semantics).
+    __psa_os_str(name);
+    __psa_os_str(value);
+    let n = __psa_str_bytes_len(name);
+    let m = __psa_str_bytes_len(value);
+    if n > 1000 { panic(77164); };
+    if m > 1000 { panic(77164); };
+    let buf = [0u8; 1000];
+    let i: i64 = 0;
+    while i < n { buf[i] = __psa_bytes_get_h(name.ipay as ptr, i); i = i + 1; }
+    let buf2 = [0u8; 1000];
+    let j: i64 = 0;
+    while j < m { buf2[j] = __psa_bytes_get_h(value.ipay as ptr, j); j = j + 1; }
+    let rc: i32 = sa_env_set_var(PTR_BYTE_ADD(&buf, 0), n as u64, PTR_BYTE_ADD(&buf2, 0), m as u64);
+    if rc != 0 { panic(77164); };
+    return PsaVal { tag: 3, ipay: 0, fpay: 0.0 };
+}
+
+fn psa_os_unsetenv(name: PsaVal) -> PsaVal {
+    // os.unsetenv(name): removing a variable that
+    // is not set is not an error in CPython, so the
+    // host status is not consulted.
+    __psa_os_str(name);
+    let n = __psa_str_bytes_len(name);
+    if n > 1000 { panic(77164); };
+    let buf = [0u8; 1000];
+    let i: i64 = 0;
+    while i < n { buf[i] = __psa_bytes_get_h(name.ipay as ptr, i); i = i + 1; }
+    let rc: i32 = sa_env_remove_var(PTR_BYTE_ADD(&buf, 0), n as u64);
+    return PsaVal { tag: 3, ipay: 0, fpay: 0.0 };
+}
+
+fn psa_os_environ() -> PsaVal {
+    // A snapshot of os.environ as a tag-5 dict,
+    // parsed from sa_env_vars_json by the json
+    // module (this function therefore requires
+    // json.sla to be spliced into the same program;
+    // see README-os.md).
+    let h = sa_env_vars_json();
+    if h == 0 { panic(77164); };
+    let text = __psa_os_env_str(h);
+    let d = psa_json_parse(text);
+    if d.tag != 5 { panic(77164); };
+    return d;
+}
+
+fn psa_os_getpid() -> PsaVal {
+    // os.getpid()
+    return __psa_box_int(sa_std_process_id() as i64);
+}
+
+fn psa_os_listdir(path: PsaVal) -> PsaVal {
+    // os.listdir(path): the entry *names* (not
+    // paths), in the host enumeration order --
+    // CPython's order is likewise the raw OS order.
+    // The sa_std entries call caps the listing at
+    // 100000 entries; a directory past the cap
+    // fails loudly (77164), it is not truncated.
+    __psa_os_str(path);
+    let n = __psa_str_bytes_len(path);
+    if n > 1000 { panic(77164); };
+    let buf = [0u8; 1000];
+    let i: i64 = 0;
+    while i < n { buf[i] = __psa_bytes_get_h(path.ipay as ptr, i); i = i + 1; }
+    let entries: u64 = 0;
+    let st: i32 = sa_std_fs_read_dir_entries(PTR_BYTE_ADD(&buf, 0), n as u64, 100000, &entries);
+    if st != 0 { panic(77164); };
+    let out = __psa_list_new();
+    let cnt = sa_fs_dir_entries_len(entries) as i64;
+    let k: i64 = 0;
+    while k < cnt {
+        let e: u64 = 0;
+        let stg: i32 = sa_std_fs_dir_entries_get(entries, k as u64, &e);
+        if stg != 0 { panic(77164); };
+        let np: ptr = sa_fs_dir_entry_file_name_ptr(e);
+        let nl = sa_fs_dir_entry_file_name_len(e) as i64;
+        let name = __psa_str_new();
+        let j: i64 = 0;
+        while j < nl {
+            name = __psa_str_push(name, PTR_BYTE_AT(np, j as u64));
+            j = j + 1;
+        }
+        let fe: i32 = sa_fs_dir_entry_free(e);
+        __psa_list_push(out, name);
+        k = k + 1;
+    }
+    let fd: i32 = sa_fs_dir_entries_free(entries);
+    return out;
+}
+
+fn psa_os_mkdir(path: PsaVal) -> PsaVal {
+    // os.mkdir(path): an existing path is
+    // CPython's FileExistsError (an OSError).
+    __psa_os_str(path);
+    let n = __psa_str_bytes_len(path);
+    if n > 1000 { panic(77164); };
+    let buf = [0u8; 1000];
+    let i: i64 = 0;
+    while i < n { buf[i] = __psa_bytes_get_h(path.ipay as ptr, i); i = i + 1; }
+    let rc: i32 = sa_fs_create_dir(PTR_BYTE_ADD(&buf, 0), n as u64);
+    if rc != 0 { panic(77164); };
+    return PsaVal { tag: 3, ipay: 0, fpay: 0.0 };
+}
+
+fn psa_os_rmdir(path: PsaVal) -> PsaVal {
+    // os.rmdir(path)
+    __psa_os_str(path);
+    let n = __psa_str_bytes_len(path);
+    if n > 1000 { panic(77164); };
+    let buf = [0u8; 1000];
+    let i: i64 = 0;
+    while i < n { buf[i] = __psa_bytes_get_h(path.ipay as ptr, i); i = i + 1; }
+    let rc: i32 = sa_fs_remove_dir(PTR_BYTE_ADD(&buf, 0), n as u64);
+    if rc != 0 { panic(77164); };
+    return PsaVal { tag: 3, ipay: 0, fpay: 0.0 };
+}
+
+fn psa_os_remove(path: PsaVal) -> PsaVal {
+    // os.remove(path) / os.unlink(path)
+    __psa_os_str(path);
+    let n = __psa_str_bytes_len(path);
+    if n > 1000 { panic(77164); };
+    let buf = [0u8; 1000];
+    let i: i64 = 0;
+    while i < n { buf[i] = __psa_bytes_get_h(path.ipay as ptr, i); i = i + 1; }
+    let st: i32 = sa_std_fs_remove(PTR_BYTE_ADD(&buf, 0), n as u64);
+    if st != 0 { panic(77164); };
+    return PsaVal { tag: 3, ipay: 0, fpay: 0.0 };
+}
+
+fn psa_os_rename(src: PsaVal, dst: PsaVal) -> PsaVal {
+    // os.rename(src, dst)
+    __psa_os_str(src);
+    __psa_os_str(dst);
+    let n = __psa_str_bytes_len(src);
+    let m = __psa_str_bytes_len(dst);
+    if n > 1000 { panic(77164); };
+    if m > 1000 { panic(77164); };
+    let buf = [0u8; 1000];
+    let i: i64 = 0;
+    while i < n { buf[i] = __psa_bytes_get_h(src.ipay as ptr, i); i = i + 1; }
+    let buf2 = [0u8; 1000];
+    let j: i64 = 0;
+    while j < m { buf2[j] = __psa_bytes_get_h(dst.ipay as ptr, j); j = j + 1; }
+    let rc: i32 = sa_fs_rename(PTR_BYTE_ADD(&buf, 0), n as u64, PTR_BYTE_ADD(&buf2, 0), m as u64);
+    if rc != 0 { panic(77164); };
+    return PsaVal { tag: 3, ipay: 0, fpay: 0.0 };
+}
+
+fn psa_os_name() -> PsaVal {
+    // os.name on the platforms this toolchain
+    // targets (Linux): "posix". Registered as a
+    // platform assumption in README-os.md.
+    return __psa_os_lit_posix();
+}
+
+fn psa_os_sep() -> PsaVal {
+    // os.sep on the same platforms: "/".
+    return __psa_os_lit_sep();
+}
+fn __psa_os_lit_posix() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 112u8); s = __psa_str_push(s, 111u8); s = __psa_str_push(s, 115u8); s = __psa_str_push(s, 105u8); s = __psa_str_push(s, 120u8);
+    return s;
+}
+
+fn __psa_os_lit_sep() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 47u8);
+    return s;
+}
