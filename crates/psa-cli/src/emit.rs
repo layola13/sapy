@@ -6,7 +6,13 @@
 //! downstream. Anything the subset cannot express is a loud error.
 
 use crate::ast::*;
+use crate::diag::Diagnostic;
+use crate::srcmap::{
+    sha256_hex, EmittedChunk, NameBinding, Origin, Precision, SegKind, SegMeta, SourceEntry,
+    SourceMap, SegmentWriter, SRC_MAIN,
+};
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Ty {
@@ -122,7 +128,7 @@ pub struct Emitter {
     defs: HashMap<String, Func>,
     sigs: HashMap<String, Sig>,
     in_progress: Vec<String>,
-    emitted: Vec<String>,
+    emitted: Vec<EmittedChunk>,
     emitted_set: Vec<String>,
     /// D3 function values: source name -> callable id, plus the
     /// id-ordered callable names. The dispatch (`__psa_call_value`
@@ -130,6 +136,16 @@ pub struct Emitter {
     /// time from `callables`.
     fn_ids: HashMap<String, i64>,
     callables: Vec<String>,
+    /// D8 closures: the same registry for closure defs (defs
+    /// whose first parameter is the hidden environment).
+    /// Closure callables get their OWN id space and their own
+    /// adapters (`__psa_cadapt_<j>`), generated at assembly
+    /// time from `closure_callables`; `used_closure` gates
+    /// the CLOSURE_RUNTIME text (and the tag-16 branch of
+    /// `__psa_call_value`).
+    fn_cids: HashMap<String, i64>,
+    closure_callables: Vec<String>,
+    used_closure: bool,
     /// D4 classes: the registry in definition order, a name ->
     /// index map, and def key -> emitted SLA name for methods
     /// (the dotted def key is not a valid SLA identifier; the
@@ -144,6 +160,9 @@ pub struct Emitter {
     mod_attrs: HashMap<String, Expr>,
     const_names: HashMap<String, Expr>,
     modules: Vec<String>,
+    /// Source file names in source-id order (Program.sources),
+    /// handed down to each Ctx for move-error file resolution.
+    sources: Vec<String>,
     used_floordiv: bool,
     used_floormod: bool,
     used_vec: bool,
@@ -169,6 +188,10 @@ pub struct Emitter {
     /// which splices the module's SLA text at assembly.
     std_json: bool,
     used_psa_json: bool,
+    /// psa_std: the same wiring for `pickle` (thin data-only
+    /// wrapper; dump/load also need the file runtime).
+    std_pickle: bool,
+    used_psa_pickle: bool,
     /// psa_std L1 batch 2: the same wiring for `math` and
     /// `string` -- `std_*` records the merge-pass binding,
     /// `used_psa_*` is set when an entry point is actually
@@ -213,21 +236,33 @@ pub struct Emitter {
     /// which is what unwinds a callee's exception through
     /// frames that have no try of their own.
     program_exc: bool,
+    /// Loop-else support: a stack with one entry per loop
+    /// currently being emitted (innermost last). The entry is
+    /// the loop's break-flag variable name when the loop has an
+    /// `else:` clause, or None when it does not. emit_break_
+    /// through sets the innermost loop's flag (when it has one)
+    /// before emitting the break itself, so the loop can run
+    /// its else clause exactly when no break fired.
+    loop_else_stack: Vec<Option<String>>,
 }
 
 struct Ctx {
-    vars: Vec<(String, Ty, Option<u32>)>,
+    vars: Vec<(String, Ty, Option<SourceAnchor>)>,
+    /// The program's source file names, in source-id order
+    /// (Program.sources); used to fill Diagnostic.file for
+    /// move errors. Mirrors the Emitter's copy.
+    sources: Vec<String>,
     scopes: Vec<usize>,
     ret: Option<Ty>,
     fname: String,
-    out: String,
+    out: SegmentWriter,
     /// Function-prologue lines (hoisted declarations). On the Rust
     /// sla build-exe route a block-scoped aggregate local is never
     /// retired (hand-written probes q16/q29: MemoryLeak at function
     /// exit), so a dynamic variable or temp first materialised inside
     /// a block has its `let` hoisted here, to function scope, and is
     /// filled in place via the stage pattern (see emit_dyn_store).
-    prologue: String,
+    prologue: SegmentWriter,
     indent: usize,
     tmp: usize,
     borrowed: Vec<String>,
@@ -269,6 +304,21 @@ struct Ctx {
     /// channel variable each `yield` sends its wrap on. None
     /// everywhere else (a `yield` there is a loud error).
     gen_chan: Option<String>,
+    /// P1 source map: the anchor (psa position) the lines currently
+    /// being written belong to, and how they are classified.
+    /// `emit_stmt` / `emit_expr` set this on entry and restore the
+    /// enclosing anchor on exit; `Ctx::line` records every line
+    /// under it. `anchor.line == 0` means synthetic (no psa line).
+    anchor: SourceAnchor,
+    anchor_kind: SegKind,
+    anchor_precision: Precision,
+    anchor_name: Option<String>,
+    anchor_origin: Origin,
+    /// P1 source map: a call boundary noted by `emit_expr`'s Call
+    /// arm (`note_call`). The next `Ctx::line` whose text contains
+    /// the callee name becomes a `CallSite` segment; see `line`.
+    pending_call: bool,
+    pending_call_name: Option<String>,
 }
 
 /// D6: one try statement's flag machinery. The flags and the
@@ -292,26 +342,138 @@ struct TryFrame {
 }
 
 impl Ctx {
+    /// Write one generated line and record its source-map segment
+    /// under the current anchor (P1). The bytes written are exactly
+    /// the old ones (indent + `s` + newline); recording only reads
+    /// them. A pending call (see `note_call`) turns this line into
+    /// a `CallSite` segment when the line's text contains the
+    /// callee's call (`<name>(`); a `panic(N)` in the text turns
+    /// it into a `PanicSite` segment instead (the panic scan in
+    /// `SegmentWriter::push_line` takes precedence: the panic code
+    /// is the more precise signal).
     fn line(&mut self, s: &str) {
+        let mut full = String::with_capacity(self.indent * 4 + s.len());
         for _ in 0..self.indent {
-            self.out.push_str("    ");
+            full.push_str("    ");
         }
-        self.out.push_str(s);
-        self.out.push('\n');
+        full.push_str(s);
+        let mut meta = SegMeta {
+            anchor: self.anchor,
+            origin: self.anchor_origin.clone(),
+            kind: self.anchor_kind,
+            name: self.anchor_name.clone(),
+            precision: self.anchor_precision,
+        };
+        if self.pending_call {
+            let consume = match &self.pending_call_name {
+                Some(n) => full.contains(&format!("{}(", n)),
+                None => {
+                    full.contains("__psa_call_value(")
+                        || full.contains("__psa_call_closure(")
+                        || full.contains("__psa_call_id(")
+                }
+            };
+            if consume {
+                meta.kind = SegKind::CallSite;
+                meta.name = self.pending_call_name.clone();
+                self.pending_call = false;
+                self.pending_call_name = None;
+            }
+        }
+        self.out.push_line(&full, &meta);
+    }
+
+    /// Set the anchor under which subsequent lines are recorded.
+    /// The origin is derived from the anchor (a psa line anchors
+    /// `User`, `line == 0` anchors `Synthetic`); override it with
+    /// `set_anchor_origin` for psa-added lines anchored to a user
+    /// line (e.g. main's fallthrough `return 0;`).
+    fn set_anchor(&mut self, anchor: SourceAnchor, kind: SegKind, precision: Precision, name: Option<String>) {
+        self.anchor_origin = if anchor.is_synthetic() { Origin::Synthetic } else { Origin::User };
+        self.anchor = anchor;
+        self.anchor_kind = kind;
+        self.anchor_precision = precision;
+        self.anchor_name = name;
+    }
+
+    /// Override the origin of the current anchor (see `set_anchor`).
+    fn set_anchor_origin(&mut self, origin: Origin) {
+        self.anchor_origin = origin;
+    }
+
+    /// Save the current anchor (for `emit_stmt` / `emit_expr`
+    /// entry/exit discipline).
+    fn save_anchor(&self) -> (SourceAnchor, SegKind, Precision, Option<String>, Origin) {
+        (
+            self.anchor,
+            self.anchor_kind,
+            self.anchor_precision,
+            self.anchor_name.clone(),
+            self.anchor_origin.clone(),
+        )
+    }
+
+    /// Restore an anchor saved by `save_anchor`.
+    fn restore_anchor(&mut self, saved: (SourceAnchor, SegKind, Precision, Option<String>, Origin)) {
+        self.anchor = saved.0;
+        self.anchor_kind = saved.1;
+        self.anchor_precision = saved.2;
+        self.anchor_name = saved.3;
+        self.anchor_origin = saved.4;
+    }
+
+    /// Note a call boundary (called by `emit_expr`'s Call arm):
+    /// the next line containing the callee's call becomes a
+    /// `CallSite` segment. First call wins when calls nest on one
+    /// line (the outermost call names the line); `None` means a
+    /// dynamic callee (dispatch through `__psa_call_value`).
+    fn note_call(&mut self, name: Option<String>) {
+        if self.pending_call {
+            return;
+        }
+        self.pending_call = true;
+        self.pending_call_name = name;
+    }
+
+    /// Drop a pending call note without consuming it (called when
+    /// a statement finishes: a note that survived its statement
+    /// must not leak into a later statement's lines).
+    fn clear_pending_call(&mut self) {
+        self.pending_call = false;
+        self.pending_call_name = None;
+    }
+
+    /// Push raw (newline-terminated) text into the function
+    /// prologue and record its segment(s) under the current anchor:
+    /// a hoisted declaration belongs to the statement that first
+    /// materialised the variable. Every current call site pushes
+    /// exactly one line.
+    fn prologue_push(&mut self, text: &str) {
+        let meta = SegMeta {
+            anchor: self.anchor,
+            origin: self.anchor_origin.clone(),
+            kind: SegKind::Stmt,
+            name: None,
+            precision: self.anchor_precision,
+        };
+        self.prologue.push_raw(text, &meta);
     }
     fn lookup(&self, name: &str) -> Option<Ty> {
         self.vars.iter().rev().find(|(n, _, _)| n == name).map(|(_, t, _)| *t)
     }
-    fn moved_at(&self, name: &str) -> Option<u32> {
+    /// Ruling #8: the move slot records the move site's full
+    /// anchor (line + name-span column + source id), not just a
+    /// line, so the E1001 diagnostic can point at both ends.
+    fn moved_at(&self, name: &str) -> Option<SourceAnchor> {
         self.vars
             .iter()
             .rev()
             .find(|(n, _, _)| n == name)
             .and_then(|(_, _, m)| *m)
     }
-    fn mark_moved(&mut self, name: &str, line: u32) {
+    fn mark_moved(&mut self, name: &str, anchor: SourceAnchor) {
         if let Some(entry) = self.vars.iter_mut().rev().find(|(n, _, _)| n == name) {
-            entry.2 = Some(line);
+            entry.2 = Some(anchor);
         }
     }
     fn revive(&mut self, name: &str) {
@@ -319,27 +481,40 @@ impl Ctx {
             entry.2 = None;
         }
     }
-    fn check_alive(&self, name: &str, line: u32) -> Result<(), String> {
-        if let Some(at) = self.moved_at(name) {
-            return Err(eerr(
-                line,
-                &format!(
-                    "use of `{}` after it was moved at line {} (container assignment moves; the binding is dead until re-bound)",
-                    name, at
-                ),
-            ));
+    /// Ruling #8: `anchor` is the use site's name span when the
+    /// caller has it, or None for a line-only report (MethodCall
+    /// objects carry no span; emit_expr has no statement anchor
+    /// in scope there -- see the P0b fallback note in
+    /// INTEGRATION-RESULT-R2.md). The diagnostic's `file` comes
+    /// from the use anchor's source, falling back to the move
+    /// anchor's source for line-only uses.
+    fn check_alive(
+        &self,
+        name: &str,
+        line: u32,
+        anchor: Option<SourceAnchor>,
+    ) -> Result<(), Diagnostic> {
+        if let Some(moved) = self.moved_at(name) {
+            let use_site = match anchor {
+                Some(a) => crate::diag::Site::at(a.line, a.col, "use"),
+                None => crate::diag::Site::new(line, "use"),
+            };
+            let mut d = Diagnostic::use_after_move(
+                name,
+                use_site,
+                crate::diag::Site::at(moved.line, moved.col, "move"),
+            );
+            let src: u16 = anchor.map(|a| a.source).unwrap_or(moved.source);
+            if let Some(path) = self.sources.get(src as usize) {
+                d.file = Some(path.clone());
+            }
+            return Err(d);
         }
         Ok(())
     }
-    fn check_not_deleted(&self, name: &str, line: u32) -> Result<(), String> {
+    fn check_not_deleted(&self, name: &str, line: u32) -> Result<(), Diagnostic> {
         if let Some((_, at)) = self.deleted.iter().rev().find(|(n, _)| n == name) {
-            return Err(eerr(
-                line,
-                &format!(
-                    "use of `{}` after `del` at line {} (Python raises NameError; re-bind the name first)",
-                    name, at
-                ),
-            ));
+            return Err(Diagnostic::use_after_del(name, line, *at));
         }
         Ok(())
     }
@@ -352,7 +527,7 @@ impl Ctx {
         let mark = *self.scopes.last().unwrap_or(&0);
         if self.vars[mark..].iter().any(|(n, _, _)| n == name) {
             return Err(format!(
-                "psa emit error: variable `{}` assigned twice in the same scope (v0.1 treats re-binding as an error; rename or restructure)",
+                "variable `{}` assigned twice in the same scope (v0.1 treats re-binding as an error; rename or restructure)",
                 name
             ));
         }
@@ -379,7 +554,7 @@ impl Ctx {
                 *mark += 1;
             }
         }
-        self.prologue.push_str(&format!(
+        self.prologue_push(&format!(
             "    let {}: {} = {};\n",
             name,
             ty.sla(),
@@ -388,11 +563,36 @@ impl Ctx {
     }
 }
 
-fn eerr(line: u32, msg: &str) -> String {
-    format!("psa emit error at line {}: {}", line, msg)
+fn eerr(line: u32, msg: &str) -> Diagnostic {
+    Diagnostic::emit(line, msg)
 }
 
-pub fn emit_program(prog: &Program) -> Result<String, String> {
+pub fn emit_program(prog: &Program) -> Result<String, Diagnostic> {
+    // Plain-text entry point: the map headers are empty here (no
+    // file paths / source bytes were supplied); the emitted text
+    // is identical. Callers that need a map use
+    // `emit_program_with_map`.
+    let sources = vec![SourceEntry {
+        path: String::new(),
+        sha256: String::new(),
+        content: None,
+    }];
+    Ok(emit_program_with_map(prog, sources, "")?.0)
+}
+
+/// Emit the program and return the generated SLA together with
+/// its source map (the in-memory segment table). The map's
+/// `sources` / `generated` headers come from the caller (main.rs,
+/// which owns the file paths and source bytes); the `segments`
+/// table is populated by the SegmentWriter during emission and
+/// finished here once emission is complete. `emit_program` stays
+/// the plain-text entry point; `psa emit` output is byte-identical
+/// either way.
+pub fn emit_program_with_map(
+    prog: &Program,
+    sources: Vec<SourceEntry>,
+    generated_path: &str,
+) -> Result<(String, SourceMap), Diagnostic> {
     // D3: lambdas desugar into synthetic defs before anything
     // else runs; the analysis and emission passes never see a
     // Lambda node.
@@ -407,12 +607,16 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
         emitted_set: Vec::new(),
         fn_ids: HashMap::new(),
         callables: Vec::new(),
+        fn_cids: HashMap::new(),
+        closure_callables: Vec::new(),
+        used_closure: false,
         classes: Vec::new(),
         class_ids: HashMap::new(),
         sla_names: HashMap::new(),
         mod_attrs: prog.mod_attrs.iter().cloned().collect(),
         const_names: prog.const_names.iter().cloned().collect(),
         modules: prog.modules.clone(),
+        sources: prog.sources.clone(),
         used_floordiv: false,
         used_floormod: false,
         used_vec: false,
@@ -432,6 +636,8 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
         // block runs, so the dependency is primed here at
         // construction (psa-std/BATCH-WIRING.md, R5).
         used_psa_json: prog.std_imports.iter().any(|m| m == "argparse"),
+        std_pickle: prog.std_imports.iter().any(|m| m == "pickle"),
+        used_psa_pickle: false,
         std_math: prog.std_imports.iter().any(|m| m == "math"),
         used_psa_math: false,
         std_string: prog.std_imports.iter().any(|m| m == "string"),
@@ -463,6 +669,7 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
         std_urllib: prog.std_imports.iter().any(|m| m == "urllib"),
         used_psa_urllib: false,
         program_exc: false,
+        loop_else_stack: Vec::new(),
     };
     em.program_exc = prog.funcs.iter().any(|f| stmts_use_exc(&f.body))
         || stmts_use_exc(&prog.top);
@@ -489,7 +696,7 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
             base: None,
             methods: Vec::new(),
             attrs: Vec::new(),
-            line: 0,
+            line: 0, anchor: SourceAnchor::synthetic(),
         }];
         for n in [
             "ValueError",
@@ -506,7 +713,7 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
                 base: Some("Exception".to_string()),
                 methods: Vec::new(),
                 attrs: Vec::new(),
-                line: 0,
+                line: 0, anchor: SourceAnchor::synthetic(),
             });
         }
         synth.extend(prog.classes.iter().cloned());
@@ -588,11 +795,12 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
     // other), then main from the top-level statements.
     let mut main_ctx = Ctx {
         vars: Vec::new(),
+        sources: prog.sources.clone(),
         scopes: vec![0],
         ret: Some(Ty::Void),
         fname: "main".to_string(),
-        out: String::new(),
-        prologue: String::new(),
+        out: SegmentWriter::new(),
+        prologue: SegmentWriter::new(),
         indent: 1,
         tmp: 0,
         borrowed: Vec::new(),
@@ -606,22 +814,47 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
         in_finally: 0,
         exc_bare: None,
         gen_chan: None,
+        anchor: SourceAnchor::synthetic(),
+        anchor_kind: SegKind::Stmt,
+        anchor_precision: Precision::None,
+        anchor_name: None,
+        anchor_origin: Origin::Synthetic,
+        pending_call: false,
+        pending_call_name: None,
     };
     // D4 runtime registry: seed every class's literal
     // attributes into its registry dict before any user code
     // runs (CPython evaluates class bodies at definition
     // time; program start is psa's equivalent point).
     if !em.classes.is_empty() {
+        // P1: the registry-seed call is synthetic runtime wiring,
+        // not a user statement (no user line anchors it).
+        main_ctx.set_anchor(
+            SourceAnchor::synthetic(),
+            SegKind::CallSite,
+            Precision::None,
+            Some("__psa_class_attrs_seed".to_string()),
+        );
         main_ctx.line("__psa_class_attrs_seed();");
     }
     for s in &prog.top {
         em.emit_stmt(&mut main_ctx, s)?;
     }
+    // P1: main's fallthrough return is psa-added, anchored to the
+    // last top-level statement (definition-site precision).
+    if let Some(last) = prog.top.last() {
+        main_ctx.set_anchor(stmt_anchor(last), SegKind::Stmt, Precision::Function, None);
+        main_ctx.set_anchor_origin(Origin::Synthetic);
+    }
     main_ctx.line("return 0;");
-    let mut main_txt = String::from("fn main() -> i32 {\n");
-    main_txt.push_str(&main_ctx.prologue);
-    main_txt.push_str(&main_ctx.out);
-    main_txt.push_str("}\n");
+    // P1: main's text is a segment writer: header (anchored to the
+    // first top-level statement), prologue, body, closer.
+    let main_anchor = prog.top.first().map(stmt_anchor).unwrap_or_else(SourceAnchor::synthetic);
+    let mut main_txt = SegmentWriter::new();
+    main_txt.push_line("fn main() -> i32 {", &SegMeta::fn_header(main_anchor, "main".to_string()));
+    main_txt.append_writer(std::mem::take(&mut main_ctx.prologue));
+    main_txt.append_writer(std::mem::take(&mut main_ctx.out));
+    main_txt.push_line("}", &SegMeta::fn_header(main_anchor, "main".to_string()));
 
     // D4: pin every method of every class as a callable -- the
     // per-class getattr generators below bind methods by id.
@@ -647,7 +880,7 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
     // suite, say), the dynamic runtime and the PsaVal struct
     // must still be assembled, or the checker meets field
     // accesses on an unknown struct.
-    if !em.callables.is_empty() || !em.classes.is_empty() {
+    if !em.callables.is_empty() || !em.classes.is_empty() || !em.closure_callables.is_empty() {
         em.used_dyn = true;
     }
 
@@ -657,9 +890,18 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
     // __psa_call_value (tag check: 7 = plain callable, 9 = bound
     // method) and __psa_call_id (per-id adapter dispatch), so a
     // bound method can prepend its receiver and reuse it.
-    if !em.callables.is_empty() || !em.classes.is_empty() {
+    // D8: when the program has closure callables, the dispatch
+    // gains a tag-16 branch and a parallel closure dispatch
+    // (__psa_call_closure_id + __psa_cadapt_<j>, whose adapters
+    // pass the environment as the callee's first argument);
+    // without closures the generated text is unchanged.
+    if !em.callables.is_empty() || !em.classes.is_empty() || !em.closure_callables.is_empty() {
         let mut disp = String::from(
-            "fn __psa_call_value(f: PsaVal, args: PsaVal) -> PsaVal {\n    if f.tag == 9 { return __psa_call_bound(f, args); };\n    if f.tag != 7 { panic(77067); };\n    return __psa_call_id(f.ipay, args);\n}\n",
+            if em.closure_callables.is_empty() {
+                "fn __psa_call_value(f: PsaVal, args: PsaVal) -> PsaVal {\n    if f.tag == 9 { return __psa_call_bound(f, args); };\n    if f.tag != 7 { panic(77067); };\n    return __psa_call_id(f.ipay, args);\n}\n"
+            } else {
+                "fn __psa_call_value(f: PsaVal, args: PsaVal) -> PsaVal {\n    if f.tag == 9 { return __psa_call_bound(f, args); };\n    if f.tag == 16 { return __psa_call_closure(f, args); };\n    if f.tag != 7 { panic(77067); };\n    return __psa_call_id(f.ipay, args);\n}\n"
+            },
         );
         disp.push_str("fn __psa_call_id(id: i64, args: PsaVal) -> PsaVal {\n");
         for i in 0..em.callables.len() {
@@ -672,7 +914,9 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
         disp.push_str(
             "fn __psa_call_bound(f: PsaVal, args: PsaVal) -> PsaVal {\n    let mid = __psa_method_id(f);\n    let mself = __psa_method_self(f);\n    let a2 = __psa_list_new();\n    __psa_list_push(a2, mself);\n    let n = __psa_list_len(args);\n    let i: i64 = 0;\n    while i < n {\n        __psa_list_push(a2, __psa_list_get(args, i));\n        i = i + 1;\n    }\n    return __psa_call_id(mid, a2);\n}\n",
         );
-        em.emitted.push(disp);
+        // P1: the dispatch is one synthetic multi-function chunk
+        // (no single def anchors it).
+        em.emitted.push(EmittedChunk::span(disp, &SegMeta::synthetic_unanchored(SegKind::Stmt)));
         for (i, name) in em.callables.iter().enumerate() {
             let n = em
                 .defs
@@ -704,7 +948,77 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
                 "fn __psa_adapt_{}(args: PsaVal) -> PsaVal {{\n    if __psa_list_len(args) != {} {{ panic(77068); }};\n{}}}\n",
                 i, n, body
             );
-            em.emitted.push(ad);
+            // P1: one synthetic function chunk per adapter, anchored
+            // to the callable def it adapts (precision Function).
+            let ad_anchor = em
+                .defs
+                .get(name.as_str())
+                .expect("a callable is always a def")
+                .anchor;
+            em.emitted.push(EmittedChunk::span(
+                ad,
+                &SegMeta::synthetic_fn(ad_anchor, format!("__psa_adapt_{}", i)),
+            ));
+        }
+        // D8: the closure dispatch and one adapter per
+        // closure callable. The adapter passes the captured
+        // environment as the callee's first argument; the
+        // arity check counts only the user-visible
+        // parameters (param_count includes the env param).
+        if !em.closure_callables.is_empty() {
+            let mut cdisp = String::from(
+                "fn __psa_call_closure(f: PsaVal, args: PsaVal) -> PsaVal {\n    return __psa_call_closure_id(__psa_closure_id(f), __psa_closure_env(f), args);\n}\n",
+            );
+            cdisp.push_str("fn __psa_call_closure_id(id: i64, env: PsaVal, args: PsaVal) -> PsaVal {\n");
+            for j in 0..em.closure_callables.len() {
+                cdisp.push_str(&format!(
+                    "    if id == {} {{ return __psa_cadapt_{}(env, args); }};\n",
+                    j, j
+                ));
+            }
+            cdisp.push_str("    panic(77067);\n}\n");
+            // P1: the closure dispatch is one synthetic
+            // multi-function chunk (no single def anchors it).
+            em.emitted.push(EmittedChunk::span(cdisp, &SegMeta::synthetic_unanchored(SegKind::Stmt)));
+            for (j, name) in em.closure_callables.iter().enumerate() {
+                let n = em
+                    .defs
+                    .get(name.as_str())
+                    .expect("a closure callable is always a def")
+                    .param_count();
+                let mut call = format!("{}(env", em.sla_name(name));
+                for k in 0..n - 1 {
+                    call.push_str(&format!(", __psa_list_get(args, {})", k));
+                }
+                call.push(')');
+                // Return normalisation mirrors the plain
+                // adapters (see above).
+                let ret = em.sigs.get(name.as_str()).and_then(|s| s.ret);
+                let body = match ret {
+                    Some(Ty::Void) => format!("    {};\n    return {};\n", call, Ty::Dyn.default_lit()),
+                    Some(Ty::Int) => format!("    return __psa_box_int({});\n", call),
+                    Some(Ty::Float) => format!("    return __psa_box_float({});\n", call),
+                    Some(Ty::Bool) => format!("    return __psa_box_bool({});\n", call),
+                    _ => format!("    return {};\n", call),
+                };
+                let ad = format!(
+                    "fn __psa_cadapt_{}(env: PsaVal, args: PsaVal) -> PsaVal {{\n    if __psa_list_len(args) != {} {{ panic(77068); }};\n{}}}\n",
+                    j,
+                    n - 1,
+                    body
+                );
+                // P1: one synthetic function chunk per closure
+                // adapter, anchored to the callable def it adapts.
+                let ad_anchor = em
+                    .defs
+                    .get(name.as_str())
+                    .expect("a closure callable is always a def")
+                    .anchor;
+                em.emitted.push(EmittedChunk::span(
+                    ad,
+                    &SegMeta::synthetic_fn(ad_anchor, format!("__psa_cadapt_{}", j)),
+                ));
+            }
         }
     }
 
@@ -716,67 +1030,84 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
     // cannot arise then).
     if em.used_dyn {
         let machinery = gen_obj_machinery(&em);
-        em.emitted.push(machinery);
+        // P1: the object machinery is one synthetic chunk (its
+        // lines serve every class; no single def anchors it).
+        em.emitted.push(EmittedChunk::span(machinery, &SegMeta::synthetic_unanchored(SegKind::Stmt)));
     }
 
-    let mut out = String::new();
-    out.push_str("@import \"sa_std/io/print.sai\"\n@import \"sa_std/fmt.sai\"\n");
+    // P1 source map: the assembly buffer is a segment writer; every
+    // push below records the segments for the lines it appends, so
+    // the final table covers the whole file. The text appended is
+    // unchanged (byte-identical red line). The writer is seeded
+    // with the caller's user sources (main first, merged modules
+    // after); the prelude entry lands after them.
+    let mut asm = SegmentWriter::with_sources(sources);
+    let prelude_meta = SegMeta::prelude(SegKind::Stmt);
+    asm.push_raw("@import \"sa_std/io/print.sai\"\n@import \"sa_std/fmt.sai\"\n", &prelude_meta);
     if em.used_vec || em.used_dyn {
-        out.push_str("@import \"sa_std/vec.sa\"\n");
+        asm.push_raw("@import \"sa_std/vec.sa\"\n", &prelude_meta);
     }
     if em.used_dyn {
-        out.push_str("@import \"sa_std/globals.sai\"\n");
-        out.push_str("@import \"sa_std/core/box.sa\"\n");
-        out.push_str("@import \"sa_std/hashmap.sa\"\n");
-        out.push_str("@import \"sa_std/core/option.sa\"\n");
-        out.push_str("@import \"sa_std/string.sa\"\n");
-        out.push_str("@import \"sa_std/ptr.sa\"\n");
-        out.push_str("@import \"sla_std/wrap/io.sla\"\n");
-        out.push_str("@import \"sla_std/wrap/fmt.sla\"\n");
+        asm.push_raw("@import \"sa_std/globals.sai\"\n", &prelude_meta);
+        asm.push_raw("@import \"sa_std/core/box.sa\"\n", &prelude_meta);
+        asm.push_raw("@import \"sa_std/hashmap.sa\"\n", &prelude_meta);
+        asm.push_raw("@import \"sa_std/core/option.sa\"\n", &prelude_meta);
+        asm.push_raw("@import \"sa_std/string.sa\"\n", &prelude_meta);
+        asm.push_raw("@import \"sa_std/ptr.sa\"\n", &prelude_meta);
+        asm.push_raw("@import \"sla_std/wrap/io.sla\"\n", &prelude_meta);
+        asm.push_raw("@import \"sla_std/wrap/fmt.sla\"\n", &prelude_meta);
+        asm.push_raw("@import \"sla_std/bigint.sla\"\n", &prelude_meta);
     }
     if em.used_math || em.used_dyn {
-        out.push_str("@import \"sa_std/math.sai\"\n");
+        asm.push_raw("@import \"sa_std/math.sai\"\n", &prelude_meta);
     }
     if em.used_file {
-        out.push_str("@import \"sa_std/fs.sai\"\n");
+        asm.push_raw("@import \"sa_std/fs.sai\"\n", &prelude_meta);
     }
     if em.used_gen {
-        out.push_str("@import \"sa_std/task.sai\"\n");
-        out.push_str("@import \"sa_std/thread.sa\"\n");
-        out.push_str("@import \"sa_std/core/result.sa\"\n");
+        asm.push_raw("@import \"sa_std/task.sai\"\n", &prelude_meta);
+        asm.push_raw("@import \"sa_std/thread.sa\"\n", &prelude_meta);
+        asm.push_raw("@import \"sa_std/core/result.sa\"\n", &prelude_meta);
     }
     if em.std_random {
         // psa_std: random.sla calls sa_crypto_random_bytes
         // for entropy seeding; emitted whenever `import
         // random` bound to the standard library, regardless
         // of used_dyn (WIRING-random.md).
-        out.push_str("@import \"sa_std/crypto.sai\"\n");
+        asm.push_raw("@import \"sa_std/crypto.sai\"\n", &prelude_meta);
     }
-    out.push('\n');
+    asm.push_raw("\n", &prelude_meta);
     if em.used_dyn {
-        out.push_str("@derive(copy)\nstruct PsaVal { tag: i64, ipay: i64, fpay: f64 }\n\nstruct PsaStage { tag: i64, ipay: i64, fpay: f64 }\n\n");
+        asm.push_raw("@derive(copy)\nstruct PsaVal { tag: i64, ipay: i64, fpay: f64 }\n\nstruct PsaStage { tag: i64, ipay: i64, fpay: f64 }\n\n", &prelude_meta);
     }
     if em.used_ipow || em.used_dyn {
-        out.push_str(
+        asm.push_raw(
             "fn __psa_ipow(a: i64, e: i64) -> i64 {\n    let r = 1;\n    let b = a;\n    let n = e;\n    while n > 0 {\n        if (n & 1) == 1 { r = r * b; };\n        b = b * b;\n        n = n >> 1;\n    }\n    return r;\n}\n\n",
+            &SegMeta::prelude_fn("__psa_ipow"),
         );
     }
     if em.used_floordiv || em.used_dyn {
-        out.push_str(
+        asm.push_raw(
             "fn __psa_floordiv(a: i64, b: i64) -> i64 {\n    if a == -9223372036854775807 - 1 && b == -1 { panic(77080); };\n    let q = a / b;\n    let r = a % b;\n    if r != 0 && ((r < 0) != (b < 0)) { return q - 1; };\n    return q;\n}\n\n",
+            &SegMeta::prelude_fn("__psa_floordiv"),
         );
     }
     if em.used_floormod || em.used_dyn {
-        out.push_str(
+        asm.push_raw(
             "fn __psa_floormod(a: i64, b: i64) -> i64 {\n    if a == -9223372036854775807 - 1 && b == -1 { return 0; };\n    let r = a % b;\n    if r != 0 && ((r < 0) != (b < 0)) { return r + b; };\n    return r;\n}\n\n",
+            &SegMeta::prelude_fn("__psa_floormod"),
         );
     }
     if em.used_dyn {
-        out.push_str(DYN_RUNTIME);
-        out.push_str(D6_EXC_RUNTIME);
+        asm.push_raw(DYN_RUNTIME, &prelude_meta);
+        asm.push_raw(BIG_RUNTIME, &prelude_meta);
+        asm.push_raw(D6_EXC_RUNTIME, &prelude_meta);
+    }
+    if em.used_closure {
+        asm.push_raw(CLOSURE_RUNTIME, &prelude_meta);
     }
     if em.used_file {
-        out.push_str(D6_FILE_RUNTIME);
+        asm.push_raw(D6_FILE_RUNTIME, &prelude_meta);
     }
     if em.used_dyn && !em.used_gen {
         // psa_std collections / itertools / functools call
@@ -786,88 +1117,197 @@ pub fn emit_program(prog: &Program) -> Result<String, String> {
         // constructed (generator defs/exprs are the only
         // source, and no std module creates one), so the
         // identity is the same function here.
-        out.push_str("fn __psa_iter_source(v: PsaVal) -> PsaVal {
+        asm.push_raw("fn __psa_iter_source(v: PsaVal) -> PsaVal {
     return v;
 }
 
-");
+", &SegMeta::prelude_fn("__psa_iter_source"));
     }
     if em.used_gen {
-        out.push_str(D7_GEN_RUNTIME);
+        asm.push_raw(D7_GEN_RUNTIME, &prelude_meta);
     }
     if em.used_coro {
-        out.push_str(D7_CORO_RUNTIME);
+        asm.push_raw(D7_CORO_RUNTIME, &prelude_meta);
     }
     if em.used_psa_json {
-        out.push_str(PSA_JSON_SLA);
-        out.push('\n');
+        let src = asm.add_source("psa-std/json.sla".to_string(), sha256_hex(PSA_JSON_SLA.as_bytes()));
+        asm.push_std_splice(PSA_JSON_SLA, "json", src);
+    }
+    if em.used_psa_pickle {
+        let src = asm.add_source("psa-std/pickle.sla".to_string(), sha256_hex(PSA_PICKLE_SLA.as_bytes()));
+        asm.push_std_splice(PSA_PICKLE_SLA, "pickle", src);
     }
     if em.used_psa_math {
-        out.push_str(PSA_MATH_SLA);
-        out.push('\n');
+        let src = asm.add_source("psa-std/math.sla".to_string(), sha256_hex(PSA_MATH_SLA.as_bytes()));
+        asm.push_std_splice(PSA_MATH_SLA, "math", src);
     }
     if em.used_psa_string {
-        out.push_str(PSA_STRING_SLA);
-        out.push('\n');
+        let src = asm.add_source("psa-std/string.sla".to_string(), sha256_hex(PSA_STRING_SLA.as_bytes()));
+        asm.push_std_splice(PSA_STRING_SLA, "string", src);
     }
     if em.used_psa_csv {
-        out.push_str(PSA_CSV_SLA);
-        out.push('\n');
+        let src = asm.add_source("psa-std/csv.sla".to_string(), sha256_hex(PSA_CSV_SLA.as_bytes()));
+        asm.push_std_splice(PSA_CSV_SLA, "csv", src);
     }
     if em.used_psa_logging {
-        out.push_str(PSA_LOGGING_SLA);
-        out.push('\n');
+        let src = asm.add_source("psa-std/logging.sla".to_string(), sha256_hex(PSA_LOGGING_SLA.as_bytes()));
+        asm.push_std_splice(PSA_LOGGING_SLA, "logging", src);
     }
     if em.used_psa_argparse {
-        out.push_str(PSA_ARGPARSE_SLA);
-        out.push('\n');
+        let src = asm.add_source("psa-std/argparse.sla".to_string(), sha256_hex(PSA_ARGPARSE_SLA.as_bytes()));
+        asm.push_std_splice(PSA_ARGPARSE_SLA, "argparse", src);
     }
     if em.used_psa_collections {
-        out.push_str(PSA_COLLECTIONS_SLA);
-        out.push('\n');
+        let src = asm.add_source("psa-std/collections.sla".to_string(), sha256_hex(PSA_COLLECTIONS_SLA.as_bytes()));
+        asm.push_std_splice(PSA_COLLECTIONS_SLA, "collections", src);
     }
     if em.used_psa_itertools {
-        out.push_str(PSA_ITERTOOLS_SLA);
-        out.push('\n');
+        let src = asm.add_source("psa-std/itertools.sla".to_string(), sha256_hex(PSA_ITERTOOLS_SLA.as_bytes()));
+        asm.push_std_splice(PSA_ITERTOOLS_SLA, "itertools", src);
     }
     if em.used_psa_functools {
-        out.push_str(PSA_FUNCTOOLS_SLA);
-        out.push('\n');
+        let src = asm.add_source("psa-std/functools.sla".to_string(), sha256_hex(PSA_FUNCTOOLS_SLA.as_bytes()));
+        asm.push_std_splice(PSA_FUNCTOOLS_SLA, "functools", src);
     }
     if em.used_psa_bisect {
-        out.push_str(PSA_BISECT_SLA);
-        out.push('\n');
+        let src = asm.add_source("psa-std/bisect.sla".to_string(), sha256_hex(PSA_BISECT_SLA.as_bytes()));
+        asm.push_std_splice(PSA_BISECT_SLA, "bisect", src);
     }
     if em.used_psa_heapq {
-        out.push_str(PSA_HEAPQ_SLA);
-        out.push('\n');
+        let src = asm.add_source("psa-std/heapq.sla".to_string(), sha256_hex(PSA_HEAPQ_SLA.as_bytes()));
+        asm.push_std_splice(PSA_HEAPQ_SLA, "heapq", src);
     }
     if em.used_psa_base64 {
-        out.push_str(PSA_BASE64_SLA);
-        out.push('\n');
+        let src = asm.add_source("psa-std/base64.sla".to_string(), sha256_hex(PSA_BASE64_SLA.as_bytes()));
+        asm.push_std_splice(PSA_BASE64_SLA, "base64", src);
     }
     if em.used_psa_random {
-        out.push_str(PSA_RANDOM_SLA);
-        out.push('\n');
+        let src = asm.add_source("psa-std/random.sla".to_string(), sha256_hex(PSA_RANDOM_SLA.as_bytes()));
+        asm.push_std_splice(PSA_RANDOM_SLA, "random", src);
     }
     if em.used_psa_re {
-        out.push_str(PSA_RE_SLA);
-        out.push('\n');
+        let src = asm.add_source("psa-std/re.sla".to_string(), sha256_hex(PSA_RE_SLA.as_bytes()));
+        asm.push_std_splice(PSA_RE_SLA, "re", src);
     }
     if em.used_psa_socket {
-        out.push_str(PSA_SOCKET_SLA);
-        out.push('\n');
+        let src = asm.add_source("psa-std/socket.sla".to_string(), sha256_hex(PSA_SOCKET_SLA.as_bytes()));
+        asm.push_std_splice(PSA_SOCKET_SLA, "socket", src);
     }
     if em.used_psa_urllib {
-        out.push_str(PSA_URLLIB_SLA);
-        out.push('\n');
+        let src = asm.add_source("psa-std/urllib.sla".to_string(), sha256_hex(PSA_URLLIB_SLA.as_bytes()));
+        asm.push_std_splice(PSA_URLLIB_SLA, "urllib", src);
     }
-    for f in &em.emitted {
-        out.push_str(f);
-        out.push('\n');
+    for chunk in &em.emitted {
+        asm.append_chunk(chunk);
     }
-    out.push_str(&main_txt);
-    Ok(out)
+    asm.append_writer(main_txt);
+    let (text, mut map) = asm.into_text_and_map(build_name_bridge(&em));
+    // P1 red line: the table must cover every generated line, or
+    // emission fails loudly as an internal error (never silently).
+    map.assert_full_coverage(&text)?;
+    // P2: hash the generated text, sort the segments, remap the
+    // panic-site indices, build the lookup indexes.
+    map.finish(&text, generated_path.to_string());
+    Ok((text, map))
+}
+
+/// P1 source map: the anchor of a statement — its psa line, on the
+/// main source. This is the single seam P0 touches: when `Stmt`
+/// carries a `SourceAnchor` (design §3.2), this function returns
+/// it (with its column and multi-file source) instead of rebuilding
+/// an anchor from the line. Every `Stmt` variant carries a line;
+/// `Def` carries its `Func`'s line.
+/// P1 source map: the anchor of a statement — its psa position,
+/// read off the statement itself (P0b `Stmt::anchor`, post-rewrite
+/// spans per P0d: the column and multi-file source travel with the
+/// statement through the closure rewrite). `Def` carries its `Func`'s
+/// anchor the same way.
+fn stmt_anchor(stmt: &Stmt) -> SourceAnchor {
+    stmt.anchor()
+}
+
+/// P0b span carriers: only `Name` / `Call` / `Index` / `Attr` carry
+/// their own span; every other variant falls back to the enclosing
+/// statement's anchor (see the `Expr` docs in ast.rs). Returns the
+/// span's start anchor, or `None`.
+fn expr_span_start(e: &Expr) -> Option<SourceAnchor> {
+    match e {
+        Expr::Name(_, s) | Expr::Call(_, _, _, s) | Expr::Index(_, _, s) | Expr::Attr(_, _, s) => {
+            Some(s.start)
+        }
+        _ => None,
+    }
+}
+
+/// P1 source map: build the name bridge (design §3.1) from the
+/// emitter's registries — every generated function symbol that
+/// resolves to a psa definition. Plain defs resolve through
+/// `sla_name` (dotted module defs are `__py_mod_<i>` and methods
+/// `__py_cls_<id>_<m>` via `sla_names`); adapters resolve by their
+/// registry index (the same index the dispatch uses); generator
+/// and async wrappers resolve to the def they shell. Sorted by
+/// generated name, deduplicated: the bridge is deterministic
+/// (the defs table itself iterates in hash order).
+fn build_name_bridge(em: &Emitter) -> Vec<NameBinding> {
+    let mut bridge: Vec<NameBinding> = Vec::new();
+    for (name, def) in &em.defs {
+        bridge.push(NameBinding {
+            generated: em.sla_name(name),
+            psa_name: name.clone(),
+            def_line: def.line,
+            source: SRC_MAIN,
+        });
+    }
+    for (i, name) in em.callables.iter().enumerate() {
+        if let Some(def) = em.defs.get(name) {
+            bridge.push(NameBinding {
+                generated: format!("__psa_adapt_{}", i),
+                psa_name: name.clone(),
+                def_line: def.line,
+                source: SRC_MAIN,
+            });
+        }
+    }
+    for (j, name) in em.closure_callables.iter().enumerate() {
+        if let Some(def) = em.defs.get(name) {
+            bridge.push(NameBinding {
+                generated: format!("__psa_cadapt_{}", j),
+                psa_name: name.clone(),
+                def_line: def.line,
+                source: SRC_MAIN,
+            });
+        }
+    }
+    for name in &em.gen_names {
+        if let Some(def) = em.defs.get(name) {
+            let base = em.sla_name(name);
+            bridge.push(NameBinding {
+                generated: format!("{}__prod", base),
+                psa_name: name.clone(),
+                def_line: def.line,
+                source: SRC_MAIN,
+            });
+            bridge.push(NameBinding {
+                generated: format!("{}__drive", base),
+                psa_name: name.clone(),
+                def_line: def.line,
+                source: SRC_MAIN,
+            });
+        }
+    }
+    for name in &em.coro_names {
+        if let Some(def) = em.defs.get(name) {
+            bridge.push(NameBinding {
+                generated: format!("{}__coro", em.sla_name(name)),
+                psa_name: name.clone(),
+                def_line: def.line,
+                source: SRC_MAIN,
+            });
+        }
+    }
+    bridge.sort_by(|a, b| a.generated.cmp(&b.generated));
+    bridge.dedup_by(|a, b| a.generated == b.generated);
+    bridge
 }
 
 /// Build a dynamic string from a compile-time literal inside a
@@ -956,6 +1396,10 @@ fn gen_class_registry(em: &Emitter) -> String {
             }
             let rc = match ae {
                 Expr::Int(v) => format!("__psa_box_int({})", v),
+                Expr::BigInt(d) => {
+                    t.push_str(&sla_str_build(&format!("sv_{}_{}", ci.id, i), d));
+                    format!("__psa_big_from_psastr(sv_{}_{})", ci.id, i)
+                }
                 Expr::Float(v) => format!("__psa_box_float({})", fmt_f64(*v)),
                 Expr::Bool(b) => format!("__psa_box_bool({})", b),
                 Expr::Str(_) => format!("sv_{}_{}", ci.id, i),
@@ -1113,22 +1557,27 @@ fn sla_fn_name(name: &str) -> String {
 /// Names a lambda body may reference without capturing: the
 /// expression-level builtins the emitter special-cases in call
 /// position.
-const LAMBDA_BUILTINS: [&str; 15] = [
+const LAMBDA_BUILTINS: [&str; 16] = [
     "print", "range", "len", "int", "float", "str", "bool", "list", "tuple", "set", "type",
-    "isinstance", "open", "next", "repr",
+    "isinstance", "open", "next", "repr", "bytes",
 ];
 
 /// Collect every name an expression mentions: variable names,
 /// call callee names and method-call object names.
 fn collect_names(e: &Expr, out: &mut Vec<String>) {
     match e {
-        Expr::Name(n) => out.push(n.clone()),
+        Expr::Name(n, _) => out.push(n.clone()),
         Expr::Bin(a, _, b) => {
             collect_names(a, out);
             collect_names(b, out);
         }
         Expr::Unary(_, a) => collect_names(a, out),
-        Expr::Call(f, args, kwargs) => {
+        Expr::Walrus { value, .. } => {
+            // The walrus target is bound by the expression
+            // itself, not a free name; the value's names are.
+            collect_names(value, out);
+        }
+        Expr::Call(f, args, kwargs, _) => {
             collect_names(f, out);
             for a in args {
                 collect_names(a, out);
@@ -1148,7 +1597,7 @@ fn collect_names(e: &Expr, out: &mut Vec<String>) {
                 collect_names(v, out);
             }
         }
-        Expr::Index(a, b) => {
+        Expr::Index(a, b, _) => {
             collect_names(a, out);
             collect_names(b, out);
         }
@@ -1166,7 +1615,7 @@ fn collect_names(e: &Expr, out: &mut Vec<String>) {
                 collect_names(a, out);
             }
         }
-        Expr::Attr(base, _) => {
+        Expr::Attr(base, _, _) => {
             // The attribute name is a field name, not a variable.
             collect_names(base, out);
         }
@@ -1207,297 +1656,636 @@ fn collect_names(e: &Expr, out: &mut Vec<String>) {
             collect_names(then, out);
             collect_names(els, out);
         }
+        // D8: cell and closure nodes (produced by the
+        // closure-conversion pass) mention the cell variable
+        // or the environment expression they wrap.
+        Expr::CellNew(a) | Expr::CellGet(a) => collect_names(a, out),
+        Expr::CellSet(a, b) => {
+            collect_names(a, out);
+            collect_names(b, out);
+        }
+        Expr::ClosureVal(_, env) => collect_names(env, out),
+        Expr::ModEnv => {}
         Expr::FStr(parts) => {
             for p in parts {
-                if let FStrPart::Expr(x) = p {
-                    collect_names(x, out);
-                }
+                p.visit_exprs(&mut |x| collect_names(x, &mut *out));
             }
         }
         _ => {}
     }
 }
 
-fn desugar_expr(
-    e: &mut Expr,
-    defnames: &std::collections::HashSet<String>,
-    counter: &mut u32,
-    new_funcs: &mut Vec<Func>,
-) -> Result<(), String> {
-    if matches!(e, Expr::Lambda { .. }) {
-        // Rewrite the body first: nested lambdas desugar before
-        // this one's capture analysis runs.
-        if let Expr::Lambda { body, .. } = e {
-            desugar_expr(body, defnames, counter, new_funcs)?;
-        }
-        let old = std::mem::replace(e, Expr::NoneLit);
-        if let Expr::Lambda { params, body, line } = old {
-            let mut free: Vec<String> = Vec::new();
-            collect_names(&body, &mut free);
-            for n in &free {
-                if params.iter().any(|p| p == n) {
-                    continue;
-                }
-                if defnames.contains(n) || LAMBDA_BUILTINS.contains(&n.as_str()) {
-                    continue;
-                }
-                return Err(eerr(
-                    line,
-                    &format!(
-                        "lambda captures `{}`: closures over local variables are not supported yet (captured variables need heap cells with late binding); only function and builtin names may be referenced",
-                        n
-                    ),
-                ));
-            }
-            let name = format!("__psa_lambda_{}", counter);
-            *counter += 1;
-            new_funcs.push(Func {
-                name: name.clone(),
-                params: params.iter().map(|p| (p.clone(), None)).collect(),
-                vararg: None,
-                kwarg: None,
-                is_async: false,
-                body: vec![Stmt::Return { value: Some(*body), line }],
-                line,
-            });
-            *e = Expr::FnVal(name);
-        }
-        return Ok(());
+
+/// D8 closure conversion (supersedes the D3 lambda
+/// desugaring; the retired D3 pass — desugar_expr /
+/// desugar_stmt / desugar_pattern — was deleted at
+/// integration).
+///
+/// A scope-aware rewrite that runs before any emission.
+/// Every body (the module top level is the module scope) is
+/// analysed for the names it binds. Lambdas and nested defs
+/// become synthetic top-level defs. When an inner function
+/// references a name bound in an enclosing function scope,
+/// that variable becomes a heap cell in the enclosing scope
+/// (Expr::CellNew — a one-element dynamic list), the inner
+/// def gains a hidden leading environment parameter
+/// (`__psa_env`), and its value is a tag-16 closure
+/// (Expr::ClosureVal) carrying the cells. Names that resolve
+/// to the module scope go through the module environment,
+/// which main publishes into the sa_std globals cell
+/// "psa.modenv" (Expr::ModEnv / Stmt::PublishModEnv).
+/// Capture-free inner functions keep the exact D3 shape
+/// (Expr::FnVal, tag 7), so programs without captures emit
+/// the same text as before.
+///
+/// Semantics follow CPython: one cell per variable per scope
+/// activation, created at scope entry, so closures made in a
+/// loop share the loop variable's final value (late binding)
+/// and `nonlocal` writes land in the very cell the enclosing
+/// scope reads. Sub-forms that stay loudly refused and the
+/// registered divergences are listed in
+/// staging-closure/REPORT.md.
+fn desugar_program(prog: &mut Program) -> Result<(), Diagnostic> {
+    let mut conv = Conv {
+        lambda_counter: 0,
+        nested_counter: 0,
+        tmp_counter: 0,
+        new_funcs: Vec::new(),
+        modenv_slots: HashMap::new(),
+        modenv_names: Vec::new(),
+    };
+    // The module scope's bound names: everything the top
+    // level binds, plus every name declared `global`
+    // anywhere (a global declaration creates the module
+    // binding when the declaring function first assigns).
+    let mut module_bound: std::collections::HashSet<String> = HashSet::new();
+    collect_bound(&prog.top, &mut module_bound);
+    collect_global_decls(&prog.top, &mut module_bound);
+    for f in &prog.funcs {
+        collect_global_decls(&f.body, &mut module_bound);
     }
-    match e {
-        Expr::Bin(a, _, b) => {
-            desugar_expr(a, defnames, counter, new_funcs)?;
-            desugar_expr(b, defnames, counter, new_funcs)?;
+    for c in &prog.classes {
+        for m in &c.methods {
+            collect_global_decls(&m.body, &mut module_bound);
         }
-        Expr::Unary(_, a) => desugar_expr(a, defnames, counter, new_funcs)?,
-        Expr::Call(f, args, kwargs) => {
-            desugar_expr(f, defnames, counter, new_funcs)?;
-            for a in args {
-                desugar_expr(a, defnames, counter, new_funcs)?;
+    }
+    let module_chain: Vec<std::collections::HashSet<String>> = vec![module_bound.clone()];
+    // 0. Analysis pass (throwaway): learn every module name
+    // any top-level def or method touches through the
+    // module environment. The module scope's own conversion
+    // needs that set before it starts — a module variable
+    // read or written from a function must live in a cell
+    // at module level too, with the module's own statements
+    // rewritten to the same cell — but the real conversion
+    // below keeps the D3 scope order (module, defs,
+    // methods) so capture-free programs keep their exact
+    // synthetic-name numbering. The probe converts the same
+    // functions with a scratch Conv and discards the
+    // results; a conversion error surfaces identically in
+    // the real pass.
+    let force_cells: std::collections::HashSet<String> = {
+        let mut probe = Conv {
+            lambda_counter: 0,
+            nested_counter: 0,
+            tmp_counter: 0,
+            new_funcs: Vec::new(),
+            modenv_slots: HashMap::new(),
+            modenv_names: Vec::new(),
+        };
+        let mut g: std::collections::HashSet<String> = HashSet::new();
+        for f in &prog.funcs {
+            let (_, _, gf) = convert_function(&mut probe, f.clone(), &module_chain, &module_bound)?;
+            g.extend(gf);
+        }
+        for c in &prog.classes {
+            for m in &c.methods {
+                let (_, _, gf) =
+                    convert_function(&mut probe, m.clone(), &module_chain, &module_bound)?;
+                g.extend(gf);
             }
-            for (_, v) in kwargs {
-                desugar_expr(v, defnames, counter, new_funcs)?;
+        }
+        g
+    };
+    // 1. The module scope itself (children resolve against
+    // an empty chain; the module bound set is passed apart).
+    let (top, module_out) = convert_scope(
+        &mut conv,
+        &[],
+        prog.top.clone(),
+        &[],
+        &module_bound,
+        true,
+        &force_cells,
+    )?;
+    prog.top = top;
+    // 2. Top-level defs. A free name resolves to the module
+    // environment or stays free (a def, a builtin, or an
+    // error the emitter reports); a top-level def never
+    // captures an enclosing function scope, so the returned
+    // `needed` is empty by construction.
+    let mut funcs: Vec<Func> = Vec::new();
+    for f in &prog.funcs {
+        let (nf, _, _) = convert_function(&mut conv, f.clone(), &module_chain, &module_bound)?;
+        funcs.push(nf);
+    }
+    prog.funcs = funcs;
+    // 3. Class methods, same treatment.
+    for c in &mut prog.classes {
+        for m in &mut c.methods {
+            let (nm, _, _) = convert_function(&mut conv, m.clone(), &module_chain, &module_bound)?;
+            *m = nm;
+        }
+    }
+    let new_funcs = std::mem::take(&mut conv.new_funcs);
+    prog.funcs.extend(new_funcs);
+    // 4. Module-environment fix-up: conversions above may
+    // have slotted module-env names the module scope never
+    // cellified (a `global` name no top-level statement
+    // binds). Create their cells at the head of main and
+    // point PublishModEnv at the final slot order.
+    finish_modenv(&mut prog.top, &mut conv, &module_out.cell_of);
+    Ok(())
+}
+
+/// D8: the hidden environment parameter every closure def
+/// takes as its first parameter.
+const ENV_PARAM: &str = "__psa_env";
+
+/// D8: closure-conversion state shared across all scopes.
+struct Conv {
+    lambda_counter: u32,
+    nested_counter: u32,
+    tmp_counter: u32,
+    new_funcs: Vec<Func>,
+    modenv_slots: HashMap<String, usize>,
+    modenv_names: Vec<String>,
+}
+
+impl Conv {
+    fn fresh(&mut self, prefix: &str) -> String {
+        let n = self.tmp_counter;
+        self.tmp_counter += 1;
+        format!("__psa_{}_{}", prefix, n)
+    }
+    fn modenv_slot(&mut self, name: &str) -> usize {
+        match self.modenv_slots.get(name) {
+            Some(i) => *i,
+            None => {
+                let i = self.modenv_names.len();
+                self.modenv_slots.insert(name.to_string(), i);
+                self.modenv_names.push(name.to_string());
+                i
             }
         }
-        Expr::ListLit(elems) => {
-            for a in elems {
-                desugar_expr(a, defnames, counter, new_funcs)?;
+    }
+}
+
+/// D8: what one scope's conversion produced.
+struct ScopeOutcome {
+    /// Ordered names this scope receives through its
+    /// environment parameter (empty unless the scope is a
+    /// closure def).
+    needed: Vec<String>,
+    /// Own variables converted to cells: source name -> the
+    /// cell variable's name in this scope.
+    cell_of: HashMap<String, String>,
+    /// Module-scope names this scope (or a descendant)
+    /// accesses through the module environment.
+    globals_used: std::collections::HashSet<String>,
+}
+
+/// D8: every name a statement list binds in its own scope
+/// (CPython's rule: an assignment anywhere in the body makes
+/// the name local to the whole body). Nested def interiors
+/// are child scopes and are not entered; a nested def's NAME
+/// is bound here.
+fn collect_bound(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Assign { name, .. } | Stmt::AugAssign { name, .. } => {
+                out.insert(name.clone());
             }
-        }
-        Expr::DictLit(pairs) => {
-            for (k, v) in pairs {
-                desugar_expr(k, defnames, counter, new_funcs)?;
-                desugar_expr(v, defnames, counter, new_funcs)?;
-            }
-        }
-        Expr::Index(a, b) => {
-            desugar_expr(a, defnames, counter, new_funcs)?;
-            desugar_expr(b, defnames, counter, new_funcs)?;
-        }
-        Expr::Slice(a, lo, hi, st) => {
-            desugar_expr(a, defnames, counter, new_funcs)?;
-            for o in [lo, hi, st] {
-                if let Some(x) = o {
-                    desugar_expr(x, defnames, counter, new_funcs)?;
+            Stmt::MultiAssign { names, .. } | Stmt::Unpack { names, .. } => {
+                for n in names {
+                    out.insert(n.clone());
                 }
             }
-        }
-        Expr::MethodCall { args, .. } => {
-            for a in args {
-                desugar_expr(a, defnames, counter, new_funcs)?;
+            Stmt::ForRange { var, body, els, .. } => {
+                out.insert(var.clone());
+                collect_bound(body, out);
+                if let Some(b) = els {
+                    collect_bound(b, out);
+                }
             }
-        }
-        Expr::TupleLit(elems) | Expr::SetLit(elems) => {
-            for a in elems {
-                desugar_expr(a, defnames, counter, new_funcs)?;
+            Stmt::ForEach { vars, body, els, .. } => {
+                for v in vars {
+                    out.insert(v.clone());
+                }
+                collect_bound(body, out);
+                if let Some(b) = els {
+                    collect_bound(b, out);
+                }
             }
-        }
-        Expr::Comp { key, value, clauses, .. } => {
-            desugar_expr(key, defnames, counter, new_funcs)?;
-            if let Some(v) = value {
-                desugar_expr(v, defnames, counter, new_funcs)?;
+            Stmt::If { arms, els, .. } => {
+                for (_, b) in arms {
+                    collect_bound(b, out);
+                }
+                if let Some(b) = els {
+                    collect_bound(b, out);
+                }
             }
-            for c in clauses {
-                match c {
-                    CompClause::For { iter, .. } => {
-                        desugar_expr(iter, defnames, counter, new_funcs)?
+            Stmt::While { body, els, .. } => {
+                collect_bound(body, out);
+                if let Some(b) = els {
+                    collect_bound(b, out);
+                }
+            }
+            Stmt::Try { body, handlers, els, finally, .. } => {
+                collect_bound(body, out);
+                for h in handlers {
+                    if let Some(b) = &h.bind {
+                        out.insert(b.clone());
                     }
-                    CompClause::If(cond) => desugar_expr(cond, defnames, counter, new_funcs)?,
+                    collect_bound(&h.body, out);
+                }
+                if let Some(b) = els {
+                    collect_bound(b, out);
+                }
+                if let Some(b) = finally {
+                    collect_bound(b, out);
                 }
             }
-        }
-        Expr::Attr(base, _) => {
-            desugar_expr(base, defnames, counter, new_funcs)?;
-        }
-        Expr::IfExp { cond, then, els } => {
-            desugar_expr(cond, defnames, counter, new_funcs)?;
-            desugar_expr(then, defnames, counter, new_funcs)?;
-            desugar_expr(els, defnames, counter, new_funcs)?;
-        }
-        Expr::FStr(parts) => {
-            for p in parts {
-                if let FStrPart::Expr(x) = p {
-                    desugar_expr(x, defnames, counter, new_funcs)?;
+            Stmt::With { items, body, .. } => {
+                for (_, b) in items {
+                    if let Some(n) = b {
+                        out.insert(n.clone());
+                    }
+                }
+                collect_bound(body, out);
+            }
+            Stmt::Match { cases, .. } => {
+                for c in cases {
+                    for n in pattern_captures(&c.pattern) {
+                        out.insert(n);
+                    }
+                    collect_bound(&c.body, out);
                 }
             }
+            Stmt::Def(f) => {
+                out.insert(f.name.clone());
+            }
+            Stmt::Del { targets, .. } => {
+                for (n, idx) in targets {
+                    if idx.is_none() {
+                        out.insert(n.clone());
+                    }
+                }
+            }
+            _ => {}
         }
-        Expr::Await(a) => desugar_expr(a, defnames, counter, new_funcs)?,
-        _ => {}
+        // Assignment expressions bind in this scope too
+        // (CPython: a name bound anywhere in the body —
+        // including inside an expression — is local to the
+        // whole body), but the match above only sees
+        // statement-level targets. Walk the statement's own
+        // expressions for walrus targets; walk_stmts_exprs
+        // does not enter child scopes (lambda bodies, nested
+        // defs), whose interiors are their own scopes, and a
+        // comprehension's walrus targets bind HERE, so
+        // entering comprehensions is correct.
+        walk_stmts_exprs(std::slice::from_ref(s), &mut |e| {
+            if let Expr::Walrus { name, .. } = e {
+                out.insert(name.clone());
+            }
+        });
+    }
+}
+
+/// D8: the names a statement list declares `global` or
+/// `nonlocal` in its own scope (child scopes not entered).
+fn collect_declared(
+    stmts: &[Stmt],
+    dglobal: &mut std::collections::HashSet<String>,
+    dnonlocal: &mut std::collections::HashSet<String>,
+) {
+    for s in stmts {
+        match s {
+            Stmt::Global { names, .. } => {
+                for n in names {
+                    dglobal.insert(n.clone());
+                }
+            }
+            Stmt::Nonlocal { names, .. } => {
+                for n in names {
+                    dnonlocal.insert(n.clone());
+                }
+            }
+            Stmt::If { arms, els, .. } => {
+                for (_, b) in arms {
+                    collect_declared(b, dglobal, dnonlocal);
+                }
+                if let Some(b) = els {
+                    collect_declared(b, dglobal, dnonlocal);
+                }
+            }
+            Stmt::While { body, els, .. }
+            | Stmt::ForRange { body, els, .. }
+            | Stmt::ForEach { body, els, .. } => {
+                collect_declared(body, dglobal, dnonlocal);
+                if let Some(b) = els {
+                    collect_declared(b, dglobal, dnonlocal);
+                }
+            }
+            Stmt::With { body, .. } => collect_declared(body, dglobal, dnonlocal),
+            Stmt::Try { body, handlers, els, finally, .. } => {
+                collect_declared(body, dglobal, dnonlocal);
+                for h in handlers {
+                    collect_declared(&h.body, dglobal, dnonlocal);
+                }
+                if let Some(b) = els {
+                    collect_declared(b, dglobal, dnonlocal);
+                }
+                if let Some(b) = finally {
+                    collect_declared(b, dglobal, dnonlocal);
+                }
+            }
+            Stmt::Match { cases, .. } => {
+                for c in cases {
+                    collect_declared(&c.body, dglobal, dnonlocal);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// D8: like collect_declared, but appends the declared
+/// names to a Vec in source order (duplicates kept; the
+/// caller dedups). `want_nonlocal` selects which
+/// declaration kind to collect. Slot assignment must be
+/// deterministic, so environment slots are handed out in
+/// this order rather than HashSet order.
+fn collect_declared_ordered(stmts: &[Stmt], want_nonlocal: bool, out: &mut Vec<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Global { names, .. } if !want_nonlocal => out.extend(names.iter().cloned()),
+            Stmt::Nonlocal { names, .. } if want_nonlocal => out.extend(names.iter().cloned()),
+            Stmt::If { arms, els, .. } => {
+                for (_, b) in arms {
+                    collect_declared_ordered(b, want_nonlocal, out);
+                }
+                if let Some(b) = els {
+                    collect_declared_ordered(b, want_nonlocal, out);
+                }
+            }
+            Stmt::While { body, els, .. }
+            | Stmt::ForRange { body, els, .. }
+            | Stmt::ForEach { body, els, .. } => {
+                collect_declared_ordered(body, want_nonlocal, out);
+                if let Some(b) = els {
+                    collect_declared_ordered(b, want_nonlocal, out);
+                }
+            }
+            Stmt::With { body, .. } => collect_declared_ordered(body, want_nonlocal, out),
+            Stmt::Try { body, handlers, els, finally, .. } => {
+                collect_declared_ordered(body, want_nonlocal, out);
+                for h in handlers {
+                    collect_declared_ordered(&h.body, want_nonlocal, out);
+                }
+                if let Some(b) = els {
+                    collect_declared_ordered(b, want_nonlocal, out);
+                }
+                if let Some(b) = finally {
+                    collect_declared_ordered(b, want_nonlocal, out);
+                }
+            }
+            Stmt::Match { cases, .. } => {
+                for c in cases {
+                    collect_declared_ordered(&c.body, want_nonlocal, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// D8: every name declared `global` in a body or in any
+/// nested def inside it (such a name is a module binding,
+/// created when the declaring function first assigns it).
+fn collect_global_decls(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
+    let mut g: std::collections::HashSet<String> = HashSet::new();
+    let mut n: std::collections::HashSet<String> = HashSet::new();
+    collect_declared(stmts, &mut g, &mut n);
+    out.extend(g);
+    for s in stmts {
+        match s {
+            Stmt::Def(f) => collect_global_decls(&f.body, out),
+            Stmt::If { arms, els, .. } => {
+                for (_, b) in arms {
+                    collect_global_decls(b, out);
+                }
+                if let Some(b) = els {
+                    collect_global_decls(b, out);
+                }
+            }
+            Stmt::While { body, els, .. }
+            | Stmt::ForRange { body, els, .. }
+            | Stmt::ForEach { body, els, .. } => {
+                collect_global_decls(body, out);
+                if let Some(b) = els {
+                    collect_global_decls(b, out);
+                }
+            }
+            Stmt::With { body, .. } => collect_global_decls(body, out),
+            Stmt::Try { body, handlers, els, finally, .. } => {
+                collect_global_decls(body, out);
+                for h in handlers {
+                    collect_global_decls(&h.body, out);
+                }
+                if let Some(b) = els {
+                    collect_global_decls(b, out);
+                }
+                if let Some(b) = finally {
+                    collect_global_decls(b, out);
+                }
+            }
+            Stmt::Match { cases, .. } => {
+                for c in cases {
+                    collect_global_decls(&c.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// D8: how a free name resolves against the enclosing
+/// scopes (chain[0] is the module scope): 0 = stays free
+/// (a def, a builtin, or an error for the emitter),
+/// 1 = an enclosing function scope binds it (a capture),
+/// 2 = the module scope binds it (a global).
+fn resolve_chain(chain: &[std::collections::HashSet<String>], n: &str) -> u8 {
+    for (i, s) in chain.iter().enumerate().rev() {
+        if s.contains(n) {
+            return if i == 0 { 2 } else { 1 };
+        }
+    }
+    0
+}
+
+/// D8: a child-function site inside a scope: a lambda
+/// expression or a nested def statement. The traversal in
+/// scan_stmt / scan_expr visits sites in exactly the order
+/// the pass-B rewriter (Rw) encounters them; a site's
+/// interior is NOT scanned here — converting the child
+/// scans its own body.
+enum Site<'a> {
+    Lambda { params: &'a [String], body: &'a Expr, line: u32 },
+    Def(&'a Func),
+}
+
+/// D8: a converted child function, in site order.
+struct ChildResult {
+    key: String,
+    needed: Vec<String>,
+    is_def: bool,
+    src_name: String,
+    line: u32,
+}
+
+fn scan_stmts(
+    stmts: &[Stmt],
+    conv: &mut Conv,
+    cb: &mut dyn FnMut(&mut Conv, Site) -> Result<(), Diagnostic>,
+) -> Result<(), Diagnostic> {
+    for s in stmts {
+        scan_stmt(s, conv, cb)?;
     }
     Ok(())
 }
 
-fn desugar_stmt(
-    s: &mut Stmt,
-    defnames: &std::collections::HashSet<String>,
-    counter: &mut u32,
-    new_funcs: &mut Vec<Func>,
-) -> Result<(), String> {
+fn scan_stmt(
+    s: &Stmt,
+    conv: &mut Conv,
+    cb: &mut dyn FnMut(&mut Conv, Site) -> Result<(), Diagnostic>,
+) -> Result<(), Diagnostic> {
     match s {
         Stmt::Assign { value, .. }
         | Stmt::AugAssign { value, .. }
-        | Stmt::ExprStmt { value, .. } => desugar_expr(value, defnames, counter, new_funcs),
+        | Stmt::ExprStmt { value, .. }
+        | Stmt::Unpack { value, .. } => scan_expr(value, conv, cb),
         Stmt::IndexAssign { index, value, .. } => {
-            desugar_expr(index, defnames, counter, new_funcs)?;
-            desugar_expr(value, defnames, counter, new_funcs)
+            scan_expr(index, conv, cb)?;
+            scan_expr(value, conv, cb)
         }
         Stmt::AttrAssign { base, value, .. } => {
-            desugar_expr(base, defnames, counter, new_funcs)?;
-            desugar_expr(value, defnames, counter, new_funcs)
+            scan_expr(base, conv, cb)?;
+            scan_expr(value, conv, cb)
         }
-        Stmt::AttrDel { base, .. } => desugar_expr(base, defnames, counter, new_funcs),
+        Stmt::AttrDel { base, .. } => scan_expr(base, conv, cb),
         Stmt::If { arms, els, .. } => {
             for (c, b) in arms {
-                desugar_expr(c, defnames, counter, new_funcs)?;
-                for x in b {
-                    desugar_stmt(x, defnames, counter, new_funcs)?;
-                }
+                scan_expr(c, conv, cb)?;
+                scan_stmts(b, conv, cb)?;
             }
             if let Some(b) = els {
-                for x in b {
-                    desugar_stmt(x, defnames, counter, new_funcs)?;
-                }
+                scan_stmts(b, conv, cb)?;
             }
             Ok(())
         }
-        Stmt::While { cond, body, .. } => {
-            desugar_expr(cond, defnames, counter, new_funcs)?;
-            for x in body {
-                desugar_stmt(x, defnames, counter, new_funcs)?;
+        Stmt::While { cond, body, els, .. } => {
+            scan_expr(cond, conv, cb)?;
+            scan_stmts(body, conv, cb)?;
+            if let Some(b) = els {
+                scan_stmts(b, conv, cb)?;
             }
             Ok(())
         }
-        Stmt::ForRange { start, stop, body, .. } => {
+        Stmt::ForRange { start, stop, body, els, .. } => {
             if let Some(x) = start {
-                desugar_expr(x, defnames, counter, new_funcs)?;
+                scan_expr(x, conv, cb)?;
             }
-            desugar_expr(stop, defnames, counter, new_funcs)?;
-            for x in body {
-                desugar_stmt(x, defnames, counter, new_funcs)?;
-            }
-            Ok(())
-        }
-        Stmt::ForEach { iter, body, .. } => {
-            desugar_expr(iter, defnames, counter, new_funcs)?;
-            for x in body {
-                desugar_stmt(x, defnames, counter, new_funcs)?;
+            scan_expr(stop, conv, cb)?;
+            scan_stmts(body, conv, cb)?;
+            if let Some(b) = els {
+                scan_stmts(b, conv, cb)?;
             }
             Ok(())
         }
-        Stmt::Return { value, .. } => {
+        Stmt::ForEach { iter, body, els, .. } => {
+            scan_expr(iter, conv, cb)?;
+            scan_stmts(body, conv, cb)?;
+            if let Some(b) = els {
+                scan_stmts(b, conv, cb)?;
+            }
+            Ok(())
+        }
+        Stmt::Return { value, .. } | Stmt::Yield { value, .. } | Stmt::Raise { value, .. } => {
             if let Some(x) = value {
-                desugar_expr(x, defnames, counter, new_funcs)?;
+                scan_expr(x, conv, cb)?;
             }
             Ok(())
         }
-        Stmt::Assert { cond, .. } => desugar_expr(cond, defnames, counter, new_funcs),
+        Stmt::Assert { cond, .. } => scan_expr(cond, conv, cb),
         Stmt::Del { targets, .. } => {
             for (_, idx) in targets {
                 if let Some(x) = idx {
-                    desugar_expr(x, defnames, counter, new_funcs)?;
+                    scan_expr(x, conv, cb)?;
                 }
             }
             Ok(())
         }
         Stmt::MultiAssign { values, .. } => {
             for x in values {
-                desugar_expr(x, defnames, counter, new_funcs)?;
+                scan_expr(x, conv, cb)?;
             }
             Ok(())
         }
-        Stmt::Unpack { value, .. } => desugar_expr(value, defnames, counter, new_funcs),
         Stmt::Try { body, handlers, els, finally, .. } => {
-            for x in body {
-                desugar_stmt(x, defnames, counter, new_funcs)?;
-            }
+            scan_stmts(body, conv, cb)?;
             for h in handlers {
-                for x in &mut h.body {
-                    desugar_stmt(x, defnames, counter, new_funcs)?;
-                }
+                scan_stmts(&h.body, conv, cb)?;
             }
             if let Some(b) = els {
-                for x in b {
-                    desugar_stmt(x, defnames, counter, new_funcs)?;
-                }
+                scan_stmts(b, conv, cb)?;
             }
             if let Some(b) = finally {
-                for x in b {
-                    desugar_stmt(x, defnames, counter, new_funcs)?;
-                }
-            }
-            Ok(())
-        }
-        Stmt::Raise { value, .. } => {
-            if let Some(x) = value {
-                desugar_expr(x, defnames, counter, new_funcs)?;
+                scan_stmts(b, conv, cb)?;
             }
             Ok(())
         }
         Stmt::With { items, body, .. } => {
             for (e, _) in items {
-                desugar_expr(e, defnames, counter, new_funcs)?;
+                scan_expr(e, conv, cb)?;
             }
-            for x in body {
-                desugar_stmt(x, defnames, counter, new_funcs)?;
-            }
-            Ok(())
-        }
-        Stmt::Yield { value, .. } => {
-            if let Some(x) = value {
-                desugar_expr(x, defnames, counter, new_funcs)?;
-            }
-            Ok(())
+            scan_stmts(body, conv, cb)
         }
         Stmt::Match { subject, cases, .. } => {
-            desugar_expr(subject, defnames, counter, new_funcs)?;
+            scan_expr(subject, conv, cb)?;
             for c in cases {
-                desugar_pattern(&mut c.pattern, defnames, counter, new_funcs)?;
-                if let Some(g) = &mut c.guard {
-                    desugar_expr(g, defnames, counter, new_funcs)?;
+                scan_pattern(&c.pattern, conv, cb)?;
+                if let Some(g) = &c.guard {
+                    scan_expr(g, conv, cb)?;
                 }
-                for x in &mut c.body {
-                    desugar_stmt(x, defnames, counter, new_funcs)?;
-                }
+                scan_stmts(&c.body, conv, cb)?;
             }
             Ok(())
         }
+        Stmt::Def(f) => cb(conv, Site::Def(f)),
         _ => Ok(()),
     }
 }
 
-/// D7: desugar lambdas inside match patterns (literal
-/// patterns carry plain expressions).
-fn desugar_pattern(
-    p: &mut Pattern,
-    defnames: &std::collections::HashSet<String>,
-    counter: &mut u32,
-    new_funcs: &mut Vec<Func>,
-) -> Result<(), String> {
+fn scan_pattern(
+    p: &Pattern,
+    conv: &mut Conv,
+    cb: &mut dyn FnMut(&mut Conv, Site) -> Result<(), Diagnostic>,
+) -> Result<(), Diagnostic> {
     match p {
-        Pattern::Lit(e) => desugar_expr(e, defnames, counter, new_funcs),
+        Pattern::Lit(e) => scan_expr(e, conv, cb),
         Pattern::Seq(pats) | Pattern::Or(pats) => {
             for x in pats {
-                desugar_pattern(x, defnames, counter, new_funcs)?;
+                scan_pattern(x, conv, cb)?;
             }
             Ok(())
         }
@@ -1505,35 +2293,1577 @@ fn desugar_pattern(
     }
 }
 
-/// D3 lambda desugaring: replace every lambda in the program
-/// with a synthetic def (`__psa_lambda_<n>`, body = return of
-/// the lambda body) plus an FnVal node at the lambda's site.
-/// A lambda may reference its own parameters, user functions
-/// and builtins; referencing any other name is a capture and is
-/// refused loudly (see desugar_expr).
-fn desugar_program(prog: &mut Program) -> Result<(), String> {
-    let defnames: std::collections::HashSet<String> =
-        prog.funcs.iter().map(|f| f.name.clone()).collect();
-    let mut counter = 0u32;
-    let mut new_funcs: Vec<Func> = Vec::new();
-    for s in &mut prog.top {
-        desugar_stmt(s, &defnames, &mut counter, &mut new_funcs)?;
-    }
-    for f in &mut prog.funcs {
-        for s in &mut f.body {
-            desugar_stmt(s, &defnames, &mut counter, &mut new_funcs)?;
+fn scan_expr(
+    e: &Expr,
+    conv: &mut Conv,
+    cb: &mut dyn FnMut(&mut Conv, Site) -> Result<(), Diagnostic>,
+) -> Result<(), Diagnostic> {
+    match e {
+        Expr::Lambda { params, body, line } => cb(
+            conv,
+            Site::Lambda { params, body, line: *line },
+        ),
+        Expr::Bin(a, _, b) => {
+            scan_expr(a, conv, cb)?;
+            scan_expr(b, conv, cb)
         }
+        Expr::Unary(_, a) => scan_expr(a, conv, cb),
+        Expr::Call(f, args, kwargs, _) => {
+            scan_expr(f, conv, cb)?;
+            for a in args {
+                scan_expr(a, conv, cb)?;
+            }
+            for (_, v) in kwargs {
+                scan_expr(v, conv, cb)?;
+            }
+            Ok(())
+        }
+        Expr::ListLit(elems) | Expr::TupleLit(elems) | Expr::SetLit(elems) => {
+            for a in elems {
+                scan_expr(a, conv, cb)?;
+            }
+            Ok(())
+        }
+        Expr::DictLit(pairs) => {
+            for (k, v) in pairs {
+                scan_expr(k, conv, cb)?;
+                scan_expr(v, conv, cb)?;
+            }
+            Ok(())
+        }
+        Expr::Index(a, b, _) => {
+            scan_expr(a, conv, cb)?;
+            scan_expr(b, conv, cb)
+        }
+        Expr::Slice(a, lo, hi, st) => {
+            scan_expr(a, conv, cb)?;
+            for o in [lo, hi, st] {
+                if let Some(x) = o {
+                    scan_expr(x, conv, cb)?;
+                }
+            }
+            Ok(())
+        }
+        Expr::MethodCall { args, .. } => {
+            for a in args {
+                scan_expr(a, conv, cb)?;
+            }
+            Ok(())
+        }
+        Expr::Attr(base, _, _) => scan_expr(base, conv, cb),
+        Expr::Comp { key, value, clauses, .. } => {
+            scan_expr(key, conv, cb)?;
+            if let Some(v) = value {
+                scan_expr(v, conv, cb)?;
+            }
+            for c in clauses {
+                match c {
+                    CompClause::For { iter, .. } => scan_expr(iter, conv, cb)?,
+                    CompClause::If(cond) => scan_expr(cond, conv, cb)?,
+                }
+            }
+            Ok(())
+        }
+        Expr::IfExp { cond, then, els } => {
+            scan_expr(cond, conv, cb)?;
+            scan_expr(then, conv, cb)?;
+            scan_expr(els, conv, cb)
+        }
+        Expr::FStr(parts) => {
+            scan_fstr_parts(parts, conv, cb)?;
+            Ok(())
+        }
+        Expr::Await(a) => scan_expr(a, conv, cb),
+        Expr::Walrus { value, .. } => scan_expr(value, conv, cb),
+        _ => Ok(()),
     }
-    // D4: lambdas inside method bodies desugar the same way.
-    for c in &mut prog.classes {
-        for m in &mut c.methods {
-            for s in &mut m.body {
-                desugar_stmt(s, &defnames, &mut counter, &mut new_funcs)?;
+}
+
+/// Scan the expressions of f-string parts: each field's value
+/// expression and, recursively, the expressions inside its
+/// format spec (a spec is a mini f-string).
+fn scan_fstr_parts(
+    parts: &[FStrPart],
+    conv: &mut Conv,
+    cb: &mut dyn FnMut(&mut Conv, Site) -> Result<(), Diagnostic>,
+) -> Result<(), Diagnostic> {
+    for p in parts {
+        if let FStrPart::Field { value, spec, .. } = p {
+            scan_expr(value, conv, cb)?;
+            if let Some(spec_parts) = spec {
+                scan_fstr_parts(spec_parts, conv, cb)?;
             }
         }
     }
-    prog.funcs.extend(new_funcs);
     Ok(())
+}
+
+/// D8: visit every expression in a statement list without
+/// entering child scopes (lambda bodies, nested defs).
+/// Used by the genexp and match-capture scans.
+fn walk_stmts_exprs(stmts: &[Stmt], f: &mut dyn FnMut(&Expr)) {
+    for s in stmts {
+        match s {
+            Stmt::Assign { value, .. }
+            | Stmt::AugAssign { value, .. }
+            | Stmt::ExprStmt { value, .. }
+            | Stmt::Unpack { value, .. } => walk_expr(value, f),
+            Stmt::IndexAssign { index, value, .. } => {
+                walk_expr(index, f);
+                walk_expr(value, f);
+            }
+            Stmt::AttrAssign { base, value, .. } => {
+                walk_expr(base, f);
+                walk_expr(value, f);
+            }
+            Stmt::AttrDel { base, .. } => walk_expr(base, f),
+            Stmt::If { arms, els, .. } => {
+                for (c, b) in arms {
+                    walk_expr(c, f);
+                    walk_stmts_exprs(b, f);
+                }
+                if let Some(b) = els {
+                    walk_stmts_exprs(b, f);
+                }
+            }
+            Stmt::While { cond, body, els, .. } => {
+                walk_expr(cond, f);
+                walk_stmts_exprs(body, f);
+                if let Some(b) = els {
+                    walk_stmts_exprs(b, f);
+                }
+            }
+            Stmt::ForRange { start, stop, body, els, .. } => {
+                if let Some(x) = start {
+                    walk_expr(x, f);
+                }
+                walk_expr(stop, f);
+                walk_stmts_exprs(body, f);
+                if let Some(b) = els {
+                    walk_stmts_exprs(b, f);
+                }
+            }
+            Stmt::ForEach { iter, body, els, .. } => {
+                walk_expr(iter, f);
+                walk_stmts_exprs(body, f);
+                if let Some(b) = els {
+                    walk_stmts_exprs(b, f);
+                }
+            }
+            Stmt::Return { value, .. } | Stmt::Yield { value, .. } | Stmt::Raise { value, .. } => {
+                if let Some(x) = value {
+                    walk_expr(x, f);
+                }
+            }
+            Stmt::Assert { cond, .. } => walk_expr(cond, f),
+            Stmt::Del { targets, .. } => {
+                for (_, i) in targets {
+                    if let Some(x) = i {
+                        walk_expr(x, f);
+                    }
+                }
+            }
+            Stmt::MultiAssign { values, .. } => {
+                for v in values {
+                    walk_expr(v, f);
+                }
+            }
+            Stmt::Try { body, handlers, els, finally, .. } => {
+                walk_stmts_exprs(body, f);
+                for h in handlers {
+                    walk_stmts_exprs(&h.body, f);
+                }
+                if let Some(b) = els {
+                    walk_stmts_exprs(b, f);
+                }
+                if let Some(b) = finally {
+                    walk_stmts_exprs(b, f);
+                }
+            }
+            Stmt::With { items, body, .. } => {
+                for (e, _) in items {
+                    walk_expr(e, f);
+                }
+                walk_stmts_exprs(body, f);
+            }
+            Stmt::Match { subject, cases, .. } => {
+                walk_expr(subject, f);
+                for c in cases {
+                    walk_pattern_exprs(&c.pattern, f);
+                    if let Some(g) = &c.guard {
+                        walk_expr(g, f);
+                    }
+                    walk_stmts_exprs(&c.body, f);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn walk_pattern_exprs(p: &Pattern, f: &mut dyn FnMut(&Expr)) {
+    match p {
+        Pattern::Lit(e) => walk_expr(e, f),
+        Pattern::Seq(ps) | Pattern::Or(ps) => {
+            for x in ps {
+                walk_pattern_exprs(x, f);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn walk_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
+    f(e);
+    match e {
+        Expr::Bin(a, _, b) => {
+            walk_expr(a, f);
+            walk_expr(b, f);
+        }
+        Expr::Unary(_, a) => walk_expr(a, f),
+        Expr::Call(c, args, kwargs, _) => {
+            walk_expr(c, f);
+            for a in args {
+                walk_expr(a, f);
+            }
+            for (_, v) in kwargs {
+                walk_expr(v, f);
+            }
+        }
+        Expr::ListLit(es) | Expr::TupleLit(es) | Expr::SetLit(es) => {
+            for a in es {
+                walk_expr(a, f);
+            }
+        }
+        Expr::DictLit(ps) => {
+            for (k, v) in ps {
+                walk_expr(k, f);
+                walk_expr(v, f);
+            }
+        }
+        Expr::Index(a, b, _) => {
+            walk_expr(a, f);
+            walk_expr(b, f);
+        }
+        Expr::Slice(a, lo, hi, st) => {
+            walk_expr(a, f);
+            for o in [lo, hi, st] {
+                if let Some(x) = o {
+                    walk_expr(x, f);
+                }
+            }
+        }
+        Expr::MethodCall { args, .. } => {
+            for a in args {
+                walk_expr(a, f);
+            }
+        }
+        Expr::Attr(b, _, _) => walk_expr(b, f),
+        Expr::Comp { key, value, clauses, .. } => {
+            walk_expr(key, f);
+            if let Some(v) = value {
+                walk_expr(v, f);
+            }
+            for c in clauses {
+                match c {
+                    CompClause::For { iter, .. } => walk_expr(iter, f),
+                    CompClause::If(c2) => walk_expr(c2, f),
+                }
+            }
+        }
+        Expr::IfExp { cond, then, els } => {
+            walk_expr(cond, f);
+            walk_expr(then, f);
+            walk_expr(els, f);
+        }
+        Expr::FStr(parts) => {
+            for p in parts {
+                p.visit_exprs(&mut |x| walk_expr(x, &mut *f));
+            }
+        }
+        Expr::Await(a) => walk_expr(a, f),
+        Expr::Walrus { value, .. } => walk_expr(value, f),
+        Expr::CellNew(a) | Expr::CellGet(a) => walk_expr(a, f),
+        Expr::CellSet(a, b) => {
+            walk_expr(a, f);
+            walk_expr(b, f);
+        }
+        Expr::ClosureVal(_, env) => walk_expr(env, f),
+        _ => {}
+    }
+}
+
+/// D8: convert one scope (a function body, or the module
+/// top level when `is_module`). `chain` holds the enclosing
+/// scopes' bound sets, module first; it is empty for the
+/// module scope itself. Returns the rewritten body — cell
+/// creations (and, for the module scope, the PublishModEnv
+/// placeholder) prepended — and the scope's outcome.
+fn convert_scope(
+    conv: &mut Conv,
+    params: &[String],
+    body: Vec<Stmt>,
+    chain: &[std::collections::HashSet<String>],
+    module_bound: &std::collections::HashSet<String>,
+    is_module: bool,
+    force_cells: &std::collections::HashSet<String>,
+) -> Result<(Vec<Stmt>, ScopeOutcome), Diagnostic> {
+    // ---- scope analysis (CPython's rules: a name assigned
+    // anywhere in the body is local everywhere in it).
+    let mut bound: std::collections::HashSet<String> = params.iter().cloned().collect();
+    collect_bound(&body, &mut bound);
+    let mut dglobal: std::collections::HashSet<String> = HashSet::new();
+    let mut dnonlocal: std::collections::HashSet<String> = HashSet::new();
+    collect_declared(&body, &mut dglobal, &mut dnonlocal);
+    for n in &dglobal {
+        if dnonlocal.contains(n) {
+            return Err(eerr(
+                0,
+                &format!("name `{}` is both global and nonlocal (CPython raises SyntaxError)", n),
+            ));
+        }
+        if params.iter().any(|p| p == n) {
+            return Err(eerr(
+                0,
+                &format!("name `{}` is a parameter and declared global (CPython raises SyntaxError)", n),
+            ));
+        }
+    }
+    for n in &dnonlocal {
+        if params.iter().any(|p| p == n) {
+            return Err(eerr(
+                0,
+                &format!("name `{}` is a parameter and declared nonlocal (CPython raises SyntaxError)", n),
+            ));
+        }
+    }
+    if is_module {
+        if !dnonlocal.is_empty() {
+            return Err(eerr(
+                0,
+                "nonlocal declaration not allowed at module level (CPython raises SyntaxError)",
+            ));
+        }
+        // `global` at module level is a no-op in CPython.
+        dglobal.clear();
+    }
+    for n in dglobal.iter().chain(dnonlocal.iter()) {
+        bound.remove(n);
+    }
+    for n in &dnonlocal {
+        if resolve_chain(chain, n) != 1 {
+            return Err(eerr(
+                0,
+                &format!(
+                    "no binding for nonlocal `{}` found in any enclosing function scope (CPython raises SyntaxError)",
+                    n
+                ),
+            ));
+        }
+    }
+    // ---- pass A: convert the child functions (lambdas and
+    // nested defs) in traversal order. Learn which of this
+    // scope's variables must become cells, which names this
+    // scope must itself receive through its environment, and
+    // which module names the subtree touches.
+    let mut sites: Vec<ChildResult> = Vec::new();
+    let mut needed: Vec<String> = Vec::new();
+    let mut cellified: Vec<String> = Vec::new();
+    let mut globals_used: std::collections::HashSet<String> = HashSet::new();
+    {
+        let mut child_chain: Vec<std::collections::HashSet<String>> = chain.to_vec();
+        // The module scope's children resolve against the
+        // full module namespace (which also holds names
+        // that exist only through a `global` declaration);
+        // a function scope's children resolve against its
+        // own bound set.
+        child_chain.push(if is_module {
+            module_bound.clone()
+        } else {
+            bound.clone()
+        });
+        let bound_ref = &bound;
+        let mut cb = |conv: &mut Conv, site: Site| -> Result<(), Diagnostic> {
+            let (raw, src_name, is_def, line) = match site {
+                Site::Lambda { params, body, line } => {
+                    let f = Func {
+                        name: String::new(),
+                        params: params.iter().map(|p| (p.clone(), None)).collect(),
+                        vararg: None,
+                        kwarg: None,
+                        is_async: false,
+                        body: vec![Stmt::Return { value: Some((*body).clone()), line, anchor: SourceAnchor::at(line, 0, None)}],
+                        line, anchor: SourceAnchor::at(line, 0, None),
+                    };
+                    (f, String::new(), false, line)
+                }
+                Site::Def(f) => {
+                    if f.is_async {
+                        return Err(eerr(
+                            f.line,
+                            &format!(
+                                "nested async def `{}` is not supported yet (D8 v1 closures)",
+                                f.name
+                            ),
+                        ));
+                    }
+                    if func_is_generator(f) {
+                        return Err(eerr(
+                            f.line,
+                            &format!(
+                                "nested generator def `{}` cannot capture yet (D8 v1 closures)",
+                                f.name
+                            ),
+                        ));
+                    }
+                    (f.clone(), f.name.clone(), true, f.line)
+                }
+            };
+            let (mut cfunc, cneeded, cglobals) =
+                convert_function(conv, raw, &child_chain, module_bound)?;
+            for n in cglobals {
+                globals_used.insert(n);
+            }
+            // The def key is assigned only now — after the
+            // interior was converted — which preserves the
+            // D3 lambda numbering (post-order).
+            let key = if is_def {
+                let k = format!("__psa_nested_{}", conv.nested_counter);
+                conv.nested_counter += 1;
+                k
+            } else {
+                let k = format!("__psa_lambda_{}", conv.lambda_counter);
+                conv.lambda_counter += 1;
+                k
+            };
+            cfunc.name = key.clone();
+            conv.new_funcs.push(cfunc);
+            sites.push(ChildResult {
+                key,
+                needed: cneeded.clone(),
+                is_def,
+                src_name,
+                line,
+            });
+            for n in &cneeded {
+                if bound_ref.contains(n) {
+                    if !cellified.contains(n) {
+                        cellified.push(n.clone());
+                    }
+                } else if resolve_chain(chain, n) == 1 {
+                    if !needed.contains(n) {
+                        needed.push(n.clone());
+                    }
+                } else {
+                    return Err(eerr(
+                        line,
+                        "internal error: a nested function needs a name that resolves nowhere",
+                    ));
+                }
+            }
+            Ok(())
+        };
+        scan_stmts(&body, conv, &mut cb)?;
+    }
+    // Names this scope binds that the subtree (or, for the
+    // module scope, any function in the program — the
+    // caller passes those in `force_cells`) accesses
+    // through the module environment must live in cells
+    // here: the module scope's own reads and writes have
+    // to go through the very cell the environment
+    // publishes, or the two sides would see different
+    // variables. (For a function scope the filter is
+    // empty by construction — globals are never its own
+    // bound names.)
+    {
+        let mut extra: Vec<String> = globals_used
+            .iter()
+            .chain(force_cells.iter())
+            .filter(|n| bound.contains(*n) && !cellified.contains(*n))
+            .cloned()
+            .collect();
+        extra.sort();
+        extra.dedup();
+        for n in extra {
+            cellified.push(n);
+        }
+    }
+    // Generator expressions in this scope reference its
+    // variables from a synthetic def (see emit_genexp), so
+    // every bound name their key / condition expressions
+    // mention must live in a cell too. The clause
+    // iterables are NOT collected: psa's genexp shape
+    // evaluates them in the enclosing scope and passes
+    // them in, so their names never enter the synthetic
+    // def (collecting them would needlessly cellify, say,
+    // a statically-typed list parameter — whose cell
+    // initialiser then could not box it).
+    {
+        let mut gnames: Vec<String> = Vec::new();
+        walk_stmts_exprs(&body, &mut |e| {
+            if let Expr::Comp { kind: CompKind::GenExp, key, clauses, .. } = e {
+                let cvars: Vec<&String> = clauses
+                    .iter()
+                    .filter_map(|c| match c {
+                        CompClause::For { var, .. } => Some(var),
+                        _ => None,
+                    })
+                    .collect();
+                let mut inner: Vec<String> = Vec::new();
+                collect_names(key, &mut inner);
+                for c in clauses {
+                    if let CompClause::If(cond) = c {
+                        collect_names(cond, &mut inner);
+                    }
+                }
+                for n in inner {
+                    if !cvars.contains(&&n) {
+                        gnames.push(n);
+                    }
+                }
+            }
+        });
+        // Sorted + deduped: collect_names appends in
+        // traversal order with duplicates, and cell-creation
+        // order is visible in the emitted text, so it must
+        // be deterministic.
+        gnames.sort();
+        gnames.dedup();
+        for n in gnames {
+            if bound.contains(&n) && !cellified.contains(&n) {
+                cellified.push(n);
+            }
+        }
+    }
+    // A match pattern may not bind a cell variable (the
+    // match machinery binds captures through its own temps,
+    // with no cell write-back path).
+    {
+        let mut caps: std::collections::HashSet<String> = HashSet::new();
+        for s in &body {
+            if let Stmt::Match { cases, .. } = s {
+                for c in cases {
+                    for n in pattern_captures(&c.pattern) {
+                        caps.insert(n);
+                    }
+                }
+            }
+        }
+        walk_stmts_match_captures(&body, &mut caps);
+        for n in &caps {
+            if cellified.contains(n) {
+                return Err(eerr(
+                    0,
+                    &format!(
+                        "match pattern captures `{}`, which is also captured by a nested function; binding a cell variable through a match pattern is not supported yet (D8 v1)",
+                        n
+                    ),
+                ));
+            }
+        }
+    }
+    // `nonlocal` names receive their environment slots
+    // first (they are known statically), in declaration
+    // order — HashSet order is not stable across runs and
+    // slot order is visible in the emitted text. Further
+    // captures append in encounter order during the
+    // rewrite.
+    {
+        let mut ordered: Vec<String> = Vec::new();
+        collect_declared_ordered(&body, true, &mut ordered);
+        for n in ordered {
+            if !needed.contains(&n) {
+                needed.push(n);
+            }
+        }
+    }
+    let mut cell_of: HashMap<String, String> = HashMap::new();
+    for n in &cellified {
+        let cv = conv.fresh("cell");
+        cell_of.insert(n.clone(), cv);
+    }
+    // ---- pass B: rewrite the body.
+    let mut rw = Rw {
+        conv,
+        bound: &bound,
+        cell_of: &cell_of,
+        dglobal: &dglobal,
+        dnonlocal: &dnonlocal,
+        chain,
+        module_bound,
+        is_module,
+        needed,
+        globals_used,
+        sites: &sites,
+        site_idx: 0,
+        shadow: Vec::new(),
+        hoist_forbidden: false,
+    };
+    let new_body = rw.rewrite_stmts(body)?;
+    let needed = rw.needed;
+    let globals_used = rw.globals_used;
+    if rw.site_idx != sites.len() {
+        return Err(eerr(
+            0,
+            "internal error: closure conversion site count mismatch (scanner/rewriter traversal diverged)",
+        ));
+    }
+    // ---- prepend the cell creations: one cell per captured
+    // variable, created at scope entry (CPython's cell
+    // lifetime). Parameters initialise their cell from the
+    // argument; other variables start as None and are filled
+    // by their first (rewritten) assignment.
+    let mut head: Vec<Stmt> = Vec::new();
+    for n in &cellified {
+        let init = if !is_module && params.iter().any(|p| p == n) {
+            Expr::Name(n.clone(), ExprSpan::synthetic())
+        } else {
+            Expr::NoneLit
+        };
+        head.push(Stmt::Assign {
+            name: cell_of[n].clone(),
+            value: Expr::CellNew(Box::new(init)),
+            line: 0, anchor: SourceAnchor::synthetic(),
+        });
+    }
+    if is_module {
+        // Placeholder: finish_modenv points it at the final
+        // slot order, or removes it when no module-env name
+        // was ever slotted.
+        head.push(Stmt::PublishModEnv { cells: Vec::new(), line: 0, anchor: SourceAnchor::synthetic()});
+    }
+    head.extend(new_body);
+    Ok((head, ScopeOutcome { needed, cell_of, globals_used }))
+}
+
+/// D8: convert one function (a top-level def, a method, or
+/// a synthetic child). When the converted body needs names
+/// from an enclosing function scope, the def gains the
+/// hidden environment parameter in first position.
+fn convert_function(
+    conv: &mut Conv,
+    f: Func,
+    chain: &[std::collections::HashSet<String>],
+    module_bound: &std::collections::HashSet<String>,
+) -> Result<(Func, Vec<String>, std::collections::HashSet<String>), Diagnostic> {
+    let mut nf = f;
+    // Parameter defaults are evaluated in the ENCLOSING
+    // scope at def time; the converter does not rewrite
+    // them, so a lambda there would reach emission
+    // unconverted. Refuse it loudly instead.
+    for (_, d) in &nf.params {
+        if let Some(dx) = d {
+            let mut has_lambda = false;
+            walk_expr(dx, &mut |e| {
+                if matches!(e, Expr::Lambda { .. }) {
+                    has_lambda = true;
+                }
+            });
+            if has_lambda {
+                return Err(eerr(
+                    nf.line,
+                    "a lambda in a parameter default value is not supported yet (D8 v1 closures)",
+                ));
+            }
+        }
+    }
+    let params = nf.param_names();
+    let body = std::mem::take(&mut nf.body);
+    let no_force: std::collections::HashSet<String> = HashSet::new();
+    let (body, out) =
+        convert_scope(conv, &params, body, chain, module_bound, false, &no_force)?;
+    nf.body = body;
+    if !out.needed.is_empty() {
+        if nf.params.iter().any(|(n, _)| n == ENV_PARAM) {
+            return Err(eerr(
+                nf.line,
+                "a function that captures cannot have a parameter named `__psa_env` (reserved for the closure environment)",
+            ));
+        }
+        let mut ps = vec![(ENV_PARAM.to_string(), None)];
+        ps.extend(nf.params.iter().cloned());
+        nf.params = ps;
+    }
+    Ok((nf, out.needed, out.globals_used))
+}
+
+/// D8: after every scope is converted, point the module
+/// scope's PublishModEnv at the final module-environment
+/// slot order, creating cells (at the head of main) for
+/// slotted names the module scope never cellified — a
+/// `global` name no top-level statement binds. When no
+/// module-env name was ever slotted, the placeholder is
+/// removed instead.
+fn finish_modenv(
+    top: &mut Vec<Stmt>,
+    conv: &mut Conv,
+    module_cells: &HashMap<String, String>,
+) {
+    if conv.modenv_names.is_empty() {
+        top.retain(|s| !matches!(s, Stmt::PublishModEnv { .. }));
+        return;
+    }
+    let names = conv.modenv_names.clone();
+    let mut cells: Vec<String> = Vec::new();
+    let mut missing: Vec<Stmt> = Vec::new();
+    for n in &names {
+        match module_cells.get(n) {
+            Some(cv) => cells.push(cv.clone()),
+            None => {
+                let cv = conv.fresh("cell");
+                cells.push(cv.clone());
+                missing.push(Stmt::Assign {
+                    name: cv,
+                    value: Expr::CellNew(Box::new(Expr::NoneLit)),
+                    line: 0, anchor: SourceAnchor::synthetic(),
+                });
+            }
+        }
+    }
+    let mut new_top: Vec<Stmt> = missing;
+    new_top.append(top);
+    *top = new_top;
+    for s in top.iter_mut() {
+        if let Stmt::PublishModEnv { cells: c, .. } = s {
+            *c = cells.clone();
+            break;
+        }
+    }
+}
+
+/// D8: how one name resolves inside the scope being
+/// rewritten.
+#[derive(Clone)]
+enum Cl {
+    /// An ordinary local (or a name that stays free: a def,
+    /// a builtin, a comprehension variable).
+    Plain,
+    /// A cell variable of this scope.
+    Cell(String),
+    /// A slot of this scope's environment parameter.
+    Env(usize),
+    /// A slot of the module environment.
+    Global(usize),
+}
+
+/// D8 pass B: rewrite one scope's body against the
+/// classification computed in pass A. Reads of cell /
+/// environment / global names become CellGet; writes become
+/// CellSet; child-function sites (visited in the same
+/// traversal order as the pass-A scanner) become FnVal /
+/// ClosureVal bindings. Method calls on a cell-held value
+/// need the value in a plain temporary (MethodCall names
+/// its object), so the read is hoisted to just before the
+/// enclosing statement — except in positions where hoisting
+/// would change semantics (a while condition re-evaluates;
+/// match guards and pattern literals run under the match
+/// machinery), which refuse loudly instead.
+struct Rw<'a> {
+    conv: &'a mut Conv,
+    bound: &'a std::collections::HashSet<String>,
+    cell_of: &'a HashMap<String, String>,
+    dglobal: &'a std::collections::HashSet<String>,
+    dnonlocal: &'a std::collections::HashSet<String>,
+    chain: &'a [std::collections::HashSet<String>],
+    module_bound: &'a std::collections::HashSet<String>,
+    is_module: bool,
+    needed: Vec<String>,
+    globals_used: std::collections::HashSet<String>,
+    sites: &'a [ChildResult],
+    site_idx: usize,
+    shadow: Vec<std::collections::HashSet<String>>,
+    hoist_forbidden: bool,
+}
+
+impl<'a> Rw<'a> {
+    fn classify(&mut self, name: &str) -> Cl {
+        if self.shadow.iter().any(|f| f.contains(name)) {
+            return Cl::Plain;
+        }
+        if self.dnonlocal.contains(name) {
+            return Cl::Env(self.env_slot(name));
+        }
+        if self.dglobal.contains(name) {
+            self.globals_used.insert(name.to_string());
+            return Cl::Global(self.conv.modenv_slot(name));
+        }
+        if self.bound.contains(name) {
+            return match self.cell_of.get(name) {
+                Some(cv) => Cl::Cell(cv.clone()),
+                None => Cl::Plain,
+            };
+        }
+        if self.is_module && self.module_bound.contains(name) {
+            // A module name this scope never binds itself:
+            // it exists only because some function declared
+            // it `global`. It lives in the module
+            // environment (finish_modenv creates its cell).
+            self.globals_used.insert(name.to_string());
+            return Cl::Global(self.conv.modenv_slot(name));
+        }
+        match resolve_chain(self.chain, name) {
+            1 => Cl::Env(self.env_slot(name)),
+            2 => {
+                self.globals_used.insert(name.to_string());
+                Cl::Global(self.conv.modenv_slot(name))
+            }
+            _ => Cl::Plain,
+        }
+    }
+
+    fn env_slot(&mut self, name: &str) -> usize {
+        match self.needed.iter().position(|n| n == name) {
+            Some(i) => i,
+            None => {
+                self.needed.push(name.to_string());
+                self.needed.len() - 1
+            }
+        }
+    }
+
+    fn cell_expr(cl: &Cl) -> Expr {
+        match cl {
+            Cl::Cell(cv) => Expr::Name(cv.clone(), ExprSpan::synthetic()),
+            Cl::Env(i) => Expr::Index(
+                Box::new(Expr::Name(ENV_PARAM.to_string(), ExprSpan::synthetic())),
+                Box::new(Expr::Int(*i as i64)),
+            ExprSpan::synthetic()),
+            Cl::Global(i) => Expr::Index(
+                Box::new(Expr::ModEnv),
+                Box::new(Expr::Int(*i as i64)),
+            ExprSpan::synthetic()),
+            Cl::Plain => unreachable!("cell_expr of a plain name"),
+        }
+    }
+
+    /// P0d (sourcemap integration): the plain-name path keeps the
+    /// parsed span, so E1001 and other name-site diagnostics can
+    /// point at the name instead of the statement. Captured names
+    /// become CellGet, which carries no span (pre-existing D8
+    /// limitation: move checks on captured names are line-only
+    /// at best).
+    fn read_name(&mut self, name: &str, span: ExprSpan) -> Expr {
+        match self.classify(name) {
+            Cl::Plain => Expr::Name(name.to_string(), span),
+            cl => Expr::CellGet(Box::new(Self::cell_expr(&cl))),
+        }
+    }
+
+    fn bind_stmt(&mut self, name: &str, value: Expr, anchor: SourceAnchor) -> Stmt {
+        // The statement is a rewrite of a user statement, so it
+        // keeps that statement's anchor; `line` still mirrors
+        // `anchor.line` (see ast.rs).
+        let line = anchor.line;
+        match self.classify(name) {
+            Cl::Plain => Stmt::Assign { name: name.to_string(), value, line, anchor },
+            cl => Stmt::ExprStmt {
+                value: Expr::CellSet(Box::new(Self::cell_expr(&cl)), Box::new(value)),
+                line,
+                anchor,
+            },
+        }
+    }
+
+    /// The expression that builds a child site's function
+    /// value: a plain tag-7 FnVal when the child captures
+    /// nothing (the exact D3 shape), otherwise a tag-16
+    /// ClosureVal whose environment list holds this scope's
+    /// cell for each name the child needs, in the child's
+    /// capture order.
+    fn site_value(&mut self, cr: &ChildResult) -> Result<Expr, Diagnostic> {
+        if cr.needed.is_empty() {
+            return Ok(Expr::FnVal(cr.key.clone()));
+        }
+        let mut elems: Vec<Expr> = Vec::new();
+        for n in &cr.needed {
+            if let Some(cv) = self.cell_of.get(n) {
+                elems.push(Expr::Name(cv.clone(), ExprSpan::synthetic()));
+            } else if let Some(i) = self.needed.iter().position(|x| x == n) {
+                elems.push(Expr::Index(
+                    Box::new(Expr::Name(ENV_PARAM.to_string(), ExprSpan::synthetic())),
+                    Box::new(Expr::Int(i as i64)),
+                ExprSpan::synthetic()));
+            } else {
+                return Err(eerr(
+                    cr.line,
+                    "internal error: a nested function's capture resolves in no enclosing scope",
+                ));
+            }
+        }
+        Ok(Expr::ClosureVal(cr.key.clone(), Box::new(Expr::ListLit(elems))))
+    }
+
+    fn take_site(&mut self, is_def: bool, line: u32) -> Result<ChildResult, Diagnostic> {
+        let cr = self.sites.get(self.site_idx).ok_or_else(|| {
+            eerr(line, "internal error: closure conversion ran out of child sites")
+        })?;
+        if cr.is_def != is_def || cr.line != line {
+            return Err(eerr(
+                line,
+                "internal error: closure conversion site order mismatch (scanner/rewriter traversal diverged)",
+            ));
+        }
+        self.site_idx += 1;
+        Ok(ChildResult {
+            key: cr.key.clone(),
+            needed: cr.needed.clone(),
+            is_def: cr.is_def,
+            src_name: cr.src_name.clone(),
+            line: cr.line,
+        })
+    }
+
+    fn rewrite_stmts(&mut self, stmts: Vec<Stmt>) -> Result<Vec<Stmt>, Diagnostic> {
+        let mut out: Vec<Stmt> = Vec::new();
+        for s in stmts {
+            out.extend(self.rewrite_stmt(s)?);
+        }
+        Ok(out)
+    }
+
+    fn rewrite_stmt(&mut self, s: Stmt) -> Result<Vec<Stmt>, Diagnostic> {
+        let mut pre: Vec<Stmt> = Vec::new();
+        let mut main: Vec<Stmt> = Vec::new();
+        match s {
+            Stmt::Assign { name, value, line, anchor} => {
+                let v = self.rewrite_expr(value, &mut pre)?;
+                main.push(self.bind_stmt(&name, v, anchor));
+            }
+            Stmt::AugAssign { name, op, value, line, anchor} => {
+                let v = self.rewrite_expr(value, &mut pre)?;
+                match self.classify(&name) {
+                    Cl::Plain => main.push(Stmt::AugAssign { name, op, value: v, line, anchor}),
+                    cl => {
+                        let ce = Self::cell_expr(&cl);
+                        main.push(Stmt::ExprStmt {
+                            value: Expr::CellSet(
+                                Box::new(ce.clone()),
+                                Box::new(Expr::Bin(
+                                    Box::new(Expr::CellGet(Box::new(ce))),
+                                    op,
+                                    Box::new(v),
+                                )),
+                            ),
+                            line, anchor,
+                        });
+                    }
+                }
+            }
+            Stmt::IndexAssign { name, index, op, value, line, anchor} => {
+                let idx = self.rewrite_expr(index, &mut pre)?;
+                let v = self.rewrite_expr(value, &mut pre)?;
+                match self.classify(&name) {
+                    Cl::Plain => main.push(Stmt::IndexAssign { name, index: idx, op, value: v, line, anchor}),
+                    cl => {
+                        let tmp = self.conv.fresh("ix");
+                        pre.push(Stmt::Assign {
+                            name: tmp.clone(),
+                            value: Expr::CellGet(Box::new(Self::cell_expr(&cl))),
+                            line, anchor,
+                        });
+                        main.push(Stmt::IndexAssign { name: tmp, index: idx, op, value: v, line, anchor});
+                    }
+                }
+            }
+            Stmt::AttrAssign { base, name, op, value, line, anchor} => {
+                let b = self.rewrite_expr(base, &mut pre)?;
+                let v = self.rewrite_expr(value, &mut pre)?;
+                main.push(Stmt::AttrAssign { base: b, name, op, value: v, line, anchor});
+            }
+            Stmt::AttrDel { base, name, line, anchor} => {
+                let b = self.rewrite_expr(base, &mut pre)?;
+                main.push(Stmt::AttrDel { base: b, name, line, anchor});
+            }
+            Stmt::ExprStmt { value, line, anchor} => {
+                let v = self.rewrite_expr(value, &mut pre)?;
+                main.push(Stmt::ExprStmt { value: v, line, anchor});
+            }
+            Stmt::If { arms, els, line, anchor} => {
+                let mut new_arms: Vec<(Expr, Vec<Stmt>)> = Vec::new();
+                for (c, b) in arms {
+                    let c2 = self.rewrite_expr(c, &mut pre)?;
+                    new_arms.push((c2, self.rewrite_stmts(b)?));
+                }
+                let els = match els {
+                    Some(b) => Some(self.rewrite_stmts(b)?),
+                    None => None,
+                };
+                main.push(Stmt::If { arms: new_arms, els, line, anchor});
+            }
+            Stmt::While { cond, body, els, line, anchor} => {
+                let saved = self.hoist_forbidden;
+                self.hoist_forbidden = true;
+                let c = self.rewrite_expr(cond, &mut pre);
+                self.hoist_forbidden = saved;
+                let c = c?;
+                let b = self.rewrite_stmts(body)?;
+                let els = match els {
+                    Some(b) => Some(self.rewrite_stmts(b)?),
+                    None => None,
+                };
+                main.push(Stmt::While { cond: c, body: b, els, line, anchor});
+            }
+            Stmt::ForRange { var, start, stop, body, els, line, anchor} => {
+                let start = match start {
+                    Some(x) => Some(self.rewrite_expr(x, &mut pre)?),
+                    None => None,
+                };
+                let stop = self.rewrite_expr(stop, &mut pre)?;
+                let els = match els {
+                    Some(b) => Some(self.rewrite_stmts(b)?),
+                    None => None,
+                };
+                match self.classify(&var) {
+                    Cl::Plain => {
+                        let b = self.rewrite_stmts(body)?;
+                        main.push(Stmt::ForRange { var, start, stop, body: b, els, line, anchor});
+                    }
+                    cl => {
+                        let tmp = self.conv.fresh("fv");
+                        let mut b: Vec<Stmt> = vec![Stmt::ExprStmt {
+                            value: Expr::CellSet(
+                                Box::new(Self::cell_expr(&cl)),
+                                Box::new(Expr::Name(tmp.clone(), ExprSpan::synthetic())),
+                            ),
+                            line, anchor,
+                        }];
+                        b.extend(self.rewrite_stmts(body)?);
+                        main.push(Stmt::ForRange { var: tmp, start, stop, body: b, els, line, anchor});
+                    }
+                }
+            }
+            Stmt::ForEach { vars, iter, body, els, line, anchor} => {
+                let it = self.rewrite_expr(iter, &mut pre)?;
+                let mut new_vars: Vec<String> = Vec::new();
+                let mut binds: Vec<Stmt> = Vec::new();
+                for v in &vars {
+                    match self.classify(v) {
+                        Cl::Plain => new_vars.push(v.clone()),
+                        cl => {
+                            let tmp = self.conv.fresh("fv");
+                            new_vars.push(tmp.clone());
+                            binds.push(Stmt::ExprStmt {
+                                value: Expr::CellSet(
+                                    Box::new(Self::cell_expr(&cl)),
+                                    Box::new(Expr::Name(tmp, ExprSpan::synthetic())),
+                                ),
+                                line, anchor,
+                            });
+                        }
+                    }
+                }
+                let mut b = binds;
+                b.extend(self.rewrite_stmts(body)?);
+                let els = match els {
+                    Some(b) => Some(self.rewrite_stmts(b)?),
+                    None => None,
+                };
+                main.push(Stmt::ForEach { vars: new_vars, iter: it, body: b, els, line, anchor});
+            }
+            Stmt::Unpack { names, value, line, anchor} => {
+                let v = self.rewrite_expr(value, &mut pre)?;
+                let mut new_names: Vec<String> = Vec::new();
+                let mut binds: Vec<(String, Cl)> = Vec::new();
+                for n in &names {
+                    match self.classify(n) {
+                        Cl::Plain => new_names.push(n.clone()),
+                        cl => {
+                            let tmp = self.conv.fresh("up");
+                            new_names.push(tmp.clone());
+                            binds.push((tmp, cl));
+                        }
+                    }
+                }
+                main.push(Stmt::Unpack { names: new_names, value: v, line, anchor});
+                for (tmp, cl) in binds {
+                    main.push(Stmt::ExprStmt {
+                        value: Expr::CellSet(
+                            Box::new(Self::cell_expr(&cl)),
+                            Box::new(Expr::Name(tmp, ExprSpan::synthetic())),
+                        ),
+                        line, anchor,
+                    });
+                }
+            }
+            Stmt::MultiAssign { names, values, line, anchor} => {
+                let mut vs: Vec<Expr> = Vec::new();
+                for x in values {
+                    vs.push(self.rewrite_expr(x, &mut pre)?);
+                }
+                if names.iter().all(|n| matches!(self.classify(n), Cl::Plain)) {
+                    main.push(Stmt::MultiAssign { names, values: vs, line, anchor});
+                } else {
+                    // Evaluate every value into a temp first
+                    // (CPython evaluates the right-hand side
+                    // before any binding), then bind each
+                    // name from its temp. The chained form
+                    // (one value, many names) binds them all
+                    // from the single temp.
+                    let mut tmps: Vec<String> = Vec::new();
+                    for v in vs {
+                        let t = self.conv.fresh("ma");
+                        pre.push(Stmt::Assign { name: t.clone(), value: v, line, anchor});
+                        tmps.push(t);
+                    }
+                    if tmps.len() == 1 {
+                        for n in &names {
+                            let st = self.bind_stmt(n, Expr::Name(tmps[0].clone(), ExprSpan::synthetic()), anchor);
+                            main.push(st);
+                        }
+                    } else {
+                        for (n, t) in names.iter().zip(tmps.iter()) {
+                            let st = self.bind_stmt(n, Expr::Name(t.clone(), ExprSpan::synthetic()), anchor);
+                            main.push(st);
+                        }
+                    }
+                }
+            }
+            Stmt::Return { value, line, anchor} => {
+                let v = match value {
+                    Some(x) => Some(self.rewrite_expr(x, &mut pre)?),
+                    None => None,
+                };
+                main.push(Stmt::Return { value: v, line, anchor});
+            }
+            Stmt::Yield { value, line, anchor} => {
+                let v = match value {
+                    Some(x) => Some(self.rewrite_expr(x, &mut pre)?),
+                    None => None,
+                };
+                main.push(Stmt::Yield { value: v, line, anchor});
+            }
+            Stmt::Raise { value, line, anchor} => {
+                let v = match value {
+                    Some(x) => Some(self.rewrite_expr(x, &mut pre)?),
+                    None => None,
+                };
+                main.push(Stmt::Raise { value: v, line, anchor});
+            }
+            Stmt::Assert { cond, line, anchor, msg } => {
+                let c = self.rewrite_expr(cond, &mut pre)?;
+                main.push(Stmt::Assert { cond: c, line, anchor, msg });
+            }
+            Stmt::Del { targets, line, anchor} => {
+                let mut new_targets: Vec<(String, Option<Expr>)> = Vec::new();
+                for (n, idx) in targets {
+                    if !matches!(self.classify(&n), Cl::Plain) {
+                        return Err(eerr(
+                            line,
+                            &format!(
+                                "`del {}` on a captured, global or nonlocal variable is not supported yet (D8 v1 closures)",
+                                n
+                            ),
+                        ));
+                    }
+                    let idx = match idx {
+                        Some(x) => Some(self.rewrite_expr(x, &mut pre)?),
+                        None => None,
+                    };
+                    new_targets.push((n, idx));
+                }
+                main.push(Stmt::Del { targets: new_targets, line, anchor});
+            }
+            Stmt::Try { body, handlers, els, finally, line, anchor} => {
+                let b = self.rewrite_stmts(body)?;
+                let mut hs: Vec<ExcHandler> = Vec::new();
+                for h in handlers {
+                    let (bind, hb) = match h.bind {
+                        Some(n) => match self.classify(&n) {
+                            Cl::Plain => (Some(n), self.rewrite_stmts(h.body)?),
+                            cl => {
+                                let tmp = self.conv.fresh("ex");
+                                let mut nb: Vec<Stmt> = vec![Stmt::ExprStmt {
+                                    value: Expr::CellSet(
+                                        Box::new(Self::cell_expr(&cl)),
+                                        Box::new(Expr::Name(tmp.clone(), ExprSpan::synthetic())),
+                                    ),
+                                    line: h.line, anchor: SourceAnchor::at(h.line, 0, None),
+                                }];
+                                nb.extend(self.rewrite_stmts(h.body)?);
+                                (Some(tmp), nb)
+                            }
+                        },
+                        None => (None, self.rewrite_stmts(h.body)?),
+                    };
+                    hs.push(ExcHandler { classes: h.classes, bind, body: hb, line: h.line, anchor: h.anchor });
+                }
+                let els = match els {
+                    Some(b2) => Some(self.rewrite_stmts(b2)?),
+                    None => None,
+                };
+                let finally = match finally {
+                    Some(b2) => Some(self.rewrite_stmts(b2)?),
+                    None => None,
+                };
+                main.push(Stmt::Try { body: b, handlers: hs, els, finally, line, anchor});
+            }
+            Stmt::With { items, body, line, anchor} => {
+                let mut new_items: Vec<(Expr, Option<String>)> = Vec::new();
+                let mut binds: Vec<Stmt> = Vec::new();
+                for (e, bind) in items {
+                    let e2 = self.rewrite_expr(e, &mut pre)?;
+                    match bind {
+                        Some(n) => match self.classify(&n) {
+                            Cl::Plain => new_items.push((e2, Some(n))),
+                            cl => {
+                                let tmp = self.conv.fresh("wv");
+                                new_items.push((e2, Some(tmp.clone())));
+                                binds.push(Stmt::ExprStmt {
+                                    value: Expr::CellSet(
+                                        Box::new(Self::cell_expr(&cl)),
+                                        Box::new(Expr::Name(tmp, ExprSpan::synthetic())),
+                                    ),
+                                    line, anchor,
+                                });
+                            }
+                        },
+                        None => new_items.push((e2, None)),
+                    }
+                }
+                let mut b = binds;
+                b.extend(self.rewrite_stmts(body)?);
+                main.push(Stmt::With { items: new_items, body: b, line, anchor});
+            }
+            Stmt::Match { subject, cases, line, anchor} => {
+                let subj = self.rewrite_expr(subject, &mut pre)?;
+                let mut new_cases: Vec<MatchCase> = Vec::new();
+                for c in cases {
+                    let saved = self.hoist_forbidden;
+                    self.hoist_forbidden = true;
+                    let pat = self.rewrite_pattern(c.pattern, &mut pre);
+                    let guard = match c.guard {
+                        Some(g) => match self.rewrite_expr(g, &mut pre) {
+                            Ok(g2) => Some(g2),
+                            Err(e) => {
+                                self.hoist_forbidden = saved;
+                                return Err(e);
+                            }
+                        },
+                        None => None,
+                    };
+                    self.hoist_forbidden = saved;
+                    let pat = pat?;
+                    let b = self.rewrite_stmts(c.body)?;
+                    new_cases.push(MatchCase { pattern: pat, guard, body: b, line: c.line, anchor: c.anchor });
+                }
+                main.push(Stmt::Match { subject: subj, cases: new_cases, line, anchor});
+            }
+            Stmt::Def(f) => {
+                let cr = self.take_site(true, f.line)?;
+                if cr.src_name != f.name {
+                    return Err(eerr(
+                        f.line,
+                        "internal error: closure conversion def site name mismatch",
+                    ));
+                }
+                let v = self.site_value(&cr)?;
+                main.push(self.bind_stmt(&f.name, v, f.anchor));
+            }
+            Stmt::Global { .. } | Stmt::Nonlocal { .. } => {
+                // Consumed by the scope analysis; the
+                // declaration itself emits nothing.
+            }
+            Stmt::Break { line, anchor} => main.push(Stmt::Break { line, anchor}),
+            Stmt::Continue { line, anchor} => main.push(Stmt::Continue { line, anchor}),
+            Stmt::Pass { line, anchor} => main.push(Stmt::Pass { line, anchor}),
+            Stmt::PublishModEnv { .. } => {
+                return Err(eerr(
+                    0,
+                    "internal error: PublishModEnv reached the closure rewriter (it is produced after rewriting)",
+                ));
+            }
+        }
+        pre.extend(main);
+        Ok(pre)
+    }
+
+    fn rewrite_pattern(&mut self, p: Pattern, pre: &mut Vec<Stmt>) -> Result<Pattern, Diagnostic> {
+        Ok(match p {
+            Pattern::Lit(e) => Pattern::Lit(self.rewrite_expr(e, pre)?),
+            Pattern::Seq(pats) => {
+                let mut out: Vec<Pattern> = Vec::new();
+                for x in pats {
+                    out.push(self.rewrite_pattern(x, pre)?);
+                }
+                Pattern::Seq(out)
+            }
+            Pattern::Or(pats) => {
+                let mut out: Vec<Pattern> = Vec::new();
+                for x in pats {
+                    out.push(self.rewrite_pattern(x, pre)?);
+                }
+                Pattern::Or(out)
+            }
+            other => other,
+        })
+    }
+
+    /// Rewrite one f-string part: the field's value expression
+    /// and, recursively, the expressions inside its format
+    /// spec. Conversion, debug prefix and literal parts pass
+    /// through unchanged.
+    fn rewrite_fstr_part(
+        &mut self,
+        p: FStrPart,
+        pre: &mut Vec<Stmt>,
+    ) -> Result<FStrPart, Diagnostic> {
+        match p {
+            FStrPart::Lit(s) => Ok(FStrPart::Lit(s)),
+            FStrPart::Field { value, conv, debug, spec } => {
+                let spec = match spec {
+                    Some(parts) => {
+                        let mut out = Vec::new();
+                        for sp in parts {
+                            out.push(self.rewrite_fstr_part(sp, pre)?);
+                        }
+                        Some(out)
+                    }
+                    None => None,
+                };
+                Ok(FStrPart::Field {
+                    value: self.rewrite_expr(value, pre)?,
+                    conv,
+                    debug,
+                    spec,
+                })
+            }
+        }
+    }
+
+    fn rewrite_expr(&mut self, e: Expr, pre: &mut Vec<Stmt>) -> Result<Expr, Diagnostic> {
+        Ok(match e {
+            Expr::Name(n, span) => self.read_name(&n, span),
+            Expr::Bin(a, op, b) => Expr::Bin(
+                Box::new(self.rewrite_expr(*a, pre)?),
+                op,
+                Box::new(self.rewrite_expr(*b, pre)?),
+            ),
+            Expr::Unary(op, a) => Expr::Unary(op, Box::new(self.rewrite_expr(*a, pre)?)),
+            Expr::Call(f, args, kwargs, span) => {
+                let f2 = self.rewrite_expr(*f, pre)?;
+                let mut a2: Vec<Expr> = Vec::new();
+                for a in args {
+                    a2.push(self.rewrite_expr(a, pre)?);
+                }
+                let mut k2: Vec<(String, Expr)> = Vec::new();
+                for (k, v) in kwargs {
+                    k2.push((k, self.rewrite_expr(v, pre)?));
+                }
+                Expr::Call(Box::new(f2), a2, k2, span)
+            }
+            Expr::ListLit(es) => {
+                let mut out: Vec<Expr> = Vec::new();
+                for x in es {
+                    out.push(self.rewrite_expr(x, pre)?);
+                }
+                Expr::ListLit(out)
+            }
+            Expr::TupleLit(es) => {
+                let mut out: Vec<Expr> = Vec::new();
+                for x in es {
+                    out.push(self.rewrite_expr(x, pre)?);
+                }
+                Expr::TupleLit(out)
+            }
+            Expr::SetLit(es) => {
+                let mut out: Vec<Expr> = Vec::new();
+                for x in es {
+                    out.push(self.rewrite_expr(x, pre)?);
+                }
+                Expr::SetLit(out)
+            }
+            Expr::DictLit(pairs) => {
+                let mut out: Vec<(Expr, Expr)> = Vec::new();
+                for (k, v) in pairs {
+                    out.push((self.rewrite_expr(k, pre)?, self.rewrite_expr(v, pre)?));
+                }
+                Expr::DictLit(out)
+            }
+            Expr::Index(a, b, span) => Expr::Index(
+                Box::new(self.rewrite_expr(*a, pre)?),
+                Box::new(self.rewrite_expr(*b, pre)?),
+                span,
+            ),
+            Expr::Slice(a, lo, hi, st) => {
+                let a2 = self.rewrite_expr(*a, pre)?;
+                let mut parts: Vec<Option<Box<Expr>>> = Vec::new();
+                for o in [lo, hi, st] {
+                    parts.push(match o {
+                        Some(x) => Some(Box::new(self.rewrite_expr(*x, pre)?)),
+                        None => None,
+                    });
+                }
+                let mut it = parts.into_iter();
+                Expr::Slice(
+                    Box::new(a2),
+                    it.next().unwrap(),
+                    it.next().unwrap(),
+                    it.next().unwrap(),
+                )
+            }
+            Expr::MethodCall { obj, method, args } => {
+                // The object is classified (and, when it
+                // lives in a cell, read into a temp) BEFORE
+                // the arguments are rewritten: CPython
+                // evaluates the object before the arguments,
+                // and the hoisted read must observe the same
+                // binding.
+                let obj2 = match self.classify(&obj) {
+                    Cl::Plain => obj,
+                    cl => {
+                        if self.hoist_forbidden {
+                            return Err(eerr(
+                                0,
+                                &format!(
+                                    "method call on captured variable `{}` in a while condition, match guard or match pattern is not supported yet (D8 v1 closures); bind it to a plain local first",
+                                    obj
+                                ),
+                            ));
+                        }
+                        let tmp = self.conv.fresh("mc");
+                        pre.push(Stmt::Assign {
+                            name: tmp.clone(),
+                            value: Expr::CellGet(Box::new(Self::cell_expr(&cl))),
+                            line: 0, anchor: SourceAnchor::synthetic(),
+                        });
+                        tmp
+                    }
+                };
+                let mut a2: Vec<Expr> = Vec::new();
+                for a in args {
+                    a2.push(self.rewrite_expr(a, pre)?);
+                }
+                Expr::MethodCall { obj: obj2, method, args: a2 }
+            }
+            Expr::Attr(b, n, span) => Expr::Attr(Box::new(self.rewrite_expr(*b, pre)?), n, span),
+            Expr::Comp { kind, key, value, clauses } => {
+                let mut frame: std::collections::HashSet<String> = HashSet::new();
+                for c in &clauses {
+                    if let CompClause::For { var, .. } = c {
+                        frame.insert(var.clone());
+                    }
+                }
+                self.shadow.push(frame);
+                let r: Result<Expr, Diagnostic> = (|| {
+                    let k2 = self.rewrite_expr(*key, pre)?;
+                    let v2 = match value {
+                        Some(v) => Some(Box::new(self.rewrite_expr(*v, pre)?)),
+                        None => None,
+                    };
+                    let mut c2: Vec<CompClause> = Vec::new();
+                    for c in clauses {
+                        c2.push(match c {
+                            CompClause::For { var, iter } => {
+                                CompClause::For { var, iter: self.rewrite_expr(iter, pre)? }
+                            }
+                            CompClause::If(cond) => {
+                                CompClause::If(self.rewrite_expr(cond, pre)?)
+                            }
+                        });
+                    }
+                    Ok(Expr::Comp { kind, key: Box::new(k2), value: v2, clauses: c2 })
+                })();
+                self.shadow.pop();
+                r?
+            }
+            Expr::IfExp { cond, then, els } => Expr::IfExp {
+                cond: Box::new(self.rewrite_expr(*cond, pre)?),
+                then: Box::new(self.rewrite_expr(*then, pre)?),
+                els: Box::new(self.rewrite_expr(*els, pre)?),
+            },
+            Expr::FStr(parts) => {
+                let mut out: Vec<FStrPart> = Vec::new();
+                for p in parts {
+                    out.push(self.rewrite_fstr_part(p, pre)?);
+                }
+                Expr::FStr(out)
+            }
+            Expr::Await(a) => Expr::Await(Box::new(self.rewrite_expr(*a, pre)?)),
+            Expr::Lambda { line, .. } => {
+                let cr = self.take_site(false, line)?;
+                self.site_value(&cr)?
+            }
+            Expr::CellNew(a) => Expr::CellNew(Box::new(self.rewrite_expr(*a, pre)?)),
+            Expr::CellGet(a) => Expr::CellGet(Box::new(self.rewrite_expr(*a, pre)?)),
+            Expr::CellSet(a, b) => Expr::CellSet(
+                Box::new(self.rewrite_expr(*a, pre)?),
+                Box::new(self.rewrite_expr(*b, pre)?),
+            ),
+            Expr::ClosureVal(k, env) => {
+                Expr::ClosureVal(k, Box::new(self.rewrite_expr(*env, pre)?))
+            }
+            Expr::Walrus { name, value } => {
+                // The value rewrites first: its reads observe
+                // the binding state before the store, as in
+                // CPython. A plain target keeps the Walrus node
+                // (emission binds it through the plain
+                // assignment machinery). A cell / environment /
+                // global target must NOT stay a Walrus —
+                // emission would bind a plain local of that
+                // name and every closure would keep reading
+                // the stale cell — so the write becomes a
+                // CellSet, which evaluates to the stored value:
+                // exactly the walrus's yield. (A target shadowed
+                // by a comprehension frame classifies Plain and
+                // stays a Walrus; emit_comp refuses it if it
+                // names the iteration variable.)
+                let v = self.rewrite_expr(*value, pre)?;
+                match self.classify(&name) {
+                    Cl::Plain => Expr::Walrus { name, value: Box::new(v) },
+                    cl => Expr::CellSet(Box::new(Self::cell_expr(&cl)), Box::new(v)),
+                }
+            }
+            other => other,
+        })
+    }
+}
+
+/// D8: match-pattern capture names anywhere in a statement
+/// list (child scopes not entered), for the cell check in
+/// convert_scope.
+fn walk_stmts_match_captures(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Match { cases, .. } => {
+                for c in cases {
+                    for n in pattern_captures(&c.pattern) {
+                        out.insert(n);
+                    }
+                    walk_stmts_match_captures(&c.body, out);
+                }
+            }
+            Stmt::If { arms, els, .. } => {
+                for (_, b) in arms {
+                    walk_stmts_match_captures(b, out);
+                }
+                if let Some(b) = els {
+                    walk_stmts_match_captures(b, out);
+                }
+            }
+            Stmt::While { body, els, .. }
+            | Stmt::ForRange { body, els, .. }
+            | Stmt::ForEach { body, els, .. } => {
+                walk_stmts_match_captures(body, out);
+                if let Some(b) = els {
+                    walk_stmts_match_captures(b, out);
+                }
+            }
+            Stmt::With { body, .. } => walk_stmts_match_captures(body, out),
+            Stmt::Try { body, handlers, els, finally, .. } => {
+                walk_stmts_match_captures(body, out);
+                for h in handlers {
+                    walk_stmts_match_captures(&h.body, out);
+                }
+                if let Some(b) = els {
+                    walk_stmts_match_captures(b, out);
+                }
+                if let Some(b) = finally {
+                    walk_stmts_match_captures(b, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// D4 class registry: validate the class definitions, flatten
@@ -1546,7 +3876,7 @@ fn desugar_program(prog: &mut Program) -> Result<(), String> {
 /// which is exact for literals; computed attributes wait for
 /// the runtime-registry shape (mutable-global probe pending,
 /// see D4-NOTES).
-fn build_class_registry(em: &mut Emitter, prog: &Program) -> Result<(), String> {
+fn build_class_registry(em: &mut Emitter, prog: &Program) -> Result<(), Diagnostic> {
     for c in &prog.classes {
         if em.class_ids.contains_key(&c.name) {
             return Err(eerr(c.line, &format!("duplicate class definition `{}`", c.name)));
@@ -1582,7 +3912,7 @@ fn build_class_registry(em: &mut Emitter, prog: &Program) -> Result<(), String> 
             };
         for (an, ae) in &c.attrs {
             match ae {
-                Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::NoneLit => {}
+                Expr::Int(_) | Expr::BigInt(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::NoneLit => {}
                 _ => {
                     return Err(eerr(
                         c.line,
@@ -1659,9 +3989,12 @@ fn stmts_use_exc(stmts: &[Stmt]) -> bool {
             arms.iter().any(|(_, b)| stmts_use_exc(b))
                 || els.as_ref().map_or(false, |b| stmts_use_exc(b))
         }
-        Stmt::While { body, .. }
-        | Stmt::ForRange { body, .. }
-        | Stmt::ForEach { body, .. } => stmts_use_exc(body),
+        Stmt::While { body, els, .. }
+        | Stmt::ForRange { body, els, .. }
+        | Stmt::ForEach { body, els, .. } => {
+            stmts_use_exc(body)
+                || els.as_ref().map_or(false, |b| stmts_use_exc(b))
+        }
         _ => false,
     })
 }
@@ -1712,7 +4045,7 @@ impl Emitter {
     /// loud error. Functions with defaults or collection
     /// parameters cannot be values in v1 (an adapter could not
     /// bind them); direct calls to them are unaffected.
-    fn fn_val_code(&mut self, name: &str, line: u32) -> Result<(String, Ty), String> {
+    fn fn_val_code(&mut self, name: &str, line: u32) -> Result<(String, Ty), Diagnostic> {
         let def = match self.defs.get(name) {
             Some(d) => d.clone(),
             None => return Err(eerr(line, &format!("undefined function `{}`", name))),
@@ -1784,6 +4117,75 @@ impl Emitter {
         }
     }
 
+    /// D8 closures: the code for a closure value — a tag-16
+    /// PsaVal carrying the def's closure-callable id and the
+    /// environment (a dynamic list of cells). Mirrors
+    /// fn_val_code: the def is pinned to an all-Dyn signature
+    /// (the hidden environment parameter included) and
+    /// defaults / *args / **kwargs are refused loudly,
+    /// because the generated adapter binds positionally.
+    fn closure_val_code(
+        &mut self,
+        name: &str,
+        env_code: &str,
+        line: u32,
+    ) -> Result<(String, Ty), Diagnostic> {
+        let def = match self.defs.get(name) {
+            Some(d) => d.clone(),
+            None => return Err(eerr(line, &format!("undefined function `{}`", name))),
+        };
+        if def.vararg.is_some()
+            || def.kwarg.is_some()
+            || def.params.iter().any(|(_, d)| d.is_some())
+        {
+            return Err(eerr(
+                line,
+                &format!(
+                    "function `{}` has defaults or *args/**kwargs parameters and cannot be used as a closure value yet (D8 v1 closure slice)",
+                    name
+                ),
+            ));
+        }
+        let n = def.param_count();
+        self.ensure_fn(name, &vec![Ty::Dyn; n], line)?;
+        let sig = self.sigs.get(name).expect("ensure_fn registers a signature");
+        let ret_ok = matches!(
+            sig.ret,
+            Some(Ty::Dyn)
+                | Some(Ty::Int)
+                | Some(Ty::Float)
+                | Some(Ty::Bool)
+                | Some(Ty::Void)
+        );
+        if sig.params.iter().any(|t| *t != Ty::Dyn) || !ret_ok {
+            return Err(eerr(
+                line,
+                &format!(
+                    "function `{}` cannot be used as a closure value: closure functions are pinned to all-dynamic parameters, but it was already emitted with a different one",
+                    name
+                ),
+            ));
+        }
+        self.used_dyn = true;
+        self.used_closure = true;
+        let id = self.register_closure_callable(name);
+        Ok((format!("__psa_box_closure({}, {})", id, env_code), Ty::Dyn))
+    }
+
+    /// Assign (or fetch) the closure-callable id of a def
+    /// (a separate id space from the plain callables).
+    fn register_closure_callable(&mut self, name: &str) -> i64 {
+        match self.fn_cids.get(name) {
+            Some(i) => *i,
+            None => {
+                let i = self.closure_callables.len() as i64;
+                self.fn_cids.insert(name.to_string(), i);
+                self.closure_callables.push(name.to_string());
+                i
+            }
+        }
+    }
+
     /// D4: pin a method def as a callable and return its id.
     /// Like fn_val_code, the method is pinned to an all-Dyn
     /// signature and defaults/*args/**kwargs are refused (an
@@ -1792,7 +4194,7 @@ impl Emitter {
     /// the return may be Void or a static scalar -- the adapter
     /// normalises it to a dynamic value -- because methods are
     /// routinely written for effect (`__init__`, mutators).
-    fn method_callable_id(&mut self, key: &str, line: u32) -> Result<i64, String> {
+    fn method_callable_id(&mut self, key: &str, line: u32) -> Result<i64, Diagnostic> {
         let def = match self.defs.get(key) {
             Some(d) => d.clone(),
             None => return Err(eerr(line, &format!("undefined method `{}`", key))),
@@ -1846,7 +4248,7 @@ impl Emitter {
         ctx: &mut Ctx,
         args: &[Expr],
         line: u32,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<String>, Diagnostic> {
         let mut codes: Vec<String> = Vec::new();
         for a in args {
             codes.push(self.emit_dyn_value(ctx, a, line)?);
@@ -1864,7 +4266,7 @@ impl Emitter {
     /// terminates the generator. The producer is the def body
     /// itself, emitted with all-Dyn parameters and the channel
     /// in scope as `__psa_gench`.
-    fn emit_generator_def(&mut self, def: &Func) -> Result<(), String> {
+    fn emit_generator_def(&mut self, def: &Func) -> Result<(), Diagnostic> {
         let name = def.name.clone();
         gen_check_returns(&def.body, &name, def.line)?;
         let params = def.param_names();
@@ -1900,7 +4302,12 @@ impl Emitter {
         }
         w.push_str("));\n");
         w.push_str("    return __psa_gen_new(__psa_ch, __psa_h);\n}\n");
-        self.emitted.push(w);
+        // P1: the wrapper is one synthetic function chunk anchored
+        // to the generator def (precision Function).
+        self.emitted.push(EmittedChunk::span(
+            w,
+            &SegMeta::synthetic_fn(def.anchor, base.clone()),
+        ));
         self.emitted_set.push(name.clone());
         let mut d = String::new();
         d.push_str(&format!("fn {}(__psa_ch: Chan<i64>", drive_name));
@@ -1922,9 +4329,14 @@ impl Emitter {
         d.push_str("    let __psa_endw = __psa_gen_wrap_end();\n");
         d.push_str("    __psa_ch.send(__psa_endw.ipay);\n");
         d.push_str("    return __psa_r;\n}\n");
-        self.emitted.push(d);
-        let prod_txt = self.emit_gen_producer(def, &prod_name)?;
-        self.emitted.push(prod_txt);
+        // P1: the drive wrapper is one synthetic function chunk
+        // anchored to the generator def (precision Function).
+        self.emitted.push(EmittedChunk::span(
+            d,
+            &SegMeta::synthetic_fn(def.anchor, drive_name.clone()),
+        ));
+        let (prod_txt, prod_map) = self.emit_gen_producer(def, &prod_name)?;
+        self.emitted.push(EmittedChunk { text: prod_txt, map: prod_map });
         Ok(())
     }
 
@@ -1932,19 +4344,20 @@ impl Emitter {
     /// Parameters are dynamic values; `yield` statements send
     /// their wrap on `__psa_gench` (Ctx::gen_chan). Returns may
     /// only be bare / None (checked by gen_check_returns).
-    fn emit_gen_producer(&mut self, def: &Func, prod_sla: &str) -> Result<String, String> {
-        let param_vars: Vec<(String, Ty, Option<u32>)> = def
+    fn emit_gen_producer(&mut self, def: &Func, prod_sla: &str) -> Result<(String, SourceMap), Diagnostic> {
+        let param_vars: Vec<(String, Ty, Option<SourceAnchor>)> = def
             .param_names()
             .into_iter()
             .map(|n| (n, Ty::Dyn, None))
             .collect();
         let mut ctx = Ctx {
             vars: param_vars,
+            sources: self.sources.clone(),
             scopes: vec![0],
             ret: None,
             fname: def.name.clone(),
-            out: String::new(),
-            prologue: String::new(),
+            out: SegmentWriter::new(),
+            prologue: SegmentWriter::new(),
             indent: 1,
             tmp: 0,
             borrowed: Vec::new(),
@@ -1958,30 +4371,46 @@ impl Emitter {
             in_finally: 0,
             exc_bare: None,
             gen_chan: Some("__psa_gench".to_string()),
+            anchor: SourceAnchor::synthetic(),
+            anchor_kind: SegKind::Stmt,
+            anchor_precision: Precision::None,
+            anchor_name: None,
+            anchor_origin: Origin::Synthetic,
+            pending_call: false,
+            pending_call_name: None,
         };
         for s in &def.body {
             self.emit_stmt(&mut ctx, s)?;
         }
-        let mut txt = String::new();
-        txt.push_str(&format!("fn {}(__psa_gench: Chan<i64>", prod_sla));
-        for p in def.param_names() {
-            txt.push_str(&format!(", {}: PsaVal", p));
-        }
-        txt.push_str(") -> PsaVal {\n");
-        txt.push_str(&ctx.prologue);
-        txt.push_str(&ctx.out);
+        // P1 source map: same shape as `ensure_fn` — the producer is
+        // the user generator def's body under its `__prod` name.
         let last_is_return = ctx
             .out
+            .text
             .lines()
             .rev()
             .find(|l| !l.trim().is_empty())
             .map(|l| l.trim_start().starts_with("return "))
             .unwrap_or(false);
-        if !last_is_return {
-            txt.push_str(&format!("    return {};\n", Ty::Dyn.default_lit()));
+        let mut head = format!("fn {}(__psa_gench: Chan<i64>", prod_sla);
+        for p in def.param_names() {
+            head.push_str(&format!(", {}: PsaVal", p));
         }
-        txt.push_str("}\n");
-        Ok(txt)
+        head.push_str(") -> PsaVal {");
+        let def_anchor = def.anchor;
+        let mut txt = SegmentWriter::new();
+        txt.push_line(&head, &SegMeta::fn_header(def_anchor, prod_sla.to_string()));
+        txt.append_writer(std::mem::take(&mut ctx.prologue));
+        txt.append_writer(std::mem::take(&mut ctx.out));
+        if !last_is_return {
+            txt.push_line(
+                &format!("    return {};", Ty::Dyn.default_lit()),
+                &SegMeta::synthetic_stmt(def_anchor),
+            );
+        }
+        txt.push_line("}", &SegMeta::fn_header(def_anchor, prod_sla.to_string()));
+        let (text, segments, panics) = txt.into_parts();
+        Ok((text, SourceMap::from_segments(segments, panics)))
     }
 
     /// D7: install an async def's callable face. The body is
@@ -1992,7 +4421,7 @@ impl Emitter {
     /// async def never runs the body; `await` does
     /// (__psa_coro_run). Defaults and *args/**kwargs are
     /// refused: the callable adapter cannot bind them.
-    fn emit_async_def(&mut self, def: &Func) -> Result<(), String> {
+    fn emit_async_def(&mut self, def: &Func) -> Result<(), Diagnostic> {
         let name = def.name.clone();
         if def.vararg.is_some()
             || def.kwarg.is_some()
@@ -2041,7 +4470,12 @@ impl Emitter {
             w.push_str(&format!("    __psa_list_push(__psa_args, {});\n", p));
         }
         w.push_str(&format!("    return __psa_coro_new({}, __psa_args);\n}}\n", id));
-        self.emitted.push(w);
+        // P1: the async wrapper is one synthetic function chunk
+        // anchored to the async def (precision Function).
+        self.emitted.push(EmittedChunk::span(
+            w,
+            &SegMeta::synthetic_fn(def.anchor, self.sla_name(&name)),
+        ));
         self.emitted_set.push(name.clone());
         Ok(())
     }
@@ -2063,7 +4497,7 @@ impl Emitter {
         subject: &Expr,
         cases: &[MatchCase],
         line: u32,
-    ) -> Result<(), String> {
+    ) -> Result<(), Diagnostic> {
         self.used_dyn = true;
         ctx.tmp += 1;
         let mid = ctx.tmp;
@@ -2123,6 +4557,26 @@ impl Emitter {
             ctx.indent -= 1;
             ctx.line("};");
             if let Some(guard) = &case.guard {
+                // A walrus in the guard binds through the
+                // synthetic-Assign machinery, which declares a
+                // fresh `let` at the emission point — inside
+                // the `if ok` block below, where SLA block
+                // scoping makes it invisible to the case body
+                // (w09's UndefinedVariable, the same trap the
+                // pattern captures above already avoid).
+                // Hoist each unbound guard walrus target into
+                // the function prologue as a dynamic variable
+                // so the binding takes the store path and the
+                // body can read it.
+                {
+                    let mut targets: Vec<String> = Vec::new();
+                    collect_walrus_targets(guard, &mut targets);
+                    for t in &targets {
+                        if ctx.lookup(t).is_none() {
+                            ctx.hoist_declare(t, Ty::Dyn);
+                        }
+                    }
+                }
                 ctx.line(&format!("if {} {{", ok));
                 ctx.indent += 1;
                 let (gc, gt) = self.emit_expr(ctx, guard, case.line)?;
@@ -2154,7 +4608,7 @@ impl Emitter {
         ok: &str,
         binds: &[(String, String)],
         line: u32,
-    ) -> Result<(), String> {
+    ) -> Result<(), Diagnostic> {
         match pat {
             Pattern::Lit(e) => {
                 let lc = self.emit_dyn_value(ctx, e, line)?;
@@ -2171,6 +4625,8 @@ impl Emitter {
                     .map(|(_, t)| t.clone())
                     .ok_or_else(|| eerr(line, "internal: match capture temp missing"))?;
                 self.emit_dyn_store(ctx, &temp, subj)
+                    .map_err(|m| eerr(line, &m))?;
+                Ok(())
             }
             Pattern::Wildcard => Ok(()),
             Pattern::Seq(pats) => {
@@ -2248,7 +4704,8 @@ impl Emitter {
                             .ok_or_else(|| {
                                 eerr(line, "internal: match alt capture temp missing")
                             })?;
-                        self.emit_dyn_store(ctx, &target, atemp)?;
+                        self.emit_dyn_store(ctx, &target, atemp)
+                            .map_err(|m| eerr(line, &m))?;
                     }
                     ctx.line(&format!("{} = true;", any));
                     ctx.indent -= 1;
@@ -2276,7 +4733,7 @@ impl Emitter {
         args: &[Expr],
         kwargs: &[(String, Expr)],
         line: u32,
-    ) -> Result<(String, Ty), String> {
+    ) -> Result<(String, Ty), Diagnostic> {
         if !kwargs.is_empty() {
             return Err(eerr(
                 line,
@@ -2383,10 +4840,10 @@ impl Emitter {
 
     /// D5 conversion / constructor / reflection builtins in
     /// call position: int, float, str, bool, list, tuple, set,
-    /// type, isinstance. Returns None when `fname` is none of
-    /// them; the caller has already established that no user
-    /// def or variable shadows the name (a shadowed builtin is
-    /// an ordinary call, as in Python).
+    /// bytes, type, isinstance. Returns None when `fname` is
+    /// none of them; the caller has already established that
+    /// no user def or variable shadows the name (a shadowed
+    /// builtin is an ordinary call, as in Python).
     fn emit_builtin_call(
         &mut self,
         ctx: &mut Ctx,
@@ -2394,10 +4851,10 @@ impl Emitter {
         args: &[Expr],
         kwargs: &[(String, Expr)],
         line: u32,
-    ) -> Result<Option<(String, Ty)>, String> {
+    ) -> Result<Option<(String, Ty)>, Diagnostic> {
         if !matches!(
             fname,
-            "int" | "float" | "str" | "bool" | "list" | "tuple" | "set" | "type" | "isinstance"
+            "int" | "float" | "str" | "bool" | "list" | "tuple" | "set" | "bytes" | "type" | "isinstance"
                 | "open"
                 | "next"
                 | "repr"
@@ -2512,13 +4969,26 @@ impl Emitter {
                 if let Expr::Str(s) = &args[0] {
                     return match s.trim().parse::<i64>() {
                         Ok(v) => Ok(Some((v.to_string(), Ty::Int))),
-                        Err(_) => Err(eerr(
-                            line,
-                            &format!(
-                                "int() cannot parse the literal {:?} (CPython raises ValueError)",
-                                s
-                            ),
-                        )),
+                        Err(_) => {
+                            // A valid integer literal past i64
+                            // promotes to a dynamic bigint instead of
+                            // failing (CPython parses it fine);
+                            // anything else keeps the loud refusal.
+                            let t = s.trim().replace('_', "");
+                            let digits = t.strip_prefix(['+', '-']).unwrap_or(&t);
+                            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                                self.used_dyn = true;
+                                let tmp = self.emit_str_temp(ctx, &t, line)?;
+                                return Ok(Some((format!("__psa_big_from_psastr({})", tmp), Ty::Dyn)));
+                            }
+                            Err(eerr(
+                                line,
+                                &format!(
+                                    "int() cannot parse the literal {:?} (CPython raises ValueError)",
+                                    s
+                                ),
+                            ))
+                        }
                     };
                 }
                 let (c, t) = self.emit_expr(ctx, &args[0], line)?;
@@ -2533,8 +5003,13 @@ impl Emitter {
                     }
                     Ty::Float => Ok(Some((format!("({} as i64)", c), Ty::Int))),
                     Ty::Dyn => {
+                        // int() of a dynamic value stays dynamic: a
+                        // tag-17 bigint passes through untouched and
+                        // an overflowing numeric string promotes
+                        // instead of wrapping (__psa_dyn_int lives in
+                        // BIG_RUNTIME).
                         self.used_dyn = true;
-                        Ok(Some((format!("__psa_to_int({})", c), Ty::Int)))
+                        Ok(Some((format!("__psa_dyn_int({})", c), Ty::Dyn)))
                     }
                     _ => Err(eerr(
                         line,
@@ -2621,6 +5096,47 @@ impl Emitter {
                     )),
                 }
             }
+            "bytes" => {
+                // The bytes() constructor, minimal forms:
+                // bytes() is the empty bytes value, and
+                // bytes(x) of a dynamic value hands a bytes
+                // value back unchanged (CPython returns the
+                // same object for an exact bytes argument,
+                // and psa bytes are immutable, so the alias
+                // is exact). Every other form -- an int
+                // count, an iterable of ints, a str with an
+                // encoding -- is a registered gap (bytes
+                // constructor forms) and refuses loudly
+                // rather than guessing a conversion.
+                if args.len() > 1 {
+                    return Err(eerr(
+                        line,
+                        "bytes() with an encoding argument is not supported in v1 (registered gap: bytes constructor forms)",
+                    ));
+                }
+                if args.is_empty() {
+                    let t = self.emit_bytes_temp(ctx, &[], line)?;
+                    return Ok(Some((t, Ty::Dyn)));
+                }
+                if let Expr::Bytes(bs) = &args[0] {
+                    let t = self.emit_bytes_temp(ctx, bs, line)?;
+                    return Ok(Some((t, Ty::Dyn)));
+                }
+                let (c, t) = self.emit_expr(ctx, &args[0], line)?;
+                match t {
+                    Ty::Dyn => {
+                        self.used_dyn = true;
+                        Ok(Some((format!("__psa_bytes_convert({})", c), Ty::Dyn)))
+                    }
+                    _ => Err(eerr(
+                        line,
+                        &format!(
+                            "bytes() of a {} value is not supported in v1 (registered gap: bytes constructor forms)",
+                            t.py_name()
+                        ),
+                    )),
+                }
+            }
             "bool" => {
                 if args.len() > 1 {
                     return Err(eerr(line, "bool() takes at most one argument"));
@@ -2670,11 +5186,11 @@ impl Emitter {
                 }
                 // range(...) materialises through a synthetic
                 // list comprehension, then converts.
-                if let Expr::Call(callee, _, _) = &args[0] {
-                    if matches!(&**callee, Expr::Name(n) if n == "range") {
+                if let Expr::Call(callee, _, _, _) = &args[0] {
+                    if matches!(&**callee, Expr::Name(n, _) if n == "range") {
                         let comp = Expr::Comp {
                             kind: CompKind::List,
-                            key: Box::new(Expr::Name("__psa_rx".to_string())),
+                            key: Box::new(Expr::Name("__psa_rx".to_string(), ExprSpan::synthetic())),
                             value: None,
                             clauses: vec![CompClause::For {
                                 var: "__psa_rx".to_string(),
@@ -2739,7 +5255,7 @@ impl Emitter {
         code: &str,
         t: &Expr,
         line: u32,
-    ) -> Result<String, String> {
+    ) -> Result<String, Diagnostic> {
         match t {
             Expr::TupleLit(elems) => {
                 if elems.is_empty() {
@@ -2751,7 +5267,7 @@ impl Emitter {
                 }
                 Ok(parts.join(" || "))
             }
-            Expr::Name(n) => {
+            Expr::Name(n, _) => {
                 if let Some(&cid) = self.class_ids.get(n) {
                     let target = cid as i64;
                     let mut parts = Vec::new();
@@ -2773,6 +5289,7 @@ impl Emitter {
                     "set" => Some(7),
                     "object" => Some(8),
                     "NoneType" => Some(9),
+                    "bytes" => Some(10),
                     _ => None,
                 };
                 match bcode {
@@ -2806,7 +5323,7 @@ impl Emitter {
         method: &str,
         args: &[Expr],
         line: u32,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<String>, Diagnostic> {
         const BUILTIN_METHODS: &[&str] = &[
             "append", "extend", "insert", "pop", "remove", "clear", "copy", "index", "count",
             "reverse", "sort", "get", "keys", "values", "items", "setdefault", "update", "upper",
@@ -2839,7 +5356,7 @@ impl Emitter {
         tmp
     }
 
-    fn ensure_fn(&mut self, name: &str, arg_tys: &[Ty], line: u32) -> Result<Sig, String> {
+    fn ensure_fn(&mut self, name: &str, arg_tys: &[Ty], line: u32) -> Result<Sig, Diagnostic> {
         if let Some(sig) = self.sigs.get(name) {
             let compatible = sig.params.len() == arg_tys.len()
                 && sig
@@ -2905,7 +5422,7 @@ impl Emitter {
             Sig { params: arg_tys.to_vec(), param_borrow: borrows.clone(), ret: Some(Ty::Int) },
         );
         self.in_progress.push(name.to_string());
-        let param_vars: Vec<(String, Ty, Option<u32>)> = def
+        let param_vars: Vec<(String, Ty, Option<SourceAnchor>)> = def
             .param_names()
             .into_iter()
             .zip(arg_tys.iter().cloned())
@@ -2927,11 +5444,12 @@ impl Emitter {
         let prescan_ret = {
             let mut sctx = Ctx {
                 vars: param_vars.clone(),
+                sources: self.sources.clone(),
                 scopes: vec![0],
                 ret: None,
                 fname: name.to_string(),
-                out: String::new(),
-                prologue: String::new(),
+                out: SegmentWriter::new(),
+                prologue: SegmentWriter::new(),
                 indent: 1,
                 tmp: 0,
                 borrowed: borrowed_params.clone(),
@@ -2945,12 +5463,19 @@ impl Emitter {
                 in_finally: 0,
                 exc_bare: None,
                 gen_chan: None,
+                anchor: SourceAnchor::synthetic(),
+                anchor_kind: SegKind::Stmt,
+                anchor_precision: Precision::None,
+                anchor_name: None,
+                anchor_origin: Origin::Synthetic,
+                pending_call: false,
+                pending_call_name: None,
             };
             let r = (|| {
                 for s in &def.body {
                     self.emit_stmt(&mut sctx, s)?;
                 }
-                Ok::<(), String>(())
+                Ok::<(), Diagnostic>(())
             })();
             match r {
                 Ok(()) => sctx.ret,
@@ -2962,11 +5487,12 @@ impl Emitter {
         }
         let mut ctx = Ctx {
             vars: param_vars,
+            sources: self.sources.clone(),
             scopes: vec![0],
             ret: None,
             fname: name.to_string(),
-            out: String::new(),
-            prologue: String::new(),
+            out: SegmentWriter::new(),
+            prologue: SegmentWriter::new(),
             indent: 1,
             tmp: 0,
             borrowed: borrowed_params,
@@ -2980,12 +5506,19 @@ impl Emitter {
             in_finally: 0,
             exc_bare: None,
             gen_chan: None,
+            anchor: SourceAnchor::synthetic(),
+            anchor_kind: SegKind::Stmt,
+            anchor_precision: Precision::None,
+            anchor_name: None,
+            anchor_origin: Origin::Synthetic,
+            pending_call: false,
+            pending_call_name: None,
         };
         let body_res = (|| {
             for s in &def.body {
                 self.emit_stmt(&mut ctx, s)?;
             }
-            Ok::<(), String>(())
+            Ok::<(), Diagnostic>(())
         })();
         self.in_progress.pop();
         if let Err(e) = body_res {
@@ -3016,21 +5549,15 @@ impl Emitter {
         // Append a default return so all paths return (Python falls off
         // the end returning None; for value-typed functions the earlier
         // return-type unification already rejected mixed use).
-        let mut txt = String::new();
-        txt.push_str(&format!("fn {}(", self.sla_name(name)));
-        for (i, (p, t)) in def.param_names().iter().zip(arg_tys.iter()).enumerate() {
-            if i > 0 {
-                txt.push_str(", ");
-            }
-            if t.is_list() && borrows.get(i).copied().unwrap_or(false) {
-                txt.push_str(&format!("{}: &{}", p, t.sla()));
-            } else {
-                txt.push_str(&format!("{}: {}", p, t.sla()));
-            }
-        }
-        txt.push_str(&format!(") -> {} {{\n", ret_ty.sla()));
-        txt.push_str(&ctx.prologue);
-        txt.push_str(&ctx.out);
+        // P1 source map: the function's text is a segment writer.
+        // The header is built as a plain string first (byte-identical
+        // to the old construction), then recorded as the function's
+        // `FnHeader` segment; prologue and body follow as recorded
+        // by `Ctx::line` / `prologue_push`, rebased behind the
+        // header; the psa-added default return is a `Synthetic`
+        // statement anchored to the def; the closer re-states the
+        // header's anchor. The `last_is_return` check reads the
+        // body writer's text, as before (computed before the takes).
         // Default fallthrough return, appended only when the body's
         // last top-level statement is not already a return. A second,
         // dead return after a live one is accepted by the SLA checker
@@ -3040,18 +5567,43 @@ impl Emitter {
         // dyn1 on the text route, 2026-11-25).
         let last_is_return = ctx
             .out
+            .text
             .lines()
             .rev()
             .find(|l| !l.trim().is_empty())
             .map(|l| l.starts_with("    return "))
             .unwrap_or(false);
-        if !last_is_return {
-            txt.push_str(&format!("    return {};\n", ret_ty.default_lit()));
+        let mut head = format!("fn {}(", self.sla_name(name));
+        for (i, (p, t)) in def.param_names().iter().zip(arg_tys.iter()).enumerate() {
+            if i > 0 {
+                head.push_str(", ");
+            }
+            if t.is_list() && borrows.get(i).copied().unwrap_or(false) {
+                head.push_str(&format!("{}: &{}", p, t.sla()));
+            } else {
+                head.push_str(&format!("{}: {}", p, t.sla()));
+            }
         }
-        txt.push_str("}\n");
+        head.push_str(&format!(") -> {} {{", ret_ty.sla()));
+        let def_anchor = def.anchor;
+        let mut txt = SegmentWriter::new();
+        txt.push_line(&head, &SegMeta::fn_header(def_anchor, self.sla_name(name)));
+        txt.append_writer(std::mem::take(&mut ctx.prologue));
+        txt.append_writer(std::mem::take(&mut ctx.out));
+        if !last_is_return {
+            txt.push_line(
+                &format!("    return {};", ret_ty.default_lit()),
+                &SegMeta::synthetic_stmt(def_anchor),
+            );
+        }
+        txt.push_line("}", &SegMeta::fn_header(def_anchor, self.sla_name(name)));
         if !self.emitted_set.contains(&name.to_string()) {
             self.emitted_set.push(name.to_string());
-            self.emitted.push(txt);
+            let (text, segments, panics) = txt.into_parts();
+            self.emitted.push(EmittedChunk {
+                text,
+                map: SourceMap::from_segments(segments, panics),
+            });
         }
         Ok(self.sigs.get(name).unwrap().clone())
     }
@@ -3060,7 +5612,7 @@ impl Emitter {
     /// (boxing at a static/dynamic boundary). Dynamic values pass
     /// through unchanged; kinds that cannot be dynamic in D1 fail
     /// loudly with the phase that will carry them.
-    fn box_code(&mut self, code: String, ty: Ty, line: u32) -> Result<String, String> {
+    fn box_code(&mut self, code: String, ty: Ty, line: u32) -> Result<String, Diagnostic> {
         match ty {
             Ty::Dyn => Ok(code),
             Ty::Int => {
@@ -3091,13 +5643,30 @@ impl Emitter {
     /// literal, byte by byte, in a fresh temp. Dynamic strings are
     /// how psa binds Python str values: there is no static Str
     /// variable on the text route.
-    fn emit_str_temp(&mut self, ctx: &mut Ctx, s: &str, line: u32) -> Result<String, String> {
+    fn emit_str_temp(&mut self, ctx: &mut Ctx, s: &str, line: u32) -> Result<String, Diagnostic> {
         self.used_dyn = true;
         ctx.tmp += 1;
         let tmp = format!("__psa_str_{}", ctx.tmp);
         ctx.declare(&tmp, Ty::Dyn).map_err(|m| eerr(line, &m))?;
         ctx.line(&format!("let {} = __psa_str_new();", tmp));
         for b in s.bytes() {
+            ctx.line(&format!("{} = __psa_str_push({}, {});", tmp, tmp, b));
+        }
+        Ok(tmp)
+    }
+
+    /// A bytes literal as a dynamic value in a temp (tag 15):
+    /// the same Box<Vec<u8>> payload as a dynamic string (tag
+    /// 6), built byte-by-byte through the shared push helper,
+    /// which rebuilds the payload and preserves the value's
+    /// tag.
+    fn emit_bytes_temp(&mut self, ctx: &mut Ctx, bs: &[u8], line: u32) -> Result<String, Diagnostic> {
+        self.used_dyn = true;
+        ctx.tmp += 1;
+        let tmp = format!("__psa_bytes_{}", ctx.tmp);
+        ctx.declare(&tmp, Ty::Dyn).map_err(|m| eerr(line, &m))?;
+        ctx.line(&format!("let {} = __psa_bytes_new();", tmp));
+        for b in bs {
             ctx.line(&format!("{} = __psa_str_push({}, {});", tmp, tmp, b));
         }
         Ok(tmp)
@@ -3110,7 +5679,7 @@ impl Emitter {
         ctx: &mut Ctx,
         b: &Option<Box<Expr>>,
         line: u32,
-    ) -> Result<String, String> {
+    ) -> Result<String, Diagnostic> {
         match b {
             None => Ok(Ty::Dyn.default_lit().to_string()),
             Some(e) => {
@@ -3127,7 +5696,7 @@ impl Emitter {
     /// Construct a container literal as a dynamic value in a temp,
     /// for nesting inside another container, a subscript store or
     /// an append.
-    fn emit_container_temp(&mut self, ctx: &mut Ctx, e: &Expr, line: u32) -> Result<String, String> {
+    fn emit_container_temp(&mut self, ctx: &mut Ctx, e: &Expr, line: u32) -> Result<String, Diagnostic> {
         match e {
             Expr::ListLit(elems) => {
                 let codes = self.emit_list_literal_dyn(ctx, elems, line)?;
@@ -3159,7 +5728,7 @@ impl Emitter {
         ctx: &mut Ctx,
         e: &Expr,
         line: u32,
-    ) -> Result<String, String> {
+    ) -> Result<String, Diagnostic> {
         let (c, t) = if let Expr::Str(s) = e {
             (self.emit_str_temp(ctx, s, line)?, Ty::Dyn)
         } else if matches!(
@@ -3188,7 +5757,7 @@ impl Emitter {
         ctx: &mut Ctx,
         elems: &[Expr],
         line: u32,
-    ) -> Result<String, String> {
+    ) -> Result<String, Diagnostic> {
         self.used_dyn = true;
         let mut codes = Vec::new();
         for e in elems {
@@ -3209,7 +5778,7 @@ impl Emitter {
         ctx: &mut Ctx,
         elems: &[Expr],
         line: u32,
-    ) -> Result<String, String> {
+    ) -> Result<String, Diagnostic> {
         self.used_dyn = true;
         let mut codes = Vec::new();
         for e in elems {
@@ -3230,9 +5799,14 @@ impl Emitter {
     /// iterable eagerly) and whose body is the clause nest with
     /// the element expression yielded at the centre. Element
     /// and condition expressions may only reference the clause
-    /// variables, defs, classes and builtins: anything else
-    /// would need a closure capture, which psa does not support
-    /// (the loud refusal stands for those). Iterable
+    /// variables, defs, classes and builtins — plus, since
+    /// D8, variables of the enclosing scope: the closure
+    /// conversion pass has already rewritten those references
+    /// (a cell read, or an environment slot read), and the
+    /// cell / environment variable itself is passed into the
+    /// synthetic def as an extra parameter under its own
+    /// name, so the rewritten body resolves unchanged.
+    /// Anything else stays a loud refusal. Iterable
     /// expressions themselves are evaluated in the enclosing
     /// scope, so they are not subject to the check.
     fn emit_genexp(
@@ -3242,12 +5816,54 @@ impl Emitter {
         value: &Option<Box<Expr>>,
         clauses: &[CompClause],
         line: u32,
-    ) -> Result<String, String> {
+    ) -> Result<String, Diagnostic> {
         if value.is_some() {
             return Err(eerr(
                 line,
                 "a parenthesised comprehension yields single values; there is no dict generator expression (D7)",
             ));
+        }
+        // A walrus in the element or an `if` condition would
+        // be cloned into the synthetic generator def built
+        // below and bind THERE; CPython binds it in the
+        // containing scope, at consumption time. Refuse
+        // loudly rather than bind in the wrong scope (a list
+        // comprehension binds eagerly in scope; an explicit
+        // loop always works). A walrus rebinding one of the
+        // generator's own iteration variables is a CPython
+        // SyntaxError wherever it appears, iterables included.
+        if expr_contains_walrus(key)
+            || expr_contains_cellset(key)
+            || clauses.iter().any(|c| {
+                matches!(c, CompClause::If(cond) if expr_contains_walrus(cond) || expr_contains_cellset(cond))
+            })
+        {
+            return Err(eerr(
+                line,
+                "an assignment expression inside a generator expression's element or condition is not supported in v1 (it would bind inside the generator, not in the enclosing scope); use a list comprehension or an explicit loop",
+            ));
+        }
+        {
+            let mut targets: Vec<String> = Vec::new();
+            for c in clauses {
+                if let CompClause::For { iter, .. } = c {
+                    collect_walrus_targets(iter, &mut targets);
+                }
+            }
+            for t in &targets {
+                if clauses
+                    .iter()
+                    .any(|c| matches!(c, CompClause::For { var, .. } if var == t))
+                {
+                    return Err(eerr(
+                        line,
+                        &format!(
+                            "assignment expression cannot rebind comprehension iteration variable `{}` (CPython raises SyntaxError); rename the walrus target",
+                            t
+                        ),
+                    ));
+                }
+            }
         }
         let mut fors: Vec<(&str, &Expr)> = Vec::new();
         for c in clauses {
@@ -3267,12 +5883,24 @@ impl Emitter {
                 collect_names(cond, &mut names);
             }
         }
+        // D8: a name that resolves to a variable of the
+        // enclosing scope at this point (a cell variable or
+        // the environment parameter, after closure
+        // conversion) is passed into the synthetic def as an
+        // extra parameter under its own name.
+        let mut extra: Vec<String> = Vec::new();
         for n in &names {
             if clause_vars.contains(n)
                 || self.defs.contains_key(n)
                 || self.class_ids.contains_key(n)
                 || LAMBDA_BUILTINS.contains(&n.as_str())
             {
+                continue;
+            }
+            if ctx.lookup(n).is_some() {
+                if !extra.contains(n) {
+                    extra.push(n.clone());
+                }
                 continue;
             }
             return Err(eerr(
@@ -3288,7 +5916,7 @@ impl Emitter {
         let total_fors = fors.len();
         let mut body: Vec<Stmt> = vec![Stmt::Yield {
             value: Some(key.clone()),
-            line,
+            line, anchor: SourceAnchor::at(line, 0, None),
         }];
         let mut fors_from_end = 0usize;
         for c in clauses.iter().rev() {
@@ -3297,7 +5925,7 @@ impl Emitter {
                     body = vec![Stmt::If {
                         arms: vec![(cond.clone(), body)],
                         els: None,
-                        line,
+                        line, anchor: SourceAnchor::at(line, 0, None),
                     }];
                 }
                 CompClause::For { var, .. } => {
@@ -3305,23 +5933,28 @@ impl Emitter {
                     fors_from_end += 1;
                     body = vec![Stmt::ForEach {
                         vars: vec![var.to_string()],
-                        iter: Expr::Name(format!("__psa_gx_{}", pi)),
+                        iter: Expr::Name(format!("__psa_gx_{}", pi), ExprSpan::synthetic()),
                         body,
-                        line,
+                        els: None,
+                        line, anchor: SourceAnchor::at(line, 0, None),
                     }];
                 }
             }
         }
+        let mut gparams: Vec<(String, Option<Expr>)> = (0..total_fors)
+            .map(|i| (format!("__psa_gx_{}", i), None))
+            .collect();
+        for n in &extra {
+            gparams.push((n.clone(), None));
+        }
         let gfunc = Func {
             name: gname.clone(),
-            params: (0..total_fors)
-                .map(|i| (format!("__psa_gx_{}", i), None))
-                .collect(),
+            params: gparams,
             vararg: None,
             kwarg: None,
             is_async: false,
             body,
-            line,
+            line, anchor: SourceAnchor::at(line, 0, None),
         };
         self.defs.insert(gname.clone(), gfunc.clone());
         self.emit_generator_def(&gfunc)?;
@@ -3338,7 +5971,7 @@ impl Emitter {
                     // paths cover the static face.
                     let comp = Expr::Comp {
                         kind: CompKind::List,
-                        key: Box::new(Expr::Name("__psa_gxe".to_string())),
+                        key: Box::new(Expr::Name("__psa_gxe".to_string(), ExprSpan::synthetic())),
                         value: None,
                         clauses: vec![CompClause::For {
                             var: "__psa_gxe".to_string(),
@@ -3349,6 +5982,13 @@ impl Emitter {
                 }
             }
         }
+        // D8: the extra parameters are the enclosing scope's
+        // own variables (cells / the environment), passed by
+        // name; emit_dyn_value boxes a statically-typed one
+        // if it ever occurs.
+        for n in &extra {
+            codes.push(self.emit_dyn_value(ctx, &Expr::Name(n.clone(), ExprSpan::synthetic()), line)?);
+        }
         Ok(format!("{}({})", self.sla_name(&gname), codes.join(", ")))
     }
 
@@ -3356,13 +5996,62 @@ impl Emitter {
     /// container is built by the clause nest emitted as
     /// statements. Loop variables live in a pushed scope
     /// (CPython 3 comprehension scoping: they do not leak).
-    fn emit_comp(&mut self, ctx: &mut Ctx, e: &Expr, line: u32) -> Result<String, String> {
+    fn emit_comp(&mut self, ctx: &mut Ctx, e: &Expr, line: u32) -> Result<String, Diagnostic> {
         let (kind, key, value, clauses) = match e {
             Expr::Comp { kind, key, value, clauses } => (*kind, key, value, clauses),
             _ => unreachable!(),
         };
         if kind == CompKind::GenExp {
             return self.emit_genexp(ctx, key, value, clauses, line);
+        }
+        // Walrus targets inside a comprehension bind in the
+        // CONTAINING scope in CPython, but the clause nest
+        // below is emitted under a pushed scope mark that
+        // truncates every declaration made inside it — a
+        // statically-typed first binding would be forgotten
+        // at the end of the comprehension (and its SLA `let`
+        // is trapped inside the loop text). Materialise each
+        // not-yet-bound target as a dynamic variable BEFORE
+        // the mark: hoist_declare puts it in the function
+        // prologue, and the assignment machinery then boxes
+        // static values into it like any dynamic binding.
+        // Targets the enclosing scope already holds are left
+        // alone — the assignment rebinds that variable, which
+        // is exactly CPython's rule. A target naming one of
+        // the comprehension's own iteration variables is a
+        // CPython SyntaxError, refused here where the key and
+        // the clauses are both in view.
+        {
+            let mut targets: Vec<String> = Vec::new();
+            collect_walrus_targets(key, &mut targets);
+            if let Some(v) = value.as_deref() {
+                collect_walrus_targets(v, &mut targets);
+            }
+            for c in clauses {
+                match c {
+                    CompClause::For { iter, .. } => collect_walrus_targets(iter, &mut targets),
+                    CompClause::If(cond) => collect_walrus_targets(cond, &mut targets),
+                }
+            }
+            for t in &targets {
+                if clauses
+                    .iter()
+                    .any(|c| matches!(c, CompClause::For { var, .. } if var == t))
+                {
+                    return Err(eerr(
+                        line,
+                        &format!(
+                            "assignment expression cannot rebind comprehension iteration variable `{}` (CPython raises SyntaxError); rename the walrus target",
+                            t
+                        ),
+                    ));
+                }
+            }
+            for t in &targets {
+                if ctx.lookup(t).is_none() {
+                    ctx.hoist_declare(t, Ty::Dyn);
+                }
+            }
         }
         self.used_dyn = true;
         ctx.tmp += 1;
@@ -3391,7 +6080,7 @@ impl Emitter {
         key: &Expr,
         value: Option<&Expr>,
         line: u32,
-    ) -> Result<(), String> {
+    ) -> Result<(), Diagnostic> {
         if i == clauses.len() {
             match kind {
                 CompKind::List => {
@@ -3440,13 +6129,13 @@ impl Emitter {
         key: &Expr,
         value: Option<&Expr>,
         line: u32,
-    ) -> Result<(), String> {
+    ) -> Result<(), Diagnostic> {
         ctx.tmp += 1;
         let n = ctx.tmp;
         let idx = format!("__psa_ci_{}", n);
         // range(...) iterates numerically.
-        if let Expr::Call(callee, args, kwargs) = iter {
-            if let Expr::Name(f) = &**callee {
+        if let Expr::Call(callee, args, kwargs, _) = iter {
+            if let Expr::Name(f, _) = &**callee {
                 if f == "range" && kwargs.is_empty() {
                     if args.len() > 2 {
                         return Err(eerr(
@@ -3482,10 +6171,10 @@ impl Emitter {
             }
         }
         // A static list variable iterates by index.
-        if let Expr::Name(name) = iter {
+        if let Expr::Name(name, span) = iter {
             if let Some(t) = ctx.lookup(name) {
                 if let Some(elem) = t.elem() {
-                    ctx.check_alive(name, line)?;
+                    ctx.check_alive(name, line, Some(span.start))?;
                     ctx.declare(var, elem).map_err(|m| eerr(line, &m))?;
                     ctx.line(&format!("let {}: i64 = 0;", idx));
                     ctx.line(&format!("while {} < (len({}) as i64) {{", idx, name));
@@ -3540,7 +6229,7 @@ impl Emitter {
         ctx: &mut Ctx,
         e: &Expr,
         line: u32,
-    ) -> Result<String, String> {
+    ) -> Result<String, Diagnostic> {
         let (code, ty) = self.emit_expr(ctx, e, line)?;
         match ty {
             Ty::Int => Ok(code),
@@ -3558,7 +6247,7 @@ impl Emitter {
         ctx: &mut Ctx,
         elems: &[Expr],
         line: u32,
-    ) -> Result<(Vec<String>, Vec<Ty>), String> {
+    ) -> Result<(Vec<String>, Vec<Ty>), Diagnostic> {
         let mut codes = Vec::new();
         let mut tys = Vec::new();
         for e in elems {
@@ -3586,7 +6275,7 @@ impl Emitter {
         ctx: &mut Ctx,
         elems: &[Expr],
         line: u32,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<String>, Diagnostic> {
         let (codes, tys) = self.list_elem_codes(ctx, elems, line)?;
         if tys.iter().any(|t| !matches!(t, Ty::Int | Ty::Float | Ty::Bool | Ty::Dyn)) {
             return Err(eerr(
@@ -3608,7 +6297,7 @@ impl Emitter {
     /// Extract a static value from a dynamic one at a boundary; the
     /// runtime checks the tag and panics TypeError-style on mismatch
     /// (design s3: unboxing carries a runtime type assertion).
-    fn unbox_code(&mut self, code: String, want: Ty, line: u32) -> Result<String, String> {
+    fn unbox_code(&mut self, code: String, want: Ty, line: u32) -> Result<String, Diagnostic> {
         self.used_dyn = true;
         match want {
             Ty::Int => Ok(format!("__psa_unbox_int({})", code)),
@@ -3692,7 +6381,7 @@ impl Emitter {
         name: &str,
         code: &str,
         line: u32,
-    ) -> Result<(), String> {
+    ) -> Result<(), Diagnostic> {
         ctx.clear_deleted(name);
         match ctx.lookup(name) {
             None => {
@@ -3728,7 +6417,7 @@ impl Emitter {
     /// A condition position: bools pass through, dynamic values go
     /// through the runtime truthiness check, anything else keeps the
     /// caller's historical error message.
-    fn cond_code(&mut self, code: String, ty: Ty, line: u32, what: &str) -> Result<String, String> {
+    fn cond_code(&mut self, code: String, ty: Ty, line: u32, what: &str) -> Result<String, Diagnostic> {
         match ty {
             Ty::Bool => Ok(code),
             Ty::Dyn => {
@@ -3750,7 +6439,7 @@ impl Emitter {
         ctx: &mut Ctx,
         elems: &[Expr],
         line: u32,
-    ) -> Result<ListLit, String> {
+    ) -> Result<ListLit, Diagnostic> {
         let (codes, tys) = self.list_elem_codes(ctx, elems, line)?;
         let dyn_list = tys.is_empty()
             || tys.iter().any(|t| *t == Ty::Dyn || *t == Ty::Float)
@@ -3832,7 +6521,7 @@ impl Emitter {
         name: &str,
         elems: &[Expr],
         line: u32,
-    ) -> Result<(), String> {
+    ) -> Result<(), Diagnostic> {
         match self.emit_list_literal(ctx, elems, line)? {
             ListLit::Dyn(codes) => match ctx.lookup(name) {
                 None => {
@@ -3845,7 +6534,7 @@ impl Emitter {
                     let tmp = format!("__psa_ltmp_{}", ctx.tmp);
                     ctx.declare(&tmp, Ty::Dyn).map_err(|m| eerr(line, &m))?;
                     self.emit_dyn_list_construct(ctx, &tmp, &codes, true);
-                    self.emit_dyn_store(ctx, name, &tmp)?;
+                    self.emit_dyn_store(ctx, name, &tmp).map_err(|m| eerr(line, &m))?;
                     ctx.revive(name);
                     Ok(())
                 }
@@ -3895,7 +6584,7 @@ impl Emitter {
         ctx: &mut Ctx,
         pairs: &[(Expr, Expr)],
         line: u32,
-    ) -> Result<Vec<(String, String)>, String> {
+    ) -> Result<Vec<(String, String)>, Diagnostic> {
         self.used_dyn = true;
         let mut out = Vec::new();
         for (ke, ve) in pairs {
@@ -3957,7 +6646,7 @@ impl Emitter {
         name: &str,
         pairs: &[(Expr, Expr)],
         line: u32,
-    ) -> Result<(), String> {
+    ) -> Result<(), Diagnostic> {
         let codes = self.emit_dict_literal(ctx, pairs, line)?;
         match ctx.lookup(name) {
             None => {
@@ -3970,7 +6659,7 @@ impl Emitter {
                 let tmp = format!("__psa_ltmp_{}", ctx.tmp);
                 ctx.declare(&tmp, Ty::Dyn).map_err(|m| eerr(line, &m))?;
                 self.emit_dyn_dict_construct(ctx, &tmp, &codes, true);
-                self.emit_dyn_store(ctx, name, &tmp)?;
+                self.emit_dyn_store(ctx, name, &tmp).map_err(|m| eerr(line, &m))?;
                 ctx.revive(name);
                 Ok(())
             }
@@ -3995,7 +6684,7 @@ impl Emitter {
         ctx: &mut Ctx,
         e: &Expr,
         line: u32,
-    ) -> Result<(String, Ty), String> {
+    ) -> Result<(String, Ty), Diagnostic> {
         match e {
             Expr::ListLit(elems) => match self.emit_list_literal(ctx, elems, line)? {
                 ListLit::Static(list_ty, codes) => {
@@ -4026,7 +6715,7 @@ impl Emitter {
                 Ok((tmp, Ty::Dyn))
             }
             _ => {
-                if let Expr::Name(n) = e {
+                if let Expr::Name(n, _) = e {
                     if ctx.borrowed.contains(n) {
                         return Err(eerr(
                             line,
@@ -4061,7 +6750,7 @@ impl Emitter {
         ctx: &mut Ctx,
         value: &Option<Expr>,
         line: u32,
-    ) -> Result<(), String> {
+    ) -> Result<(), Diagnostic> {
         let (code, slot_ty): (Option<String>, Ty) = match value {
             None => {
                 if ctx.fname != "main" {
@@ -4117,7 +6806,7 @@ impl Emitter {
             (frame.slot_name.clone(), frame.ret_flag.clone(), need_decl)
         };
         if need_decl {
-            ctx.prologue.push_str(&format!(
+            ctx.prologue_push(&format!(
                 "    let {}: {} = {};\n",
                 slot_name,
                 slot_ty.sla(),
@@ -4196,7 +6885,7 @@ impl Emitter {
             ret_ty: None,
         };
         for f in [&frame.brk_flag, &frame.cont_flag, &frame.ret_flag] {
-            ctx.prologue.push_str(&format!("    let {}: bool = false;\n", f));
+            ctx.prologue_push(&format!("    let {}: bool = false;\n", f));
         }
         ctx.try_stack.push(frame);
     }
@@ -4207,6 +6896,16 @@ impl Emitter {
     /// its flag and break the frame's guard wrapper instead
     /// (the epilogue re-emits the real break after the finally).
     fn emit_break_through(&mut self, ctx: &mut Ctx) {
+        // Loop-else: a break always targets the innermost
+        // enclosing loop; when that loop has an else clause,
+        // record that it fired. This also runs on the try
+        // epilogue's re-emission of a deferred break (the flag
+        // assignment is idempotent, and the epilogue still sits
+        // inside the target loop's emission region).
+        if let Some(Some(flag)) = self.loop_else_stack.last() {
+            let flag = flag.clone();
+            ctx.line(&format!("{} = true;", flag));
+        }
         let target = match ctx.try_stack.last_mut() {
             Some(f) if ctx.loop_depth <= f.loop_depth => {
                 f.brk_used = true;
@@ -4241,6 +6940,62 @@ impl Emitter {
         }
     }
 
+    /// Loop-else: open the emission of a loop that may carry an
+    /// `else:` clause. When a clause exists, declare its
+    /// break-flag variable at the current position (a plain
+    /// `let`, like the other loop temps) and return its name;
+    /// the loop's entry is pushed on the loop-else stack either
+    /// way, and the caller pops it right after the loop body,
+    /// before the else clause itself is emitted (a break inside
+    /// the else clause targets the NEXT loop out, as in
+    /// CPython).
+    fn loop_else_begin(
+        &mut self,
+        ctx: &mut Ctx,
+        els: &Option<Vec<Stmt>>,
+    ) -> Option<String> {
+        let flag = if els.is_some() {
+            ctx.tmp += 1;
+            let f = format!("__psa_broke_{}", ctx.tmp);
+            ctx.line(&format!("let {}: bool = false;", f));
+            Some(f)
+        } else {
+            None
+        };
+        self.loop_else_stack.push(flag.clone());
+        flag
+    }
+
+    /// Loop-else: emit a loop's else clause after its body. The
+    /// clause runs only on a clean, break-free exit: the break
+    /// flag is clear, no exception is pending, and no control
+    /// flag is set on the try frame enclosing the loop (the
+    /// same condition shape as try's own else clause; all
+    /// operands are side-effect-free, so SLA's eager `&&` is
+    /// safe here).
+    fn emit_loop_else_body(
+        &mut self,
+        ctx: &mut Ctx,
+        els: &[Stmt],
+        flag: &str,
+    ) -> Result<(), Diagnostic> {
+        let mut cond = format!("!{}", flag);
+        if self.program_exc {
+            cond = format!("__psa_exc_tag() == 3 && {}", cond);
+            if let Some(f) = ctx.try_stack.last() {
+                let (rf, bf, cf) =
+                    (f.ret_flag.clone(), f.brk_flag.clone(), f.cont_flag.clone());
+                cond = format!("{} && !{} && !{} && !{}", cond, rf, bf, cf);
+            }
+        }
+        ctx.line(&format!("if {} {{", cond));
+        ctx.indent += 1;
+        let r = self.emit_block(ctx, els);
+        ctx.indent -= 1;
+        ctx.line("};");
+        r
+    }
+
     /// D6: the epilogue of a try frame (the frame has already
     /// been popped; any finally text has already been emitted).
     /// Deferred control flow propagates into the next frame or
@@ -4251,7 +7006,7 @@ impl Emitter {
         ctx: &mut Ctx,
         frame: TryFrame,
         line: u32,
-    ) -> Result<(), String> {
+    ) -> Result<(), Diagnostic> {
         if frame.ret_used {
             ctx.line(&format!("if {} {{", frame.ret_flag));
             ctx.indent += 1;
@@ -4293,7 +7048,7 @@ impl Emitter {
                 };
                 if need_decl {
                     let ty = frame.ret_ty.expect("a value return carries a slot type");
-                    ctx.prologue.push_str(&format!(
+                    ctx.prologue_push(&format!(
                         "    let {}: {} = {};\n",
                         oslot,
                         ty.sla(),
@@ -4342,7 +7097,7 @@ impl Emitter {
     /// exception: the instance's class is the handler class or
     /// one of its descendants. Handler classes must derive from
     /// Exception (checked here, loudly).
-    fn handler_cond(&mut self, h: &ExcHandler) -> Result<String, String> {
+    fn handler_cond(&mut self, h: &ExcHandler) -> Result<String, Diagnostic> {
         if h.classes.is_empty() {
             return Ok("true".to_string());
         }
@@ -4383,11 +7138,11 @@ impl Emitter {
         let mut cur = e;
         loop {
             match cur {
-                Expr::Attr(base, name) => {
+                Expr::Attr(base, name, _) => {
                     segs.push(name.clone());
                     cur = base;
                 }
-                Expr::Name(n) => {
+                Expr::Name(n, _) => {
                     segs.push(n.clone());
                     segs.reverse();
                     return Some(segs);
@@ -4438,11 +7193,18 @@ impl Emitter {
         ctx: &mut Ctx,
         e: &Expr,
         line: u32,
-    ) -> Option<Result<(String, Ty), String>> {
+    ) -> Option<Result<(String, Ty), Diagnostic>> {
         match e {
             Expr::Int(v) => {
                 self.used_dyn = true;
                 Some(Ok((format!("__psa_box_int({})", v), Ty::Dyn)))
+            }
+            Expr::BigInt(d) => {
+                self.used_dyn = true;
+                Some(
+                    self.emit_str_temp(ctx, d, line)
+                        .map(|t| (format!("__psa_big_from_psastr({})", t), Ty::Dyn)),
+                )
             }
             Expr::Float(v) => {
                 self.used_dyn = true;
@@ -4453,6 +7215,7 @@ impl Emitter {
                 Some(Ok((format!("__psa_box_bool({})", b), Ty::Dyn)))
             }
             Expr::Str(s) => Some(self.emit_str_temp(ctx, s, line).map(|t| (t, Ty::Dyn))),
+            Expr::Bytes(bs) => Some(self.emit_bytes_temp(ctx, bs, line).map(|t| (t, Ty::Dyn))),
             Expr::NoneLit => {
                 self.used_dyn = true;
                 Some(Ok((Ty::Dyn.default_lit().to_string(), Ty::Dyn)))
@@ -4461,7 +7224,7 @@ impl Emitter {
         }
     }
 
-    fn emit_block(&mut self, ctx: &mut Ctx, stmts: &[Stmt]) -> Result<(), String> {
+    fn emit_block(&mut self, ctx: &mut Ctx, stmts: &[Stmt]) -> Result<(), Diagnostic> {
         ctx.scopes.push(ctx.vars.len());
         for s in stmts {
             self.emit_stmt(ctx, s)?;
@@ -4481,7 +7244,16 @@ impl Emitter {
     /// Returns and plain control exits skip the guard: a return
     /// inside a finally discards a pending exception (CPython),
     /// and a break/continue is itself the exit.
-    fn emit_stmt(&mut self, ctx: &mut Ctx, stmt: &Stmt) -> Result<(), String> {
+    fn emit_stmt(&mut self, ctx: &mut Ctx, stmt: &Stmt) -> Result<(), Diagnostic> {
+        // P1 source map: anchor every line this statement emits to
+        // the statement's psa position (kind Stmt; Exact when the
+        // post-rewrite anchor carries a column, else LineOnly).
+        // Restored on exit so a nested statement cannot leak its
+        // anchor into the enclosing statement's trailing lines.
+        let saved = ctx.save_anchor();
+        let stmt_a = stmt_anchor(stmt);
+        let stmt_p = if stmt_a.col >= 1 { Precision::Exact } else { Precision::LineOnly };
+        ctx.set_anchor(stmt_a, SegKind::Stmt, stmt_p, None);
         let r = self.emit_stmt_inner(ctx, stmt);
         if r.is_ok() && ctx.guard_depth > 0 {
             match stmt {
@@ -4524,11 +7296,49 @@ impl Emitter {
                 }
             }
         }
+        // P1: a call noted while evaluating this statement must not
+        // leak into a later statement's lines: the consuming line
+        // was written inside this statement (or there was no such
+        // line, e.g. a temp-materialised call — the marker is then
+        // dropped rather than misattributed).
+        ctx.clear_pending_call();
+        ctx.restore_anchor(saved);
         r
     }
 
-    fn emit_stmt_inner(&mut self, ctx: &mut Ctx, stmt: &Stmt) -> Result<(), String> {
+    fn emit_stmt_inner(&mut self, ctx: &mut Ctx, stmt: &Stmt) -> Result<(), Diagnostic> {
         match stmt {
+            // D8: nested defs and global/nonlocal declarations
+            // are consumed by the closure-conversion pass and
+            // must never reach emission; reaching one is an
+            // internal error, reported loudly.
+            Stmt::Def(f) => Err(eerr(
+                f.line,
+                &format!(
+                    "internal error: nested def `{}` reached emission without closure conversion",
+                    f.name
+                ),
+            )),
+            Stmt::Global { line, .. } | Stmt::Nonlocal { line, .. } => Err(eerr(
+                *line,
+                "internal error: a global/nonlocal declaration reached emission without closure conversion",
+            )),
+            // D8: publish the module environment at the head
+            // of main: collect the module scope's cell
+            // variables (already created by the preceding
+            // assignments) into a fresh dynamic list and store
+            // its pointer in the sa_std globals cell.
+            Stmt::PublishModEnv { cells, .. } => {
+                self.used_dyn = true;
+                self.used_closure = true;
+                ctx.line("let __psa_me = __psa_list_new();");
+                for c in cells {
+                    ctx.check_alive(c, 0, Some(SourceAnchor::synthetic()))?;
+                    ctx.line(&format!("__psa_list_push(__psa_me, {});", c));
+                }
+                ctx.line("__psa_modenv_set(__psa_me);");
+                Ok(())
+            }
             Stmt::Pass { .. } => Ok(()),
             Stmt::Break { .. } => {
                 self.emit_break_through(ctx);
@@ -4538,7 +7348,7 @@ impl Emitter {
                 self.emit_continue_through(ctx);
                 Ok(())
             }
-            Stmt::Return { value, line } => {
+            Stmt::Return { value, line, anchor: _} => {
                 // D6: a return crossing a try frame is deferred
                 // through the frame's flag/slot machinery, so
                 // every enclosing finally runs before the return
@@ -4576,7 +7386,7 @@ impl Emitter {
                 }
                 Ok(())
             }
-            Stmt::Assign { name, value, line } => {
+            Stmt::Assign { name, value, line, anchor: _} => {
                 ctx.clear_deleted(name);
                 // List literals are constructed statement-wise.
                 if let Expr::ListLit(elems) = value {
@@ -4615,10 +7425,10 @@ impl Emitter {
                 }
                 // Container assignment moves the source binding (spec s3).
                 let src_name = match value {
-                    Expr::Name(n) if ty.is_list() => Some(n.clone()),
+                    Expr::Name(n, span) if ty.is_list() => Some((n.clone(), span.start)),
                     _ => None,
                 };
-                if let Some(src) = &src_name {
+                if let Some((src, _)) = &src_name {
                     if ctx.borrowed.contains(src) {
                         return Err(eerr(
                             *line,
@@ -4655,7 +7465,7 @@ impl Emitter {
                         } else {
                             ctx.declare(name, ty)
                                 .map_err(|m| eerr(*line, &m))?;
-                            if matches!(value, Expr::Name(_))
+                            if matches!(value, Expr::Name(_, _))
                                 && matches!(ty, Ty::Int | Ty::Float | Ty::Bool)
                             {
                                 // A fresh `let q = p;` MOVES p on the
@@ -4714,14 +7524,14 @@ impl Emitter {
                         }
                     }
                 }
-                if let Some(src) = src_name {
+                if let Some((src, src_anchor)) = src_name {
                     if src != *name {
-                        ctx.mark_moved(&src, *line);
+                        ctx.mark_moved(&src, src_anchor);
                     }
                 }
                 Ok(())
             }
-            Stmt::Assert { cond, line } => {
+            Stmt::Assert { cond, line, anchor: _, msg } => {
                 let (code, ty) = self.emit_expr(ctx, cond, *line)?;
                 let code = match ty {
                     Ty::Bool => code,
@@ -4733,10 +7543,35 @@ impl Emitter {
                         ))
                     }
                 };
-                ctx.line(&format!("if !({}) {{ panic(77040); }};", code));
+                match msg {
+                    // The label reaches the failure site at last
+                    // (census section 0.6): written to stderr just
+                    // before the panic, the argparse 77161/77162
+                    // precedent. Assert without a message emits
+                    // exactly what it always did.
+                    Some(label) => {
+                        // eprintln does NOT exist at the SLA layer
+                        // (probe 2026-11-26 on the box: `Undefined
+                        // call: eprintln` at check time). Write the
+                        // label to stderr inline via sa_io_stderr +
+                        // sa_io_write_all (argparse 77161/77162
+                        // precedent); sa_std/io.sai arrives through
+                        // the generated import block's
+                        // sla_std/wrap/io.sla, so no extra import.
+                        // The trailing newline is baked into the
+                        // literal — eprintln would have added one.
+                        let text = format!("AssertionError: {}\n", label);
+                        let esc = escape_sla_str(&text);
+                        ctx.line(&format!(
+                            "if !({}) {{ let __psa_assert_h = sa_io_stderr(); let __psa_assert_rc: i32 = sa_io_write_all(__psa_assert_h, STR_PTR(\"{}\"), STR_LEN(\"{}\")); panic(77040); }};",
+                            code, esc, esc
+                        ));
+                    }
+                    None => ctx.line(&format!("if !({}) {{ panic(77040); }};", code)),
+                }
                 Ok(())
             }
-            Stmt::Del { targets, line } => {
+            Stmt::Del { targets, line, anchor } => {
                 for (name, index) in targets {
                     if let Some(idx) = index {
                         // del dict[key] (D3 ordered dict): dynamic
@@ -4758,7 +7593,7 @@ impl Emitter {
                                 "del name[index] is only supported on dynamic dicts in D3: static containers have no SLA-source shrink shape yet",
                             ));
                         }
-                        ctx.check_alive(name, *line)?;
+                        ctx.check_alive(name, *line, Some(*anchor))?;
                         let (mut kcode, kty) = if let Expr::Str(s) = idx {
                             (self.emit_str_temp(ctx, s, *line)?, Ty::Dyn)
                         } else {
@@ -4776,14 +7611,14 @@ impl Emitter {
                             &format!("del of undefined variable `{}` (Python raises NameError)", name),
                         ));
                     }
-                    ctx.check_alive(name, *line)?;
+                    ctx.check_alive(name, *line, Some(*anchor))?;
                     if !ctx.deleted.iter().any(|(n, _)| n == name) {
                         ctx.deleted.push((name.clone(), *line));
                     }
                 }
                 Ok(())
             }
-            Stmt::MultiAssign { names, values, line } => {
+            Stmt::MultiAssign { names, values, line, anchor} => {
                 // Evaluate every RHS value into its own temp first
                 // (Python evaluates the whole RHS before binding, so
                 // `a, b = b, a` swaps correctly).
@@ -4793,7 +7628,7 @@ impl Emitter {
                     let tname = format!("__psa_ma_{}", ctx.tmp);
                     self.emit_stmt(
                         ctx,
-                        &Stmt::Assign { name: tname.clone(), value: v.clone(), line: *line },
+                        &Stmt::Assign { name: tname.clone(), value: v.clone(), line: *line, anchor: *anchor},
                     )?;
                     temps.push(tname);
                 }
@@ -4814,8 +7649,8 @@ impl Emitter {
                             ctx,
                             &Stmt::Assign {
                                 name: n.clone(),
-                                value: Expr::Name(temps[0].clone()),
-                                line: *line,
+                                value: Expr::Name(temps[0].clone(), ExprSpan::synthetic()),
+                                line: *line, anchor: *anchor,
                             },
                         )?;
                     }
@@ -4825,8 +7660,8 @@ impl Emitter {
                             ctx,
                             &Stmt::Assign {
                                 name: n.clone(),
-                                value: Expr::Name(t.clone()),
-                                line: *line,
+                                value: Expr::Name(t.clone(), ExprSpan::synthetic()),
+                                line: *line, anchor: *anchor,
                             },
                         )?;
                     }
@@ -4842,7 +7677,7 @@ impl Emitter {
                 }
                 Ok(())
             }
-            Stmt::Unpack { names, value, line } => {
+            Stmt::Unpack { names, value, line, anchor} => {
                 // A literal sequence of exactly matching length
                 // unpacks pairwise, like a multi-assignment (the
                 // RHS is fully evaluated into temps first, so
@@ -4863,16 +7698,16 @@ impl Emitter {
                         &Stmt::MultiAssign {
                             names: names.clone(),
                             values: elems.clone(),
-                            line: *line,
+                            line: *line, anchor: *anchor,
                         },
                     );
                 }
                 // A static list variable unpacks by index, with a
                 // runtime length check (panic 77077 on mismatch).
-                if let Expr::Name(n) = value {
+                if let Expr::Name(n, span) = value {
                     if let Some(t) = ctx.lookup(n) {
                         if t != Ty::Dyn && t.is_list() {
-                            ctx.check_alive(n, *line)?;
+                            ctx.check_alive(n, *line, Some(span.start))?;
                             ctx.line(&format!(
                                 "if (len({}) as i64) != {} {{ panic(77077); }};",
                                 n,
@@ -4884,10 +7719,10 @@ impl Emitter {
                                     &Stmt::Assign {
                                         name: name.clone(),
                                         value: Expr::Index(
-                                            Box::new(Expr::Name(n.clone())),
+                                            Box::new(Expr::Name(n.clone(), ExprSpan::synthetic())),
                                             Box::new(Expr::Int(j as i64)),
-                                        ),
-                                        line: *line,
+                                        ExprSpan::synthetic()),
+                                        line: *line, anchor: *anchor,
                                     },
                                 )?;
                             }
@@ -4909,12 +7744,12 @@ impl Emitter {
                 }
                 Ok(())
             }
-            Stmt::AttrAssign { base, name, op, value, line } => {
+            Stmt::AttrAssign { base, name, op, value, line, anchor: _} => {
                 // Class-side attribute assignment writes the
                 // class's own runtime-registry dict (CPython:
                 // visible to the class, its subclasses and
                 // every instance that does not shadow it).
-                if let Expr::Name(n) = base {
+                if let Expr::Name(n, _) = base {
                     if ctx.lookup(n).is_none() {
                         if let Some(&cid) = self.class_ids.get(n) {
                             self.used_dyn = true;
@@ -4989,12 +7824,12 @@ impl Emitter {
                 }
                 Ok(())
             }
-            Stmt::AttrDel { base, name, line } => {
+            Stmt::AttrDel { base, name, line, anchor: _} => {
                 // Class-side deletion removes the name from
                 // the class's OWN registry dict only (CPython);
                 // a name that lives on an ancestor is not
                 // deleted through the subclass.
-                if let Expr::Name(n) = base {
+                if let Expr::Name(n, _) = base {
                     if ctx.lookup(n).is_none() {
                         if let Some(&cid) = self.class_ids.get(n) {
                             self.used_dyn = true;
@@ -5026,11 +7861,11 @@ impl Emitter {
                 ctx.line(&format!("__psa_delattr({}, {});", bcode, ntmp));
                 Ok(())
             }
-            Stmt::IndexAssign { name, index, op, value, line } => {
+            Stmt::IndexAssign { name, index, op, value, line, anchor } => {
                 let ty = ctx
                     .lookup(name)
                     .ok_or_else(|| eerr(*line, &format!("index assignment to undefined variable `{}`", name)))?;
-                ctx.check_alive(name, *line)?;
+                ctx.check_alive(name, *line, Some(*anchor))?;
                 if ty == Ty::Dyn {
                     self.used_dyn = true;
                     let (icode, ity) = if let Expr::Str(s) = index {
@@ -5102,12 +7937,12 @@ impl Emitter {
                 }
                 Ok(())
             }
-            Stmt::AugAssign { name, op, value, line } => {
+            Stmt::AugAssign { name, op, value, line, anchor: _} => {
                 let existing = ctx
                     .lookup(name)
                     .ok_or_else(|| eerr(*line, &format!("augmented assignment to undefined variable `{}`", name)))?;
                 let fake = Expr::Bin(
-                    Box::new(Expr::Name(name.clone())),
+                    Box::new(Expr::Name(name.clone(), ExprSpan::synthetic())),
                     *op,
                     Box::new(value.clone()),
                 );
@@ -5143,10 +7978,10 @@ impl Emitter {
                     .map_err(|m| eerr(*line, &m))?;
                 Ok(())
             }
-            Stmt::ExprStmt { value, line } => {
+            Stmt::ExprStmt { value, line, anchor: _} => {
                 // print(...) is a builtin statement-level call.
-                if let Expr::Call(callee, args, kwargs) = value {
-                    if let Expr::Name(n) = &**callee {
+                if let Expr::Call(callee, args, kwargs, _) = value {
+                    if let Expr::Name(n, _) = &**callee {
                         if n == "print" {
                             // D5: sep=/end= are accepted as string
                             // literals and route to the general
@@ -5193,10 +8028,20 @@ impl Emitter {
                     }
                 }
                 let (code, _ty) = self.emit_expr(ctx, value, *line)?;
+                if matches!(value, Expr::Walrus { .. }) {
+                    // A statement-level walrus: emit_expr has
+                    // already emitted the binding (the whole
+                    // effect); the yielded value is discarded,
+                    // as in CPython. Emitting `{name};` here
+                    // would move the freshly bound variable —
+                    // the host checker rejects the next read
+                    // with UseAfterMove (w04).
+                    return Ok(());
+                }
                 ctx.line(&format!("{};", code));
                 Ok(())
             }
-            Stmt::If { arms, els, line } => {
+            Stmt::If { arms, els, line, anchor: _} => {
                 for (i, (cond, body)) in arms.iter().enumerate() {
                     let (ccode, cty) = self.emit_expr(ctx, cond, *line)?;
                     let ccode = self.cond_code(ccode, cty, *line, "if condition must be bool")?;
@@ -5218,7 +8063,48 @@ impl Emitter {
                 ctx.line("};");
                 Ok(())
             }
-            Stmt::While { cond, body, line } => {
+            Stmt::While { cond, body, els, line, anchor: _} => {
+                // A walrus as the WHOLE while condition is
+                // restructured: the value must be re-evaluated
+                // (and the name re-bound) on every iteration, so
+                // the binding becomes the loop head's first
+                // statement under `while true`, followed by a
+                // negated-condition break. That break is a plain
+                // text line, never emit_break_through, so it does
+                // not set the loop-else break flag.
+                if let Expr::Walrus { value, .. } = cond {
+                    if expr_contains_walrus(value) {
+                        return Err(eerr(
+                            *line,
+                            "a walrus nested inside a while-condition walrus value is not supported in v1; bind the inner value before the loop",
+                        ));
+                    }
+                    let flag = self.loop_else_begin(ctx, els);
+                    ctx.line("while true {");
+                    ctx.indent += 1;
+                    ctx.loop_depth += 1;
+                    let (vcode, vty) = self.emit_expr(ctx, cond, *line)?;
+                    let ccode =
+                        self.cond_code(vcode, vty, *line, "while condition must be bool")?;
+                    ctx.line(&format!("if !({}) {{ break; }};", ccode));
+                    let r = self.emit_block(ctx, body);
+                    ctx.loop_depth -= 1;
+                    ctx.indent -= 1;
+                    r?;
+                    ctx.line("}");
+                    self.loop_else_stack.pop();
+                    if let (Some(els_body), Some(flag)) = (els, &flag) {
+                        self.emit_loop_else_body(ctx, els_body, flag)?;
+                    }
+                    return Ok(());
+                }
+                if expr_contains_walrus(cond) {
+                    return Err(eerr(
+                        *line,
+                        "a walrus inside a while condition is only supported as the whole condition in v1 (`while (name := value):`); a nested walrus would be bound once before the loop instead of on every iteration",
+                    ));
+                }
+                let flag = self.loop_else_begin(ctx, els);
                 let saved = ctx.in_while_cond;
                 ctx.in_while_cond = true;
                 let res = self.emit_expr(ctx, cond, *line);
@@ -5233,9 +8119,13 @@ impl Emitter {
                 ctx.indent -= 1;
                 r?;
                 ctx.line("}");
+                self.loop_else_stack.pop();
+                if let (Some(els_body), Some(flag)) = (els, &flag) {
+                    self.emit_loop_else_body(ctx, els_body, flag)?;
+                }
                 Ok(())
             }
-            Stmt::ForRange { var, start, stop, body, line } => {
+            Stmt::ForRange { var, start, stop, body, els, line, anchor: _} => {
                 let (mut stop_code, stop_ty) = self.emit_expr(ctx, stop, *line)?;
                 if stop_ty == Ty::Dyn {
                     stop_code = self.unbox_code(stop_code, Ty::Int, *line)?;
@@ -5262,8 +8152,23 @@ impl Emitter {
                 let stop_var = format!("__psa_stop_{}_{}", line, ctx.tmp);
                 ctx.line(&format!("let {}: i64 = {};", stop_var, stop_code));
                 ctx.line(&format!("let {}: i64 = {};", var, start_code));
-                ctx.line(&format!("while {} < {} {{", var, stop_var));
+                // The range is driven by a separate counter and
+                // the loop variable is (re)bound at the top of
+                // each iteration, as CPython's range iterator
+                // does: after the loop the variable holds the
+                // last iterated value (le05's else clause reads
+                // it), a body write to the variable cannot
+                // perturb the iteration, and a break leaves the
+                // current value in place. (continue is refused
+                // in for-range loops, PSA-P023, so the counter
+                // increment at the body end cannot be skipped.)
+                ctx.tmp += 1;
+                let ctr = format!("__psa_ctr_{}_{}", line, ctx.tmp);
+                ctx.line(&format!("let {}: i64 = {};", ctr, var));
+                let flag = self.loop_else_begin(ctx, els);
+                ctx.line(&format!("while {} < {} {{", ctr, stop_var));
                 ctx.indent += 1;
+                ctx.line(&format!("{} = {};", var, ctr));
                 // Body statements share the loop scope (the loop variable
                 // stays visible); nested blocks scope themselves.
                 ctx.loop_depth += 1;
@@ -5271,22 +8176,26 @@ impl Emitter {
                     self.emit_stmt(ctx, s)?;
                 }
                 ctx.loop_depth -= 1;
-                ctx.line(&format!("{} = {} + 1;", var, var));
+                ctx.line(&format!("{} = {} + 1;", ctr, ctr));
                 ctx.indent -= 1;
                 ctx.line("}");
+                self.loop_else_stack.pop();
+                if let (Some(els_body), Some(flag)) = (els, &flag) {
+                    self.emit_loop_else_body(ctx, els_body, flag)?;
+                }
                 let mark = ctx.scopes.pop().unwrap();
                 ctx.vars.truncate(mark);
                 ctx.indent -= 1;
                 ctx.line("}");
                 Ok(())
             }
-            Stmt::ForEach { vars, iter, body, line } => {
+            Stmt::ForEach { vars, iter, body, els, line, anchor: _} => {
                 let (obj, ty) = match iter {
-                    Expr::Name(n) => {
+                    Expr::Name(n, span) => {
                         let t = ctx
                             .lookup(n)
                             .ok_or_else(|| eerr(*line, &format!("undefined variable `{}`", n)))?;
-                        ctx.check_alive(n, *line)?;
+                        ctx.check_alive(n, *line, Some(span.start))?;
                         (n.clone(), t)
                     }
                     _ => {
@@ -5357,6 +8266,23 @@ impl Emitter {
                     ctx.declare(&vars[0], elem_ty).map_err(|m| eerr(*line, &m))?;
                 }
                 ctx.line(&format!("let {}: i64 = 0;", idx));
+                if !multi {
+                    // The loop variable is declared HERE, in
+                    // the wrapping block — not by the per-
+                    // iteration `let` inside the while body,
+                    // whose SLA binding would die at the
+                    // while's closing brace and leave the loop-
+                    // else clause (and any post-loop read in
+                    // this block) facing an undefined name
+                    // (le23). The loop body assigns it.
+                    ctx.line(&format!(
+                        "let {}: {} = {};",
+                        vars[0],
+                        elem_ty.sla(),
+                        elem_ty.default_lit()
+                    ));
+                }
+                let flag = self.loop_else_begin(ctx, els);
                 // The length is re-read every iteration: CPython's
                 // list iterator observes appends made by the body.
                 ctx.line(&format!("while {} < {} {{", idx, len_code));
@@ -5376,23 +8302,37 @@ impl Emitter {
                         self.emit_bind_dyn_code(ctx, v, &ec, *line)?;
                     }
                 } else {
-                    ctx.line(&format!("let {} = {};", vars[0], get_code.replace("{}", &idx)));
+                    ctx.line(&format!("{} = {};", vars[0], get_code.replace("{}", &idx)));
                 }
+                // The index advances immediately after the
+                // bind, before the user body: a body ending in
+                // `break` (or return) would otherwise leave the
+                // increment as dead text after the terminator,
+                // which the host rejects with
+                // FallthroughForbidden (le10). The counter is
+                // synthetic (invisible to the body), and
+                // continue is refused in for-each loops
+                // (PSA-P019), so no path can skip or observe
+                // the difference.
+                ctx.line(&format!("{} = {} + 1;", idx, idx));
                 ctx.loop_depth += 1;
                 for s in body {
                     self.emit_stmt(ctx, s)?;
                 }
                 ctx.loop_depth -= 1;
-                ctx.line(&format!("{} = {} + 1;", idx, idx));
                 ctx.indent -= 1;
                 ctx.line("}");
+                self.loop_else_stack.pop();
+                if let (Some(els_body), Some(flag)) = (els, &flag) {
+                    self.emit_loop_else_body(ctx, els_body, flag)?;
+                }
                 let mark = ctx.scopes.pop().unwrap();
                 ctx.vars.truncate(mark);
                 ctx.indent -= 1;
                 ctx.line("}");
                 Ok(())
             }
-            Stmt::Try { body, handlers, els, finally, line } => {
+            Stmt::Try { body, handlers, els, finally, line, anchor: _} => {
                 validate_try(handlers, finally, *line)?;
                 self.begin_try(ctx);
                 // The body runs inside a single-iteration guard
@@ -5405,7 +8345,25 @@ impl Emitter {
                 let r = self.emit_block(ctx, body);
                 ctx.guard_depth -= 1;
                 r?;
-                ctx.line("break;");
+                // A body whose last top-level statement is a
+                // return / break / continue already terminates
+                // the guard wrapper with its own `break;` (the
+                // deferred-control emission); a second trailing
+                // `break;` is dead text after a terminator and
+                // the host rejects it with
+                // FallthroughForbidden (le12; pre-existing —
+                // any try body ending in return hit it).
+                let body_terminates = matches!(
+                    body.last(),
+                    Some(
+                        Stmt::Return { .. }
+                            | Stmt::Break { .. }
+                            | Stmt::Continue { .. }
+                    )
+                );
+                if !body_terminates {
+                    ctx.line("break;");
+                }
                 ctx.indent -= 1;
                 ctx.line("}");
                 // Handler dispatch (this try's frame is still on
@@ -5542,7 +8500,7 @@ impl Emitter {
                 self.emit_try_epilogue(ctx, frame, *line)?;
                 Ok(())
             }
-            Stmt::Raise { value, line } => {
+            Stmt::Raise { value, line, anchor: _} => {
                 self.used_dyn = true;
                 self.ensure_exc_slot(ctx);
                 match value {
@@ -5562,7 +8520,7 @@ impl Emitter {
                         // `raise SomeClass` instantiates the
                         // class with no arguments (CPython).
                         let mut done = false;
-                        if let Expr::Name(n) = e {
+                        if let Expr::Name(n, _) = e {
                             if ctx.lookup(n).is_none() {
                                 if let Some(&cid) = self.class_ids.get(n) {
                                     if !self.classes[cid].ancestors.contains(&0) {
@@ -5622,7 +8580,7 @@ impl Emitter {
                 }
                 Ok(())
             }
-            Stmt::Yield { value, line } => {
+            Stmt::Yield { value, line, anchor: _} => {
                 // D7: only reachable inside a generator producer
                 // (Ctx::gen_chan set); the def-level pre-pass
                 // guarantees every def containing a yield is
@@ -5653,10 +8611,10 @@ impl Emitter {
                 ctx.line(&format!("{}.send({}.ipay);", ch, yw));
                 Ok(())
             }
-            Stmt::Match { subject, cases, line } => {
+            Stmt::Match { subject, cases, line, anchor: _} => {
                 self.emit_match(ctx, subject, cases, *line)
             }
-            Stmt::With { items, body, line } => {
+            Stmt::With { items, body, line, anchor: _} => {
                 // Items evaluate left to right and bind before
                 // the guarded body; the finally-equivalent closes
                 // them in reverse order on every exit path.
@@ -5686,7 +8644,20 @@ impl Emitter {
                 let r = self.emit_block(ctx, body);
                 ctx.guard_depth -= 1;
                 r?;
-                ctx.line("break;");
+                // Same trailing-break guard as the Try arm:
+                // a body ending in return/break/continue has
+                // already terminated the wrapper.
+                let body_terminates = matches!(
+                    body.last(),
+                    Some(
+                        Stmt::Return { .. }
+                            | Stmt::Break { .. }
+                            | Stmt::Continue { .. }
+                    )
+                );
+                if !body_terminates {
+                    ctx.line("break;");
+                }
                 ctx.indent -= 1;
                 ctx.line("}");
                 let frame = ctx.try_stack.pop().expect("try frame");
@@ -5699,7 +8670,7 @@ impl Emitter {
         }
     }
 
-    fn emit_print(&mut self, ctx: &mut Ctx, args: &[Expr], line: u32) -> Result<(), String> {
+    fn emit_print(&mut self, ctx: &mut Ctx, args: &[Expr], line: u32) -> Result<(), Diagnostic> {
         if args.is_empty() {
             ctx.line("println(\"\");");
             return Ok(());
@@ -5729,7 +8700,7 @@ impl Emitter {
                 // Static list repr, byte-printed elementwise through
                 // the same helpers the dynamic repr uses (D2 slice C).
                 let name = match &args[0] {
-                    Expr::Name(n) => n.clone(),
+                    Expr::Name(n, _) => n.clone(),
                     // A slice temp is also a plain name.
                     _ if !code.is_empty()
                         && code
@@ -5854,7 +8825,7 @@ impl Emitter {
         sep: &str,
         end: &str,
         line: u32,
-    ) -> Result<(), String> {
+    ) -> Result<(), Diagnostic> {
         self.used_dyn = true;
         let sep_tmp = if items.len() > 1 && !sep.is_empty() {
             Some(self.emit_str_temp(ctx, sep, line)?)
@@ -5912,7 +8883,7 @@ impl Emitter {
         sep: &str,
         end: &str,
         line: u32,
-    ) -> Result<(), String> {
+    ) -> Result<(), Diagnostic> {
         let mut items: Vec<(Option<String>, String, Ty)> = Vec::new();
         for a in args {
             if let Expr::Str(s) = a {
@@ -5926,6 +8897,160 @@ impl Emitter {
     }
 
     /// print(f"...") — assemble println output from the f-string's parts.
+    /// Emit an f-string as a dynamic string value; returns the
+    /// temp holding the tag-6 PsaVal. Plain fields keep the
+    /// historical behaviour exactly (including the float
+    /// refusal, defect (xxiii) family). A field with a
+    /// conversion, a debug marker or a format spec goes through
+    /// the runtime formatter (`__psa_format_value`). Also used
+    /// recursively to evaluate format specs (a spec is a mini
+    /// f-string) and by the print route for f-strings that
+    /// carry formatted fields.
+    fn emit_fstr_value(
+        &mut self,
+        ctx: &mut Ctx,
+        parts: &[FStrPart],
+        line: u32,
+    ) -> Result<String, Diagnostic> {
+        self.used_dyn = true;
+        ctx.tmp += 1;
+        let acc = format!("__psa_ctmp_{}", ctx.tmp);
+        ctx.line(&format!("let {} = __psa_str_new();", acc));
+        for part in parts {
+            match part {
+                FStrPart::Lit(s) => {
+                    if !s.is_empty() {
+                        let t = self.emit_str_temp(ctx, s, line)?;
+                        ctx.line(&format!(
+                            "{} = __psa_str_append_str({}, {});",
+                            acc, acc, t
+                        ));
+                    }
+                }
+                FStrPart::Field { value, conv, debug, spec } => {
+                    if !part.is_formatted() {
+                        if let Expr::Str(s) = value {
+                            let t = self.emit_str_temp(ctx, s, line)?;
+                            ctx.line(&format!(
+                                "{} = __psa_str_append_str({}, {});",
+                                acc, acc, t
+                            ));
+                            continue;
+                        }
+                        let (code, ty) = self.emit_expr(ctx, value, line)?;
+                        let pcode = match ty {
+                            Ty::Dyn => format!("__psa_str_of({})", code),
+                            Ty::Int => format!("__psa_str_from_i64({})", code),
+                            Ty::Bool => format!("__psa_str_from_bool({})", code),
+                            Ty::Float => {
+                                return Err(eerr(
+                                    line,
+                                    "interpolating a float in an f-string is blocked: f64 text is unavailable until the shortest-roundtrip formatter lands (upstream defect (xxiii) family)",
+                                ))
+                            }
+                            _ => {
+                                return Err(eerr(
+                                    line,
+                                    &format!(
+                                        "values of type {} cannot be interpolated in an f-string yet",
+                                        ty.py_name()
+                                    ),
+                                ))
+                            }
+                        };
+                        ctx.line(&format!(
+                            "{} = __psa_str_append_str({}, {});",
+                            acc, acc, pcode
+                        ));
+                        continue;
+                    }
+                    // Formatted field: the debug prefix (verbatim
+                    // literal text) comes first, then the value
+                    // run through the runtime formatter.
+                    if let Some(dbg) = debug {
+                        let t = self.emit_str_temp(ctx, dbg, line)?;
+                        ctx.line(&format!(
+                            "{} = __psa_str_append_str({}, {});",
+                            acc, acc, t
+                        ));
+                    }
+                    let eff_conv =
+                        (*conv).or(if debug.is_some() { Some('r') } else { None });
+                    let t = self.emit_formatted_field(
+                        ctx,
+                        value,
+                        eff_conv,
+                        spec.as_deref(),
+                        line,
+                    )?;
+                    ctx.line(&format!(
+                        "{} = __psa_str_append_str({}, {});",
+                        acc, acc, t
+                    ));
+                }
+            }
+        }
+        Ok(acc)
+    }
+
+    /// Emit one formatted f-string field (a conversion, a debug
+    /// marker and/or a format spec is present): evaluate the
+    /// value as a dynamic value, evaluate the spec to a dynamic
+    /// string, and call the runtime formatter. Returns the temp
+    /// holding the formatted tag-6 result.
+    fn emit_formatted_field(
+        &mut self,
+        ctx: &mut Ctx,
+        value: &Expr,
+        conv: Option<char>,
+        spec: Option<&[FStrPart]>,
+        line: u32,
+    ) -> Result<String, Diagnostic> {
+        self.used_dyn = true;
+        let vcode = if let Expr::Str(s) = value {
+            self.emit_str_temp(ctx, s, line)?
+        } else {
+            let (code, ty) = self.emit_expr(ctx, value, line)?;
+            match ty {
+                Ty::Dyn => code,
+                Ty::Int | Ty::Float | Ty::Bool => self.box_code(code, ty, line)?,
+                Ty::Str => {
+                    return Err(eerr(
+                        line,
+                        "a dynamically-built string cannot appear in a formatted f-string field (only string literals become dynamic strings)",
+                    ))
+                }
+                _ => {
+                    return Err(eerr(
+                        line,
+                        &format!(
+                            "values of type {} cannot be formatted in an f-string field",
+                            ty.py_name()
+                        ),
+                    ))
+                }
+            }
+        };
+        let scode = match spec {
+            Some(parts) => self.emit_fstr_value(ctx, parts, line)?,
+            None => self.emit_str_temp(ctx, "", line)?,
+        };
+        let ccode = match conv {
+            Some('r') => 1,
+            Some('s') => 2,
+            Some('a') => 3,
+            _ => 0,
+        };
+        ctx.tmp += 1;
+        let t = format!("__psa_fmt_{}", ctx.tmp);
+        ctx.declare(&t, Ty::Dyn).map_err(|m| eerr(line, &m))?;
+        ctx.line(&format!(
+            "let {} = __psa_format_value({}, {}, {});",
+            t, vcode, ccode, scode
+        ));
+        Ok(t)
+    }
+
     /// Literal parts become format text (braces are rejected: SLA's
     /// println has no brace escaping, as a probe showed `{{}}` printing
     /// a lone `{`); interpolated ints become `{}` holes. A single bool
@@ -5937,7 +9062,18 @@ impl Emitter {
         ctx: &mut Ctx,
         parts: &[FStrPart],
         line: u32,
-    ) -> Result<(), String> {
+    ) -> Result<(), Diagnostic> {
+        // A field with a conversion, a debug marker or a format
+        // spec goes through the runtime formatter: build the
+        // whole f-string as a dynamic string and print that.
+        // (This also lifts the plain-path limits for such
+        // f-strings: float fields and literal braces work,
+        // because the text never reaches SLA's println format.)
+        if parts.iter().any(|p| p.is_formatted()) {
+            let t = self.emit_fstr_value(ctx, parts, line)?;
+            ctx.line(&format!("__psa_print_dyn({});", t));
+            return Ok(());
+        }
         let mut fmt = String::new();
         let mut codes: Vec<String> = Vec::new();
         let mut bool_hole: Option<(String, usize)> = None;
@@ -5952,7 +9088,7 @@ impl Emitter {
                     }
                     fmt.push_str(&escape_sla_str(s));
                 }
-                FStrPart::Expr(e) => {
+                FStrPart::Field { value: e, .. } => {
                     if let Expr::Str(s) = e {
                         if s.contains('{') || s.contains('}') {
                             return Err(eerr(
@@ -6024,21 +9160,80 @@ impl Emitter {
         Ok(())
     }
 
-    fn emit_expr(&mut self, ctx: &mut Ctx, e: &Expr, line: u32) -> Result<(String, Ty), String> {
+    fn emit_expr(&mut self, ctx: &mut Ctx, e: &Expr, line: u32) -> Result<(String, Ty), Diagnostic> {
+        // P1 source map: lines materialised while evaluating this
+        // expression (temps) anchor to the expression's psa line
+        // (kind Expr). `line == 0` means a synthetic expression
+        // (closure conversion): keep the enclosing anchor.
+        let saved = ctx.save_anchor();
+        if line != 0 {
+            let (anchor, precision) = match expr_span_start(e) {
+                Some(a) if !a.is_synthetic() => {
+                    (a, if a.col >= 1 { Precision::Exact } else { Precision::LineOnly })
+                }
+                _ => (SourceAnchor::at(line, 0, None), Precision::LineOnly),
+            };
+            ctx.set_anchor(anchor, SegKind::Expr, precision, None);
+        }
+        let r = self.emit_expr_inner(ctx, e, line);
+        ctx.restore_anchor(saved);
+        r
+    }
+
+    fn emit_expr_inner(&mut self, ctx: &mut Ctx, e: &Expr, line: u32) -> Result<(String, Ty), Diagnostic> {
         match e {
             Expr::Int(v) => Ok((v.to_string(), Ty::Int)),
+            Expr::BigInt(d) => {
+                // Merge note (V1): dyn contexts fall through to this
+                // arm (emit_dyn_value and binop operands route via
+                // emit_expr), so the literal is built as a dynamic
+                // bigint here, exactly as literal_dyn_code does.
+                // Static boundaries then refuse loudly: a static
+                // call argument gets the PSA-E6010 compile refusal
+                // (see the boundary loop in the call path), other
+                // static slots unbox through __psa_unbox_int and
+                // panic 77080 at runtime for a tag-17 value.
+                self.used_dyn = true;
+                let t = self.emit_str_temp(ctx, d, line)?;
+                Ok((format!("__psa_big_from_psastr({})", t), Ty::Dyn))
+            }
             Expr::Float(v) => Ok((fmt_f64(*v), Ty::Float)),
             Expr::Str(s) => Ok((format!("\"{}\"", escape_sla_str(s)), Ty::Str)),
+            Expr::Bytes(bs) => {
+                // Bytes have no static form: a literal is built
+                // directly as a dynamic bytes value (tag 15).
+                let t = self.emit_bytes_temp(ctx, bs, line)?;
+                Ok((t, Ty::Dyn))
+            }
+            Expr::Walrus { name, value } => {
+                // Evaluate, bind, yield: the binding reuses the
+                // plain assignment machinery wholesale (type
+                // pinning, dynamic stage stores, move marking,
+                // the string-literal special case), via a
+                // synthetic Assign statement; the expression's
+                // value is then the target variable itself, with
+                // whatever type the binding pinned.
+                let stmt = Stmt::Assign {
+                    name: name.clone(),
+                    value: (**value).clone(),
+                    line, anchor: SourceAnchor::at(line, 0, None),
+                };
+                self.emit_stmt(ctx, &stmt)?;
+                let ty = ctx.lookup(name).ok_or_else(|| {
+                    eerr(line, "internal error: walrus target unbound after binding")
+                })?;
+                Ok((name.clone(), ty))
+            }
             Expr::Bool(b) => Ok((b.to_string(), Ty::Bool)),
             Expr::NoneLit => {
                 self.used_dyn = true;
                 Ok((Ty::Dyn.default_lit().to_string(), Ty::Dyn))
             }
-            Expr::Name(n) => {
+            Expr::Name(n, span) => {
                 ctx.check_not_deleted(n, line)?;
                 match ctx.lookup(n) {
                     Some(t) => {
-                        ctx.check_alive(n, line)?;
+                        ctx.check_alive(n, line, Some(span.start))?;
                         Ok((n.clone(), t))
                     }
                     None => {
@@ -6063,7 +9258,46 @@ impl Emitter {
                 }
             }
             Expr::FnVal(n) => self.fn_val_code(n, line),
-            Expr::Attr(base, name) => {
+            // D8 closures: the cell and environment nodes
+            // produced by the closure-conversion pass. A
+            // cell's contents are always dynamic: the stored
+            // value goes through emit_dyn_value (scalars box,
+            // containers materialise in temps).
+            Expr::CellNew(v) => {
+                self.used_dyn = true;
+                self.used_closure = true;
+                let c = self.emit_dyn_value(ctx, v, line)?;
+                Ok((format!("__psa_cell_new({})", c), Ty::Dyn))
+            }
+            Expr::CellGet(c) => {
+                self.used_dyn = true;
+                self.used_closure = true;
+                let (cc, _) = self.emit_expr(ctx, c, line)?;
+                Ok((format!("__psa_cell_get({})", cc), Ty::Dyn))
+            }
+            Expr::CellSet(c, v) => {
+                self.used_dyn = true;
+                self.used_closure = true;
+                let (cc, _) = self.emit_expr(ctx, c, line)?;
+                let vc = self.emit_dyn_value(ctx, v, line)?;
+                Ok((format!("__psa_cell_set({}, {})", cc, vc), Ty::Dyn))
+            }
+            Expr::ClosureVal(n, env) => {
+                // The env is a ListLit of cell names built by
+                // the converter; materialise it as a
+                // dynamic-list temp. A raw emit_expr refuses
+                // bare list literals outside assignment/return
+                // positions (v0.3 gate), which is exactly the
+                // position a closure value is built in.
+                let env_code = self.emit_dyn_value(ctx, env, line)?;
+                self.closure_val_code(n, &env_code, line)
+            }
+            Expr::ModEnv => {
+                self.used_dyn = true;
+                self.used_closure = true;
+                Ok(("__psa_modenv()".to_string(), Ty::Dyn))
+            }
+            Expr::Attr(base, name, _) => {
                 // D6: a module attribute read through a chain
                 // (`foo.CONST`, `foo.bar.CONST`) whose root is
                 // an imported module, not a variable: the
@@ -6096,7 +9330,7 @@ impl Emitter {
                 // at runtime is found the same way. Method
                 // names stay an emit error (a method is not a
                 // value on the class side in v1).
-                if let Expr::Name(n) = &**base {
+                if let Expr::Name(n, _) = &**base {
                     if ctx.lookup(n).is_none() {
                         if let Some(&cid) = self.class_ids.get(n) {
                             if self.classes[cid]
@@ -6162,64 +9396,13 @@ impl Emitter {
             Expr::FStr(parts) => {
                 // D5: an f-string as a general value concatenates
                 // its parts into a dynamic string.
-                self.used_dyn = true;
-                ctx.tmp += 1;
-                let acc = format!("__psa_ctmp_{}", ctx.tmp);
-                ctx.line(&format!("let {} = __psa_str_new();", acc));
-                for p in parts {
-                    match p {
-                        FStrPart::Lit(s) => {
-                            if !s.is_empty() {
-                                let t = self.emit_str_temp(ctx, s, line)?;
-                                ctx.line(&format!(
-                                    "{} = __psa_str_append_str({}, {});",
-                                    acc, acc, t
-                                ));
-                            }
-                        }
-                        FStrPart::Expr(x) => {
-                            if let Expr::Str(s) = x {
-                                let t = self.emit_str_temp(ctx, s, line)?;
-                                ctx.line(&format!(
-                                    "{} = __psa_str_append_str({}, {});",
-                                    acc, acc, t
-                                ));
-                                continue;
-                            }
-                            let (code, ty) = self.emit_expr(ctx, x, line)?;
-                            let part = match ty {
-                                Ty::Dyn => format!("__psa_str_of({})", code),
-                                Ty::Int => format!("__psa_str_from_i64({})", code),
-                                Ty::Bool => format!("__psa_str_from_bool({})", code),
-                                Ty::Float => {
-                                    return Err(eerr(
-                                        line,
-                                        "interpolating a float in an f-string is blocked: f64 text is unavailable until the shortest-roundtrip formatter lands (upstream defect (xxiii) family)",
-                                    ))
-                                }
-                                _ => {
-                                    return Err(eerr(
-                                        line,
-                                        &format!(
-                                            "values of type {} cannot be interpolated in an f-string yet",
-                                            ty.py_name()
-                                        ),
-                                    ))
-                                }
-                            };
-                            ctx.line(&format!(
-                                "{} = __psa_str_append_str({}, {});",
-                                acc, acc, part
-                            ));
-                        }
-                    }
-                }
-                Ok((acc, Ty::Dyn))
+                let t = self.emit_fstr_value(ctx, parts, line)?;
+                Ok((t, Ty::Dyn))
             }
-            Expr::Index(base, idx) => {
+            Expr::Index(base, idx, _) => {
                 // Chained indexing on a dynamic sub-expression
                 // (m[1][0]): the inner value is the container.
-                if !matches!(&**base, Expr::Name(_)) {
+                if !matches!(&**base, Expr::Name(_, _)) {
                     let (bcode, bty) = self.emit_expr(ctx, base, line)?;
                     if bty == Ty::Dyn {
                         self.used_dyn = true;
@@ -6245,14 +9428,14 @@ impl Emitter {
                         "indexing is only supported on plain variables in v0.3",
                     ));
                 }
-                let obj = match &**base {
-                    Expr::Name(n) => n.clone(),
+                let (obj, obj_anchor) = match &**base {
+                    Expr::Name(n, span) => (n.clone(), span.start),
                     _ => unreachable!(),
                 };
                 let ty = ctx
                     .lookup(&obj)
                     .ok_or_else(|| eerr(line, &format!("undefined variable `{}`", obj)))?;
-                ctx.check_alive(&obj, line)?;
+                ctx.check_alive(&obj, line, Some(obj_anchor))?;
                 if ty == Ty::Dyn {
                     // Dynamic subscript: the key stays a PsaVal and
                     // the runtime dispatches on the container kind
@@ -6308,7 +9491,7 @@ impl Emitter {
                     ));
                 }
                 // Chained slicing on a dynamic sub-expression.
-                if !matches!(&**base, Expr::Name(_)) {
+                if !matches!(&**base, Expr::Name(_, _)) {
                     let (bcode, bty) = self.emit_expr(ctx, base, line)?;
                     if bty == Ty::Dyn {
                         self.used_dyn = true;
@@ -6325,14 +9508,14 @@ impl Emitter {
                         "slicing is only supported on plain variables in this slice",
                     ));
                 }
-                let obj = match &**base {
-                    Expr::Name(n) => n.clone(),
+                let (obj, obj_anchor) = match &**base {
+                    Expr::Name(n, span) => (n.clone(), span.start),
                     _ => unreachable!(),
                 };
                 let ty = ctx
                     .lookup(&obj)
                     .ok_or_else(|| eerr(line, &format!("undefined variable `{}`", obj)))?;
-                ctx.check_alive(&obj, line)?;
+                ctx.check_alive(&obj, line, Some(obj_anchor))?;
                 if ty == Ty::Dyn {
                     self.used_dyn = true;
                     let lo_c = self.slice_bound_code(ctx, lo, line)?;
@@ -6424,7 +9607,7 @@ impl Emitter {
                         return match key {
                             Some(k) => {
                                 let call =
-                                    Expr::Call(Box::new(Expr::Name(k)), args.clone(), Vec::new());
+                                    Expr::Call(Box::new(Expr::Name(k, ExprSpan::synthetic())), args.clone(), Vec::new(), ExprSpan::synthetic());
                                 self.emit_expr(ctx, &call, line)
                             }
                             None => Err(eerr(
@@ -6467,6 +9650,53 @@ impl Emitter {
                     self.used_dyn = true;
                     self.used_psa_json = true;
                     return Ok((format!("{}({})", sla_fn, acode), Ty::Dyn));
+                }
+                // psa_std: `pickle.dumps(v)` / `pickle.dump(v, f)` /
+                // `pickle.loads(data)` / `pickle.load(f)` with
+                // `import pickle` bound to the standard library call
+                // the spliced module's SLA entry points directly.
+                // dump/load ride the file runtime (__psa_file_write /
+                // __psa_file_read_all), so they set used_file.
+                if self.std_pickle && obj == "pickle" && ctx.lookup(obj).is_none() {
+                    let (sla_fn, arity): (&str, usize) = match method.as_str() {
+                        "dumps" => ("psa_pickle_dumps", 1),
+                        "dump" => ("psa_pickle_dump", 2),
+                        "loads" => ("psa_pickle_loads", 1),
+                        "load" => ("psa_pickle_load", 1),
+                        _ => {
+                            return Err(eerr(
+                                line,
+                                &format!(
+                                    "psa_std module `pickle` has no function `{}` in v1 (dumps / dump / loads / load)",
+                                    method
+                                ),
+                            ))
+                        }
+                    };
+                    if args.len() != arity {
+                        return Err(eerr(
+                            line,
+                            &format!(
+                                "pickle.{} takes exactly {} positional argument(s) in v1",
+                                method, arity
+                            ),
+                        ));
+                    }
+                    let mut acodes: Vec<String> = Vec::new();
+                    for a in args {
+                        acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                    }
+                    self.used_dyn = true;
+                    self.used_psa_pickle = true;
+                    // The pickle splice is monolithic: it
+                    // always carries dump/load, which call
+                    // __psa_file_write / __psa_file_read_all —
+                    // so the file runtime must be emitted
+                    // whenever ANY pickle entry point is used,
+                    // or a loads-only program fails the host
+                    // type check with Undefined call.
+                    self.used_file = true;
+                    return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
                 }
                 // psa_std L1 batch 2: `math.<fn>(...)` with
                 // `import math` bound to the standard library
@@ -7604,7 +10834,7 @@ impl Emitter {
                     let key = format!("{}.{}", obj, method);
                     if self.defs.contains_key(&key) {
                         let call =
-                            Expr::Call(Box::new(Expr::Name(key)), args.clone(), Vec::new());
+                            Expr::Call(Box::new(Expr::Name(key, ExprSpan::synthetic())), args.clone(), Vec::new(), ExprSpan::synthetic());
                         return self.emit_expr(ctx, &call, line);
                     }
                     if let Some(&cid) = self.class_ids.get(method) {
@@ -7616,7 +10846,7 @@ impl Emitter {
                     .ok_or_else(|| eerr(line, &format!("undefined variable `{}`", obj)))?;
                 // Method calls on a dynamic value (D4/D5).
                 if ty == Ty::Dyn {
-                    ctx.check_alive(obj, line)?;
+                    ctx.check_alive(obj, line, None)?;
                     self.used_dyn = true;
                     // append keeps a direct fast path (no
                     // argument packing); the runtime defers
@@ -7669,7 +10899,7 @@ impl Emitter {
                         ),
                     ));
                 }
-                ctx.check_alive(obj, line)?;
+                ctx.check_alive(obj, line, None)?;
                 if args.len() != 1 {
                     return Err(eerr(line, "append takes exactly one argument"));
                 }
@@ -7733,14 +10963,32 @@ impl Emitter {
                     }
                 }
             }
-            Expr::Call(callee, args, kwargs) => {
+            Expr::Call(callee, args, kwargs, _) => {
+                // P1 source map: note the call boundary. The next
+                // `Ctx::line` whose text contains the callee's call
+                // becomes a `CallSite` segment (see `Ctx::line`).
+                // First call wins when calls nest on one line; the
+                // name is the callee's generated symbol when it is
+                // a plain name / function value, and `None` for a
+                // dynamic callee (method calls: the dispatch is
+                // `__psa_call_value`, matched by the consumer).
+                // psa_std module entry points (`json.dumps`, ...)
+                // are deliberately NOT named here: their sla entry
+                // names are decided inside the intercept blocks
+                // below, and the call line is still covered by its
+                // ordinary User segment — see RESULT.md.
+                match &**callee {
+                    Expr::Name(n, _) | Expr::FnVal(n) => ctx.note_call(Some(self.sla_name(n))),
+                    Expr::Attr(..) => ctx.note_call(None),
+                    _ => {}
+                }
                 // psa_std: `json.dumps(v)` / `json.loads(s)`
                 // with `import json` bound to the standard
                 // library call the spliced module's SLA entry
                 // points directly (one dynamic argument each).
                 if self.std_json {
-                    if let Expr::Attr(base, mname) = &**callee {
-                        if let Expr::Name(n) = &**base {
+                    if let Expr::Attr(base, mname, _) = &**callee {
+                        if let Expr::Name(n, _) = &**base {
                             if n == "json" && ctx.lookup(n).is_none() {
                                 let sla_fn = match mname.as_str() {
                                     "dumps" => "psa_json_dumps",
@@ -7772,13 +11020,59 @@ impl Emitter {
                         }
                     }
                 }
+                // psa_std: the Call(Attr) form of the pickle
+                // intercept, mirroring the MethodCall block (same
+                // entry points and arities, keywords refused).
+                if self.std_pickle {
+                    if let Expr::Attr(base, mname, _) = &**callee {
+                        if let Expr::Name(n, _) = &**base {
+                            if n == "pickle" && ctx.lookup(n).is_none() {
+                                let (sla_fn, arity): (&str, usize) = match mname.as_str() {
+                                    "dumps" => ("psa_pickle_dumps", 1),
+                                    "dump" => ("psa_pickle_dump", 2),
+                                    "loads" => ("psa_pickle_loads", 1),
+                                    "load" => ("psa_pickle_load", 1),
+                                    _ => {
+                                        return Err(eerr(
+                                            line,
+                                            &format!(
+                                                "psa_std module `pickle` has no function `{}` in v1 (dumps / dump / loads / load)",
+                                                mname
+                                            ),
+                                        ))
+                                    }
+                                };
+                                if args.len() != arity || !kwargs.is_empty() {
+                                    return Err(eerr(
+                                        line,
+                                        &format!(
+                                            "pickle.{} takes exactly {} positional argument(s) in v1",
+                                            mname, arity
+                                        ),
+                                    ));
+                                }
+                                let mut acodes: Vec<String> = Vec::new();
+                                for a in args {
+                                    acodes.push(self.emit_dyn_value(ctx, a, line)?);
+                                }
+                                self.used_dyn = true;
+                                self.used_psa_pickle = true;
+                                // Monolithic splice: see the
+                                // MethodCall intercept — the file
+                                // runtime is always required.
+                                self.used_file = true;
+                                return Ok((format!("{}({})", sla_fn, acodes.join(", ")), Ty::Dyn));
+                            }
+                        }
+                    }
+                }
                 // psa_std L1 batch 2: the Call(Attr) form of
                 // the math / string intercepts, mirroring the
                 // json block above (same entry points, same
                 // arity rules, keywords refused).
                 if self.std_math || self.std_string {
-                    if let Expr::Attr(base, mname) = &**callee {
-                        if let Expr::Name(n) = &**base {
+                    if let Expr::Attr(base, mname, _) = &**callee {
+                        if let Expr::Name(n, _) = &**base {
                             if n == "math" && self.std_math && ctx.lookup(n).is_none() {
                                 let (sla_fn, arity): (&str, usize) = match mname.as_str() {
                                     "floor" => ("psa_math_floor", 1),
@@ -7863,8 +11157,8 @@ impl Emitter {
                 // entry points, same arity rules, keywords
                 // refused).
                 if self.std_csv || self.std_logging || self.std_argparse {
-                    if let Expr::Attr(base, mname) = &**callee {
-                        if let Expr::Name(n) = &**base {
+                    if let Expr::Attr(base, mname, _) = &**callee {
+                        if let Expr::Name(n, _) = &**base {
                             if n == "csv" && self.std_csv && ctx.lookup(n).is_none() {
                                 let (sla_fn, arity): (&str, usize) = match mname.as_str() {
                                     "reads" => ("psa_csv_reads", 1),
@@ -8057,8 +11351,8 @@ impl Emitter {
                 // intercepts, mirroring the MethodCall blocks
                 // above (keywords refused).
                 if self.std_collections || self.std_itertools || self.std_functools {
-                    if let Expr::Attr(base, mname) = &**callee {
-                        if let Expr::Name(n) = &**base {
+                    if let Expr::Attr(base, mname, _) = &**callee {
+                        if let Expr::Name(n, _) = &**base {
                             if n == "collections" && self.std_collections && ctx.lookup(n).is_none() {
                                 let (sla_fn, arity): (&str, usize) = match mname.as_str() {
                                     "Counter" => ("psa_collections_counter_any", 1),
@@ -8290,8 +11584,8 @@ impl Emitter {
                 if self.std_bisect || self.std_heapq || self.std_base64 || self.std_random
                     || self.std_re || self.std_socket || self.std_urllib
                 {
-                    if let Expr::Attr(base, mname) = &**callee {
-                        if let Expr::Name(n) = &**base {
+                    if let Expr::Attr(base, mname, _) = &**callee {
+                        if let Expr::Name(n, _) = &**base {
                             if n == "bisect" && self.std_bisect && ctx.lookup(n).is_none() {
                                 let sla_fn: &str = match mname.as_str() {
                                     "bisect_left" => "psa_bisect_bisect_left",
@@ -8944,10 +12238,10 @@ impl Emitter {
                 if matches!(&**callee, Expr::Attr(..)) {
                     if let Some(key) = self.module_def_key(ctx, callee) {
                         let call = Expr::Call(
-                            Box::new(Expr::Name(key)),
+                            Box::new(Expr::Name(key, ExprSpan::synthetic())),
                             args.clone(),
                             kwargs.clone(),
-                        );
+                        ExprSpan::synthetic());
                         return self.emit_expr(ctx, &call, line);
                     }
                     if let Some((cname, cid)) = self.module_class(ctx, callee) {
@@ -8958,7 +12252,7 @@ impl Emitter {
                 // a chained `a.b.m(...)` whose callee is an Attr
                 // node. getattr yields the value (a bound method
                 // for methods) and the callable dispatch runs it.
-                if let Expr::Attr(base, mname) = &**callee {
+                if let Expr::Attr(base, mname, _) = &**callee {
                     if !kwargs.is_empty() {
                         return Err(eerr(
                             line,
@@ -8992,8 +12286,36 @@ impl Emitter {
                         Ty::Dyn,
                     ));
                 }
-                let fname = match &**callee {
-                    Expr::Name(n) => n.clone(),
+                // D8: a computed callee — anything that is
+                // neither a plain name nor an attribute chain.
+                // Closure conversion produces these when a
+                // captured function value is called (the read
+                // is a CellGet), and parenthesised / indexed
+                // forms land here too. A dynamic callee goes
+                // through the generated dispatch, which covers
+                // tags 7, 9 and 16; a non-dynamic callee keeps
+                // the historic loud refusal below.
+                if !matches!(&**callee, Expr::Name(_, _) | Expr::Attr(..)) {
+                    if !kwargs.is_empty() {
+                        return Err(eerr(
+                            line,
+                            "keyword arguments are not supported when calling a computed function value yet (D8 v1 closure slice)",
+                        ));
+                    }
+                    let (ccode, cty) = self.emit_expr(ctx, callee, line)?;
+                    if cty != Ty::Dyn {
+                        return Err(eerr(
+                            line,
+                            "v0.1 calls only plain function names (no methods, no first-class functions)",
+                        ));
+                    }
+                    self.used_dyn = true;
+                    let codes = self.emit_dyn_args(ctx, args, line)?;
+                    let tmp = self.pack_dyn_args(ctx, &codes);
+                    return Ok((format!("__psa_call_value({}, {})", ccode, tmp), Ty::Dyn));
+                }
+                let (fname, fname_anchor) = match &**callee {
+                    Expr::Name(n, span) => (n.clone(), span.start),
                     _ => {
                         return Err(eerr(
                             line,
@@ -9007,7 +12329,7 @@ impl Emitter {
                 // the arity. A variable shadows a def of the same
                 // name, as in Python.
                 if let Some(Ty::Dyn) = ctx.lookup(&fname) {
-                    ctx.check_alive(&fname, line)?;
+                    ctx.check_alive(&fname, line, Some(fname_anchor))?;
                     if !kwargs.is_empty() {
                         return Err(eerr(
                             line,
@@ -9144,6 +12466,7 @@ impl Emitter {
                                 Some(dflt) => {
                                     match dflt {
                                         Expr::Int(_)
+                                        | Expr::BigInt(_)
                                         | Expr::Float(_)
                                         | Expr::Str(_)
                                         | Expr::Bool(_)
@@ -9232,6 +12555,16 @@ impl Emitter {
                         let c = std::mem::take(&mut arg_codes[i]);
                         arg_codes[i] = self.box_code(c, at, line)?;
                     } else if at == Ty::Dyn && pt != Ty::Dyn {
+                        // A big integer literal consumed directly by
+                        // a static parameter is a compile-time
+                        // refusal (PSA-E6010), not a runtime unbox:
+                        // the literal itself can never fit.
+                        if matches!(args[i], Expr::BigInt(_)) {
+                            return Err(eerr(
+                                line,
+                                "integer literal out of i64 range in a static position (dynamic positions accept arbitrary precision)",
+                            ));
+                        }
                         let c = std::mem::take(&mut arg_codes[i]);
                         arg_codes[i] = self.unbox_code(c, pt, line)?;
                     }
@@ -9246,7 +12579,7 @@ impl Emitter {
                     }
                     let borrow = sig.param_borrow.get(i).copied().unwrap_or(false);
                     match a {
-                        Expr::Name(n) => {
+                        Expr::Name(n, span) => {
                             let caller_borrowed = ctx.borrowed.contains(n);
                             if borrow {
                                 if !caller_borrowed {
@@ -9262,7 +12595,7 @@ impl Emitter {
                                         ),
                                     ));
                                 }
-                                ctx.mark_moved(n, line);
+                                ctx.mark_moved(n, span.start);
                             }
                         }
                         _ => {
@@ -9325,14 +12658,14 @@ impl Emitter {
                             } else {
                                 ctx.line(&format!("if !({}) {{", name));
                             }
-                            ctx.out.push_str(&r_lines);
+                            ctx.out.append_writer(r_lines);
                             ctx.indent += 1;
                             ctx.line(&format!("{} = {};", name, rc));
                             ctx.indent -= 1;
                             ctx.line("};");
                             return Ok((name, Ty::Bool));
                         }
-                        ctx.out.push_str(&r_lines);
+                        ctx.out.append_writer(r_lines);
                         return self.emit_binop(lc, lt, *op, rc, rt, line);
                     }
                     // A string literal beside a dynamic operand
@@ -9369,6 +12702,40 @@ impl Emitter {
                     if let Expr::Str(s) = &**r {
                         rc = self.emit_str_temp(ctx, s, line)?;
                         rt = Ty::Dyn;
+                    }
+                }
+                {
+                    // Cross-kind static identity (171-B
+                    // NOTES: cross-kind identity is always
+                    // False): when neither operand is a
+                    // scalar of the other's kind and at
+                    // least one side is a non-scalar (a
+                    // static string/list/...), the two
+                    // values can never be the same object,
+                    // so the answer is a constant. Boxing
+                    // is not an option — static containers
+                    // cannot become dynamic values in D1
+                    // (E5020) — and none is needed.
+                    // Restricted to duplicable (pure,
+                    // deterministic) operands, whose
+                    // emitted codes may be dropped safely;
+                    // anything else falls through to the
+                    // loud refusal in emit_binop. Same-kind
+                    // non-scalar pairs (Str/Str, List/List)
+                    // are excluded: they stay refused.
+                    let scalar =
+                        |t: Ty| matches!(t, Ty::Int | Ty::Float | Ty::Bool);
+                    if matches!(op, BinOp::Is | BinOp::IsNot)
+                        && lt != rt
+                        && !(scalar(lt) && scalar(rt))
+                        && crate::parser::duplicable(l)
+                        && crate::parser::duplicable(r)
+                    {
+                        return Ok((
+                            if *op == BinOp::IsNot { "true" } else { "false" }
+                                .to_string(),
+                            Ty::Bool,
+                        ));
                     }
                 }
                 self.emit_binop(lc, lt, *op, rc, rt, line)
@@ -9513,7 +12880,7 @@ impl Emitter {
                     ctx.line(&format!("let {}: {} = {};", name, ty.sla(), ty.default_lit()));
                 }
                 ctx.line(&format!("if {} {{", cc));
-                ctx.out.push_str(&then_lines);
+                ctx.out.append_writer(then_lines);
                 ctx.indent += 1;
                 if ty == Ty::Dyn {
                     if then_void {
@@ -9529,7 +12896,7 @@ impl Emitter {
                 }
                 ctx.indent -= 1;
                 ctx.line("} else {");
-                ctx.out.push_str(&els_lines);
+                ctx.out.append_writer(els_lines);
                 ctx.indent += 1;
                 if ty == Ty::Dyn {
                     if els_void {
@@ -9565,7 +12932,7 @@ impl Emitter {
         l: &Expr,
         r: &Expr,
         line: u32,
-    ) -> Result<(String, Ty), String> {
+    ) -> Result<(String, Ty), Diagnostic> {
         let (lc, lt) = self.emit_expr(ctx, l, line)?;
         let (rc, rt) = self.emit_expr(ctx, r, line)?;
         if lt == Ty::Dyn || rt == Ty::Dyn {
@@ -9628,9 +12995,9 @@ impl Emitter {
         op: BinOp,
         rc: String,
         rt: Ty,
-        r_lines: String,
+        r_lines: SegmentWriter,
         line: u32,
-    ) -> Result<(String, Ty), String> {
+    ) -> Result<(String, Ty), Diagnostic> {
         if ctx.in_while_cond {
             return Err(eerr(
                 line,
@@ -9655,7 +13022,7 @@ impl Emitter {
         } else {
             ctx.line(&format!("if !(__psa_dyn_truthy({})) {{", name));
         }
-        ctx.out.push_str(&r_lines);
+        ctx.out.append_writer(r_lines);
         ctx.indent += 1;
         self.emit_dyn_store(ctx, &name, &rc)
             .map_err(|m| eerr(line, &m))?;
@@ -9675,7 +13042,7 @@ impl Emitter {
         rc: String,
         rt: Ty,
         line: u32,
-    ) -> Result<(String, Ty), String> {
+    ) -> Result<(String, Ty), Diagnostic> {
         let lc = self.box_code(lc, lt, line)?;
         let rc = self.box_code(rc, rt, line)?;
         self.used_dyn = true;
@@ -9698,6 +13065,10 @@ impl Emitter {
             }
             BinOp::Eq => return Ok((format!("__psa_dyn_eq({}, {})", lc, rc), Ty::Bool)),
             BinOp::NotEq => return Ok((format!("__psa_dyn_ne({}, {})", lc, rc), Ty::Bool)),
+            BinOp::Is => return Ok((format!("__psa_dyn_is({}, {})", lc, rc), Ty::Bool)),
+            BinOp::IsNot => {
+                return Ok((format!("!(__psa_dyn_is({}, {}))", lc, rc), Ty::Bool))
+            }
             BinOp::Lt => return Ok((format!("__psa_dyn_lt({}, {})", lc, rc), Ty::Bool)),
             BinOp::LtEq => return Ok((format!("__psa_dyn_le({}, {})", lc, rc), Ty::Bool)),
             BinOp::Gt => return Ok((format!("__psa_dyn_gt({}, {})", lc, rc), Ty::Bool)),
@@ -9720,7 +13091,7 @@ impl Emitter {
         rc: String,
         rt: Ty,
         line: u32,
-    ) -> Result<(String, Ty), String> {
+    ) -> Result<(String, Ty), Diagnostic> {
         if lt == Ty::Dyn || rt == Ty::Dyn {
             return self.emit_dyn_binop(lc, lt, op, rc, rt, line);
         }
@@ -9751,6 +13122,49 @@ impl Emitter {
                     }
                     (Ty::Str, Ty::Str) => Err(eerr(line, "string comparison is not supported in v0.1")),
                     _ => Err(eerr(line, &format!("cannot compare {:?} with {:?}", lt, rt))),
+                }
+            }
+            BinOp::Is | BinOp::IsNot => {
+                // Identity on static operands (171-B,
+                // SEMANTICS.md §6): same-kind scalars compare
+                // payloads (the documented immediate rule);
+                // mixed scalar kinds box and go through the
+                // dynamic test so the tag decides (`1 is 1.0`
+                // and `True is 1` are False, as in CPython);
+                // anything else has no heap identity to test
+                // and stays refused rather than miscompiled.
+                let neg = op == BinOp::IsNot;
+                match (lt, rt) {
+                    (Ty::Int, Ty::Int) | (Ty::Bool, Ty::Bool) => {
+                        let sym = if neg { "!=" } else { "==" };
+                        Ok((format!("({} {} {})", lc, sym, rc), Ty::Bool))
+                    }
+                    (Ty::Float, Ty::Float) => {
+                        // Payload equality with the NaN clause:
+                        // a NaN is identical to itself.
+                        let eq = format!(
+                            "(({} == {}) || ({} != {} && {} != {}))",
+                            lc, rc, lc, lc, rc, rc
+                        );
+                        if neg {
+                            Ok((format!("!{}", eq), Ty::Bool))
+                        } else {
+                            Ok((eq, Ty::Bool))
+                        }
+                    }
+                    (Ty::Int | Ty::Float | Ty::Bool, Ty::Int | Ty::Float | Ty::Bool) => {
+                        let lc = self.box_code(lc, lt, line)?;
+                        let rc = self.box_code(rc, rt, line)?;
+                        if neg {
+                            Ok((format!("!(__psa_dyn_is({}, {}))", lc, rc), Ty::Bool))
+                        } else {
+                            Ok((format!("__psa_dyn_is({}, {})", lc, rc), Ty::Bool))
+                        }
+                    }
+                    _ => Err(eerr(
+                        line,
+                        "`is` is currently supported on dynamic values and static scalars; a static string/list operand stays refused rather than miscompiled",
+                    )),
                 }
             }
             BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
@@ -9849,13 +13263,13 @@ fn param_usage(em: &Emitter, def: &Func, param: &str, visiting: &mut Vec<(String
         visiting: &mut Vec<(String, String)>,
     ) -> bool {
         match e {
-            Expr::Call(callee, args, kwargs) => {
+            Expr::Call(callee, args, kwargs, _) => {
                 let gname = match &**callee {
-                    Expr::Name(n) => Some(n.clone()),
+                    Expr::Name(n, _) => Some(n.clone()),
                     _ => None,
                 };
                 for (i, a) in args.iter().enumerate() {
-                    if let Expr::Name(n) = a {
+                    if let Expr::Name(n, _) = a {
                         if n == param {
                             if let (Some(g), Some(gdef)) =
                                 (gname.clone(), gname.as_ref().and_then(|g| em.defs.get(g)))
@@ -9884,7 +13298,7 @@ fn param_usage(em: &Emitter, def: &Func, param: &str, visiting: &mut Vec<(String
                     }
                 }
                 for (k, v) in kwargs.iter() {
-                    if let Expr::Name(n) = v {
+                    if let Expr::Name(n, _) = v {
                         if n == param {
                             if let (Some(g), Some(gdef)) =
                                 (gname.clone(), gname.as_ref().and_then(|g| em.defs.get(g)))
@@ -9920,7 +13334,7 @@ fn param_usage(em: &Emitter, def: &Func, param: &str, visiting: &mut Vec<(String
                 expr_consumes(em, l, param, visiting) || expr_consumes(em, r, param, visiting)
             }
             Expr::Unary(_, i) => expr_consumes(em, i, param, visiting),
-            Expr::Index(base, idx) => {
+            Expr::Index(base, idx, _) => {
                 // Indexing the parameter itself is a read (borrow).
                 let _ = base;
                 expr_consumes(em, idx, param, visiting)
@@ -9934,7 +13348,7 @@ fn param_usage(em: &Emitter, def: &Func, param: &str, visiting: &mut Vec<(String
             Expr::MethodCall { args, .. } => {
                 args.iter().any(|a| expr_consumes(em, a, param, visiting))
             }
-            Expr::Attr(base, _) => {
+            Expr::Attr(base, _, _) => {
                 // Reading an attribute of the parameter is a read (borrow).
                 let _ = base;
                 false
@@ -9970,13 +13384,13 @@ fn param_usage(em: &Emitter, def: &Func, param: &str, visiting: &mut Vec<(String
         for s in stmts {
             let hit = match s {
                 Stmt::Assign { value, .. } => {
-                    matches!(value, Expr::Name(n) if n == param)
+                    matches!(value, Expr::Name(n, _) if n == param)
                         || expr_consumes(em, value, param, visiting)
                 }
                 Stmt::AugAssign { value, .. } => expr_consumes(em, value, param, visiting),
                 Stmt::ExprStmt { value, .. } => expr_consumes(em, value, param, visiting),
                 Stmt::Return { value, .. } => match value {
-                    Some(Expr::Name(n)) => n == param,
+                    Some(Expr::Name(n, _)) => n == param,
                     Some(e) => expr_consumes(em, e, param, visiting),
                     None => false,
                 },
@@ -9989,17 +13403,25 @@ fn param_usage(em: &Emitter, def: &Func, param: &str, visiting: &mut Vec<(String
                         .map(|b| stmts_consume(em, b, param, visiting))
                         .unwrap_or(false)
                 }
-                Stmt::While { cond, body, .. } => {
+                Stmt::While { cond, body, els, .. } => {
                     expr_consumes(em, cond, param, visiting)
                         || stmts_consume(em, body, param, visiting)
+                        || els
+                            .as_ref()
+                            .map(|b| stmts_consume(em, b, param, visiting))
+                            .unwrap_or(false)
                 }
-                Stmt::ForRange { start, stop, body, .. } => {
+                Stmt::ForRange { start, stop, body, els, .. } => {
                     start
                         .as_ref()
                         .map(|e| expr_consumes(em, e, param, visiting))
                         .unwrap_or(false)
                         || expr_consumes(em, stop, param, visiting)
                         || stmts_consume(em, body, param, visiting)
+                        || els
+                            .as_ref()
+                            .map(|b| stmts_consume(em, b, param, visiting))
+                            .unwrap_or(false)
                 }
                 Stmt::IndexAssign { value, index, .. } => {
                     expr_consumes(em, value, param, visiting)
@@ -10011,9 +13433,13 @@ fn param_usage(em: &Emitter, def: &Func, param: &str, visiting: &mut Vec<(String
                 }
                 Stmt::AttrDel { base, .. } => expr_consumes(em, base, param, visiting),
                 Stmt::Unpack { value, .. } => expr_consumes(em, value, param, visiting),
-                Stmt::ForEach { iter, body, .. } => {
+                Stmt::ForEach { iter, body, els, .. } => {
                     expr_consumes(em, iter, param, visiting)
                         || stmts_consume(em, body, param, visiting)
+                        || els
+                            .as_ref()
+                            .map(|b| stmts_consume(em, b, param, visiting))
+                            .unwrap_or(false)
                 }
                 Stmt::Try { body, handlers, els, finally, .. } => {
                     stmts_consume(em, body, param, visiting)
@@ -10066,10 +13492,13 @@ fn func_is_generator(f: &Func) -> bool {
                 arms.iter().any(|(_, b)| stmts_have_yield(b))
                     || els.as_ref().map(|b| stmts_have_yield(b)).unwrap_or(false)
             }
-            Stmt::While { body, .. }
-            | Stmt::ForRange { body, .. }
-            | Stmt::ForEach { body, .. }
-            | Stmt::With { body, .. } => stmts_have_yield(body),
+            Stmt::While { body, els, .. }
+            | Stmt::ForRange { body, els, .. }
+            | Stmt::ForEach { body, els, .. } => {
+                stmts_have_yield(body)
+                    || els.as_ref().map(|b| stmts_have_yield(b)).unwrap_or(false)
+            }
+            Stmt::With { body, .. } => stmts_have_yield(body),
             Stmt::Try {
                 body,
                 handlers,
@@ -10097,7 +13526,7 @@ fn func_is_generator(f: &Func) -> bool {
 /// D7: a generator body may only return bare / None -- a
 /// returned value would become StopIteration's payload in
 /// CPython, which psa v1 does not model (loud).
-fn gen_check_returns(stmts: &[Stmt], fname: &str, line: u32) -> Result<(), String> {
+fn gen_check_returns(stmts: &[Stmt], fname: &str, line: u32) -> Result<(), Diagnostic> {
     for s in stmts {
         match s {
             Stmt::Return { value, .. } => {
@@ -10121,10 +13550,15 @@ fn gen_check_returns(stmts: &[Stmt], fname: &str, line: u32) -> Result<(), Strin
                     gen_check_returns(b, fname, line)?;
                 }
             }
-            Stmt::While { body, .. }
-            | Stmt::ForRange { body, .. }
-            | Stmt::ForEach { body, .. }
-            | Stmt::With { body, .. } => gen_check_returns(body, fname, line)?,
+            Stmt::While { body, els, .. }
+            | Stmt::ForRange { body, els, .. }
+            | Stmt::ForEach { body, els, .. } => {
+                gen_check_returns(body, fname, line)?;
+                if let Some(b) = els {
+                    gen_check_returns(b, fname, line)?;
+                }
+            }
+            Stmt::With { body, .. } => gen_check_returns(body, fname, line)?,
             Stmt::Try {
                 body,
                 handlers,
@@ -10173,7 +13607,7 @@ fn pattern_captures(p: &Pattern) -> Vec<String> {
     out
 }
 
-fn unify_ret(ctx: &mut Ctx, ty: Ty, line: u32) -> Result<(), String> {
+fn unify_ret(ctx: &mut Ctx, ty: Ty, line: u32) -> Result<(), Diagnostic> {
     match ctx.ret {
         None => {
             ctx.ret = Some(ty);
@@ -10224,9 +13658,15 @@ fn deep_has_raise(s: &Stmt) -> bool {
             arms.iter().any(|(_, b)| b.iter().any(deep_has_raise))
                 || els.as_ref().map(|b| b.iter().any(deep_has_raise)).unwrap_or(false)
         }
-        Stmt::While { body, .. } => body.iter().any(deep_has_raise),
-        Stmt::ForRange { body, .. } => body.iter().any(deep_has_raise),
-        Stmt::ForEach { body, .. } => body.iter().any(deep_has_raise),
+        Stmt::While { body, els, .. }
+        | Stmt::ForRange { body, els, .. }
+        | Stmt::ForEach { body, els, .. } => {
+            body.iter().any(deep_has_raise)
+                || els
+                    .as_ref()
+                    .map(|b| b.iter().any(deep_has_raise))
+                    .unwrap_or(false)
+        }
         Stmt::With { body, .. } => body.iter().any(deep_has_raise),
         Stmt::Try { .. } => false,
         _ => false,
@@ -10242,7 +13682,7 @@ fn validate_try(
     handlers: &[ExcHandler],
     finally: &Option<Vec<Stmt>>,
     line: u32,
-) -> Result<(), String> {
+) -> Result<(), Diagnostic> {
     for h in handlers {
         let n = h.body.len();
         for (i, s) in h.body.iter().enumerate() {
@@ -10290,8 +13730,8 @@ fn validate_try(
 fn def_calls(stmts: &[Stmt], name: &str) -> bool {
     fn expr_calls(e: &Expr, name: &str) -> bool {
         match e {
-            Expr::Call(callee, args, kwargs) => {
-                if let Expr::Name(n) = &**callee {
+            Expr::Call(callee, args, kwargs, _) => {
+                if let Expr::Name(n, _) = &**callee {
                     if n == name {
                         return true;
                     }
@@ -10314,13 +13754,22 @@ fn def_calls(stmts: &[Stmt], name: &str) -> bool {
                 arms.iter().any(|(c, b)| expr_calls(c, name) || def_calls(b, name))
                     || els.as_ref().map(|b| def_calls(b, name)).unwrap_or(false)
             }
-            Stmt::While { cond, body, .. } => expr_calls(cond, name) || def_calls(body, name),
-            Stmt::ForRange { start, stop, body, .. } => {
+            Stmt::While { cond, body, els, .. } => {
+                expr_calls(cond, name)
+                    || def_calls(body, name)
+                    || els.as_ref().map(|b| def_calls(b, name)).unwrap_or(false)
+            }
+            Stmt::ForRange { start, stop, body, els, .. } => {
                 start.as_ref().map(|e| expr_calls(e, name)).unwrap_or(false)
                     || expr_calls(stop, name)
                     || def_calls(body, name)
+                    || els.as_ref().map(|b| def_calls(b, name)).unwrap_or(false)
             }
-            Stmt::ForEach { iter, body, .. } => expr_calls(iter, name) || def_calls(body, name),
+            Stmt::ForEach { iter, body, els, .. } => {
+                expr_calls(iter, name)
+                    || def_calls(body, name)
+                    || els.as_ref().map(|b| def_calls(b, name)).unwrap_or(false)
+            }
             Stmt::Try { body, handlers, els, finally, .. } => {
                 def_calls(body, name)
                     || handlers.iter().any(|h| def_calls(&h.body, name))
@@ -10376,15 +13825,15 @@ fn assign_line(
 /// Does the expression mention variable `name` anywhere?
 fn expr_mentions(e: &Expr, name: &str) -> bool {
     match e {
-        Expr::Name(n) => n == name,
+        Expr::Name(n, _) => n == name,
         Expr::Bin(a, _, b) => expr_mentions(a, name) || expr_mentions(b, name),
         Expr::Unary(_, a) => expr_mentions(a, name),
-        Expr::Call(f, args, kwargs) => {
+        Expr::Call(f, args, kwargs, _) => {
             expr_mentions(f, name)
                 || args.iter().any(|a| expr_mentions(a, name))
                 || kwargs.iter().any(|(_, v)| expr_mentions(v, name))
         }
-        Expr::Index(a, b) => expr_mentions(a, name) || expr_mentions(b, name),
+        Expr::Index(a, b, _) => expr_mentions(a, name) || expr_mentions(b, name),
         Expr::Slice(a, lo, hi, st) => {
             expr_mentions(a, name)
                 || [lo, hi, st]
@@ -10409,7 +13858,10 @@ fn expr_mentions(e: &Expr, name: &str) -> bool {
                     CompClause::If(cond) => expr_mentions(cond, name),
                 })
         }
-        Expr::Attr(base, _) => expr_mentions(base, name),
+        Expr::Attr(base, _, _) => expr_mentions(base, name),
+        Expr::Walrus { name: target, value } => {
+            target == name || expr_mentions(value, name)
+        }
         Expr::IfExp { cond, then, els } => {
             expr_mentions(cond, name)
                 || expr_mentions(then, name)
@@ -10417,7 +13869,7 @@ fn expr_mentions(e: &Expr, name: &str) -> bool {
         }
         Expr::FStr(parts) => parts
             .iter()
-            .any(|p| matches!(p, FStrPart::Expr(x) if expr_mentions(x, name))),
+            .any(|p| p.any_expr(&|x| expr_mentions(x, name))),
         _ => false,
     }
 }
@@ -10433,7 +13885,7 @@ fn expr_has_call(e: &Expr) -> bool {
                 || expr_has_call(b)
         }
         Expr::Unary(_, a) => expr_has_call(a),
-        Expr::Index(a, b) => expr_has_call(a) || expr_has_call(b),
+        Expr::Index(a, b, _) => expr_has_call(a) || expr_has_call(b),
         Expr::Slice(a, lo, hi, st) => {
             expr_has_call(a)
                 || [lo, hi, st]
@@ -10451,18 +13903,234 @@ fn expr_has_call(e: &Expr) -> bool {
                     CompClause::If(cond) => expr_has_call(cond),
                 })
         }
-        Expr::Attr(base, _) => expr_has_call(base),
+        Expr::Attr(base, _, _) => expr_has_call(base),
         Expr::IfExp { cond, then, els } => {
             expr_has_call(cond) || expr_has_call(then) || expr_has_call(els)
         }
         Expr::FStr(parts) => parts
             .iter()
-            .any(|p| matches!(p, FStrPart::Expr(x) if expr_has_call(x))),
+            .any(|p| p.any_expr(&|x| expr_has_call(x))),
         // An await runs the coroutine worker synchronously
         // through __psa_coro_run — a call in every sense that
         // matters here (it can leave a pending exception).
         Expr::Await(a) => expr_has_call(a),
+        Expr::Walrus { value, .. } => expr_has_call(value),
+        // D8: cell and closure nodes wrap ordinary
+        // expressions (a cell read/write is a runtime call
+        // in the emitted text, but it cannot raise a psa
+        // exception; what matters here is the wrapped
+        // expression).
+        Expr::CellNew(a) | Expr::CellGet(a) => expr_has_call(a),
+        Expr::CellSet(a, b) => expr_has_call(a) || expr_has_call(b),
+        Expr::ClosureVal(_, env) => expr_has_call(env),
+        Expr::ModEnv => false,
         _ => false,
+    }
+}
+
+/// Does the expression contain a walrus (assignment expression)
+/// anywhere? Used by the while-condition emission: only a
+/// walrus that IS the whole condition gets the per-iteration
+/// restructuring; one nested deeper is refused loudly.
+fn expr_contains_walrus(e: &Expr) -> bool {
+    match e {
+        Expr::Walrus { .. } => true,
+        Expr::Bin(a, _, b) => expr_contains_walrus(a) || expr_contains_walrus(b),
+        Expr::Unary(_, a) => expr_contains_walrus(a),
+        Expr::Call(f, args, kwargs, _) => {
+            expr_contains_walrus(f)
+                || args.iter().any(expr_contains_walrus)
+                || kwargs.iter().any(|(_, v)| expr_contains_walrus(v))
+        }
+        Expr::Index(a, b, _) => expr_contains_walrus(a) || expr_contains_walrus(b),
+        Expr::Slice(a, lo, hi, st) => {
+            expr_contains_walrus(a)
+                || [lo, hi, st]
+                    .iter()
+                    .any(|o| o.as_ref().map(|e| expr_contains_walrus(e)).unwrap_or(false))
+        }
+        Expr::MethodCall { args, .. } => args.iter().any(expr_contains_walrus),
+        Expr::ListLit(elems) | Expr::TupleLit(elems) | Expr::SetLit(elems) => {
+            elems.iter().any(expr_contains_walrus)
+        }
+        Expr::DictLit(pairs) => pairs
+            .iter()
+            .any(|(k, v)| expr_contains_walrus(k) || expr_contains_walrus(v)),
+        Expr::Comp { key, value, clauses, .. } => {
+            expr_contains_walrus(key)
+                || value.as_ref().map(|e| expr_contains_walrus(e)).unwrap_or(false)
+                || clauses.iter().any(|c| match c {
+                    CompClause::For { iter, .. } => expr_contains_walrus(iter),
+                    CompClause::If(cond) => expr_contains_walrus(cond),
+                })
+        }
+        Expr::Attr(base, _, _) => expr_contains_walrus(base),
+        Expr::IfExp { cond, then, els } => {
+            expr_contains_walrus(cond)
+                || expr_contains_walrus(then)
+                || expr_contains_walrus(els)
+        }
+        Expr::FStr(parts) => parts
+            .iter()
+            .any(|p| p.any_expr(&|x| expr_contains_walrus(x))),
+        Expr::Await(a) => expr_contains_walrus(a),
+        _ => false,
+    }
+}
+
+/// True when the expression contains a CellSet — the node a
+/// walrus with a cell / environment / global target is
+/// rewritten into by closure conversion (see rewrite_expr's
+/// Walrus arm). Scope-sensitive walrus scans that run AFTER
+/// rewriting (the generator-expression refusal in
+/// emit_genexp) must treat CellSet as a walrus: it binds the
+/// enclosing scope's cell, which the synthetic generator def
+/// cannot do on the enclosing scope's behalf.
+fn expr_contains_cellset(e: &Expr) -> bool {
+    match e {
+        Expr::CellSet(..) => true,
+        Expr::Bin(a, _, b) => expr_contains_cellset(a) || expr_contains_cellset(b),
+        Expr::Unary(_, a) => expr_contains_cellset(a),
+        Expr::Call(f, args, kwargs, _) => {
+            expr_contains_cellset(f)
+                || args.iter().any(expr_contains_cellset)
+                || kwargs.iter().any(|(_, v)| expr_contains_cellset(v))
+        }
+        Expr::Index(a, b, _) => expr_contains_cellset(a) || expr_contains_cellset(b),
+        Expr::Slice(a, lo, hi, st) => {
+            expr_contains_cellset(a)
+                || [lo, hi, st]
+                    .iter()
+                    .any(|o| o.as_ref().map(|e| expr_contains_cellset(e)).unwrap_or(false))
+        }
+        Expr::MethodCall { args, .. } => args.iter().any(expr_contains_cellset),
+        Expr::ListLit(elems) | Expr::TupleLit(elems) | Expr::SetLit(elems) => {
+            elems.iter().any(expr_contains_cellset)
+        }
+        Expr::DictLit(pairs) => pairs
+            .iter()
+            .any(|(k, v)| expr_contains_cellset(k) || expr_contains_cellset(v)),
+        Expr::Comp { key, value, clauses, .. } => {
+            expr_contains_cellset(key)
+                || value.as_ref().map(|e| expr_contains_cellset(e)).unwrap_or(false)
+                || clauses.iter().any(|c| match c {
+                    CompClause::For { iter, .. } => expr_contains_cellset(iter),
+                    CompClause::If(cond) => expr_contains_cellset(cond),
+                })
+        }
+        Expr::Attr(base, _, _) => expr_contains_cellset(base),
+        Expr::IfExp { cond, then, els } => {
+            expr_contains_cellset(cond)
+                || expr_contains_cellset(then)
+                || expr_contains_cellset(els)
+        }
+        Expr::FStr(parts) => parts
+            .iter()
+            .any(|p| p.any_expr(&|x| expr_contains_cellset(x))),
+        Expr::Await(a) => expr_contains_cellset(a),
+        Expr::CellNew(a) | Expr::CellGet(a) => expr_contains_cellset(a),
+        Expr::Walrus { value, .. } => expr_contains_cellset(value),
+        Expr::ClosureVal(_, env) => expr_contains_cellset(env),
+        _ => false,
+    }
+}
+
+/// Walrus targets inside f-string replacement fields, including
+/// fields nested inside a format spec (fstring batch: FStrPart::Field
+/// replaced the old FStrPart::Expr).
+fn collect_fstr_walrus_targets(parts: &[FStrPart], out: &mut Vec<String>) {
+    for p in parts {
+        if let FStrPart::Field { value, spec, .. } = p {
+            collect_walrus_targets(value, out);
+            if let Some(spec) = spec {
+                collect_fstr_walrus_targets(spec, out);
+            }
+        }
+    }
+}
+
+/// Collect every walrus target an expression binds, in
+/// traversal order (duplicates kept; callers deduplicate by
+/// lookup). Nested comprehensions are entered — their walrus
+/// targets bind in the containing function scope, like this
+/// expression's own (CPython's comprehension rule). Lambda
+/// bodies are NOT entered: a walrus there binds in the
+/// lambda's own scope.
+fn collect_walrus_targets(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::Walrus { name, value } => {
+            out.push(name.clone());
+            collect_walrus_targets(value, out);
+        }
+        Expr::Bin(a, _, b) => {
+            collect_walrus_targets(a, out);
+            collect_walrus_targets(b, out);
+        }
+        Expr::Unary(_, a) => collect_walrus_targets(a, out),
+        Expr::Call(f, args, kwargs, _) => {
+            collect_walrus_targets(f, out);
+            for a in args {
+                collect_walrus_targets(a, out);
+            }
+            for (_, v) in kwargs {
+                collect_walrus_targets(v, out);
+            }
+        }
+        Expr::Index(a, b, _) => {
+            collect_walrus_targets(a, out);
+            collect_walrus_targets(b, out);
+        }
+        Expr::Slice(a, lo, hi, st) => {
+            collect_walrus_targets(a, out);
+            for o in [lo, hi, st] {
+                if let Some(x) = o {
+                    collect_walrus_targets(x, out);
+                }
+            }
+        }
+        Expr::MethodCall { args, .. } => {
+            for a in args {
+                collect_walrus_targets(a, out);
+            }
+        }
+        Expr::ListLit(elems) | Expr::TupleLit(elems) | Expr::SetLit(elems) => {
+            for a in elems {
+                collect_walrus_targets(a, out);
+            }
+        }
+        Expr::DictLit(pairs) => {
+            for (k, v) in pairs {
+                collect_walrus_targets(k, out);
+                collect_walrus_targets(v, out);
+            }
+        }
+        Expr::Comp { key, value, clauses, .. } => {
+            collect_walrus_targets(key, out);
+            if let Some(v) = value {
+                collect_walrus_targets(v, out);
+            }
+            for c in clauses {
+                match c {
+                    CompClause::For { iter, .. } => collect_walrus_targets(iter, out),
+                    CompClause::If(cond) => collect_walrus_targets(cond, out),
+                }
+            }
+        }
+        Expr::Attr(base, _, _) => collect_walrus_targets(base, out),
+        Expr::IfExp { cond, then, els } => {
+            collect_walrus_targets(cond, out);
+            collect_walrus_targets(then, out);
+            collect_walrus_targets(els, out);
+        }
+        Expr::FStr(parts) => collect_fstr_walrus_targets(parts, out),
+        Expr::Await(a) => collect_walrus_targets(a, out),
+        Expr::CellNew(a) | Expr::CellGet(a) => collect_walrus_targets(a, out),
+        Expr::CellSet(a, b) => {
+            collect_walrus_targets(a, out);
+            collect_walrus_targets(b, out);
+        }
+        Expr::ClosureVal(_, env) => collect_walrus_targets(env, out),
+        _ => {}
     }
 }
 
@@ -10480,12 +14148,28 @@ fn fmt_f64(v: f64) -> String {
     if v == v.trunc() && v.abs() < 1e15 {
         format!("{:.1}", v)
     } else {
-        format!("{}", v)
+        let s = format!("{}", v);
+        // Rust's Display gives the shortest round-trip decimal,
+        // which for large integral floats is a bare integer string
+        // (2^63 prints as 9223372036854776000). SLA lexes a bare
+        // integer as an i64 first and rejects it past i64::MAX, so
+        // keep the literal visibly floating: appending `.0` parses
+        // back to the identical f64.
+        if s.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+            format!("{}.0", s)
+        } else {
+            s
+        }
     }
 }
 
 /// The D1 dynamic runtime, emitted once when any dynamic value is
-/// used. PsaVal tags: 0 = int, 1 = float, 2 = bool, 3 = None.
+/// used. PsaVal tags: 0 = int, 1 = float, 2 = bool, 3 = None,
+/// 4 = list, 5 = dict, 6 = str, 7 = fn, 8 = object, 9 = bound
+/// method, 10 = tuple, 11 = set, 12 = file, 13 = generator,
+/// 14 = coroutine, 15 = bytes (same Box<Vec<u8>> payload as
+/// str, byte-wise semantics), 16 = closure (D8; payload mirrors
+/// the bound-method layout, tag 9).
 /// The payload is split into an integer slot and a float slot (the
 /// design's single u64 payload would need an f64 bitcast primitive;
 /// the split representation has identical semantics). D1 values are
@@ -10503,6 +14187,7 @@ fn fmt_f64(v: f64) -> String {
 /// psa_std json module text (psa-std/json.sla in the repo),
 /// spliced into programs that call json.dumps / json.loads.
 const PSA_JSON_SLA: &str = include_str!("../../../psa-std/json.sla");
+const PSA_PICKLE_SLA: &str = include_str!("../../../psa-std/pickle.sla");
 
 /// psa_std math module text (psa-std/math.sla in the repo),
 /// spliced into programs that call math.<fn>.
@@ -10572,6 +14257,65 @@ const PSA_SOCKET_SLA: &str = include_str!("../../../psa-std/socket.sla");
 /// urllib.<fn>.
 const PSA_URLLIB_SLA: &str = include_str!("../../../psa-std/urllib.sla");
 
+/// D8 closures: the runtime text spliced (after
+/// DYN_RUNTIME) only into programs that use a closure, a
+/// cell or the module environment, so capture-free programs
+/// emit byte-identical text. Tag 16 is a closure value: its
+/// payload mirrors the bound-method layout (tag 9) — a heap
+/// list [box_int(callable id), env] whose pointer is the
+/// value's ipay; env is itself a dynamic list of cells. A
+/// cell is a one-element dynamic list (tag 4). The module
+/// environment — the module scope's cell list, in slot
+/// order — is published by main into the sa_std globals
+/// cell "psa.modenv" (the class-registry precedent) and
+/// fetched back by __psa_modenv; 77083 is the loud panic
+/// for a fetch before publication, which the emission
+/// order makes unreachable (PublishModEnv precedes every
+/// user statement in main).
+const CLOSURE_RUNTIME: &str = r#"fn __psa_box_closure(id: i64, env: PsaVal) -> PsaVal {
+    let xs: Vec<PsaVal> = Vec::new();
+    let p = Box::into_raw(Box::new(xs)) as i64;
+    __psa_vec_push_h(p as ptr, __psa_box_int(id));
+    __psa_vec_push_h(p as ptr, env);
+    return PsaVal { tag: 16, ipay: p, fpay: 0.0 };
+}
+
+fn __psa_closure_id(f: PsaVal) -> i64 {
+    return __psa_vec_get_h(f.ipay as ptr, 0).ipay;
+}
+
+fn __psa_closure_env(f: PsaVal) -> PsaVal {
+    return __psa_vec_get_h(f.ipay as ptr, 1);
+}
+
+fn __psa_cell_new(v: PsaVal) -> PsaVal {
+    let c = __psa_list_new();
+    __psa_list_push(c, v);
+    return c;
+}
+
+fn __psa_cell_get(c: PsaVal) -> PsaVal {
+    return __psa_list_get(c, 0);
+}
+
+fn __psa_cell_set(c: PsaVal, v: PsaVal) -> PsaVal {
+    __psa_list_set(c, 0, v);
+    return v;
+}
+
+fn __psa_modenv() -> PsaVal {
+    let out = [0u64; 1];
+    let rc = sa_global_u64_get(STR_PTR("psa.modenv"), STR_LEN("psa.modenv"), &out[0]);
+    if rc != 0 { panic(77083); };
+    return PsaVal { tag: 4, ipay: out[0] as i64, fpay: 0.0 };
+}
+
+fn __psa_modenv_set(env: PsaVal) {
+    let rc = sa_global_u64_set(STR_PTR("psa.modenv"), STR_LEN("psa.modenv"), env.ipay as u64);
+}
+
+"#;
+
 const DYN_RUNTIME: &str = r#"fn __psa_box_int(x: i64) -> PsaVal {
     return PsaVal { tag: 0, ipay: x, fpay: 0.0 };
 }
@@ -10597,11 +14341,6 @@ fn __psa_drop_stage(s: PsaStage) -> void {
     return;
 }
 
-fn __psa_as_float(v: PsaVal) -> f64 {
-    if v.tag == 1 { return v.fpay; };
-    if v.tag == 0 || v.tag == 2 { return v.ipay as f64; };
-    panic(77010);
-}
 
 fn __psa_dyn_floor_f(x: f64) -> f64 {
     if x >= 9223372036854775808.0 { return x; };
@@ -10612,192 +14351,46 @@ fn __psa_dyn_floor_f(x: f64) -> f64 {
     return qf;
 }
 
-fn __psa_dyn_add(a: PsaVal, b: PsaVal) -> PsaVal {
-    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) {
-        if b.ipay > 0 && a.ipay > 9223372036854775807 - b.ipay { panic(77080); };
-        if b.ipay < 0 && a.ipay < -9223372036854775807 - 1 - b.ipay { panic(77080); };
-        return __psa_box_int(a.ipay + b.ipay);
-    };
-    if a.tag <= 2 && b.tag <= 2 { return __psa_box_float(__psa_as_float(a) + __psa_as_float(b)); };
-    if a.tag == 6 && b.tag == 6 { return __psa_str_concat(a, b); };
-    panic(77011);
-}
 
-fn __psa_dyn_sub(a: PsaVal, b: PsaVal) -> PsaVal {
-    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) {
-        if b.ipay < 0 && a.ipay > 9223372036854775807 + b.ipay { panic(77080); };
-        if b.ipay > 0 && a.ipay < -9223372036854775807 - 1 + b.ipay { panic(77080); };
-        return __psa_box_int(a.ipay - b.ipay);
-    };
-    if a.tag <= 2 && b.tag <= 2 { return __psa_box_float(__psa_as_float(a) - __psa_as_float(b)); };
-    panic(77011);
-}
 
-fn __psa_dyn_mul(a: PsaVal, b: PsaVal) -> PsaVal {
-    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) {
-        let x = a.ipay;
-        let y = b.ipay;
-        if (x == -1 && y == -9223372036854775807 - 1) || (y == -1 && x == -9223372036854775807 - 1) { panic(77080); };
-        let r = x * y;
-        if x != 0 && r / x != y { panic(77080); };
-        return __psa_box_int(r);
-    };
-    if a.tag <= 2 && b.tag <= 2 { return __psa_box_float(__psa_as_float(a) * __psa_as_float(b)); };
-    if a.tag == 6 && (b.tag == 0 || b.tag == 2) { return __psa_str_repeat(a, b.ipay); };
-    if b.tag == 6 && (a.tag == 0 || a.tag == 2) { return __psa_str_repeat(b, a.ipay); };
-    panic(77011);
-}
 
 fn __psa_dyn_div(a: PsaVal, b: PsaVal) -> PsaVal {
     return __psa_box_float(__psa_as_float(a) / __psa_as_float(b));
 }
 
-fn __psa_dyn_floordiv(a: PsaVal, b: PsaVal) -> PsaVal {
-    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) { return __psa_box_int(__psa_floordiv(a.ipay, b.ipay)); };
-    if a.tag <= 2 && b.tag <= 2 { return __psa_box_float(__psa_dyn_floor_f(__psa_as_float(a) / __psa_as_float(b))); };
-    panic(77011);
-}
 
-fn __psa_dyn_mod(a: PsaVal, b: PsaVal) -> PsaVal {
-    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) { return __psa_box_int(__psa_floormod(a.ipay, b.ipay)); };
-    if a.tag <= 2 && b.tag <= 2 {
-        let fa = __psa_as_float(a);
-        let fb = __psa_as_float(b);
-        return __psa_box_float(fa - __psa_dyn_floor_f(fa / fb) * fb);
-    };
-    panic(77011);
-}
 
-fn __psa_dyn_pow(a: PsaVal, b: PsaVal) -> PsaVal {
-    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) && b.ipay >= 0 { return __psa_box_int(__psa_ipow(a.ipay, b.ipay)); };
-    if a.tag <= 2 && b.tag <= 2 { return __psa_box_float(sa_math_pow(__psa_as_float(a), __psa_as_float(b))); };
-    panic(77011);
-}
 
-fn __psa_dyn_eq(a: PsaVal, b: PsaVal) -> bool {
-    if a.tag == 5 && b.tag == 5 { return __psa_dict_eq(a, b); };
-    if a.tag == 5 || b.tag == 5 { return false; };
-    if a.tag == 4 && b.tag == 4 { return __psa_list_eq(a, b); };
-    if a.tag == 6 && b.tag == 6 { return __psa_str_eq(a, b); };
-    if a.tag == 10 && b.tag == 10 { return __psa_tuple_eq(a, b); };
-    if a.tag == 11 && b.tag == 11 { return __psa_set_eq(a, b); };
-    if a.tag == 8 || a.tag == 9 || b.tag == 8 || b.tag == 9 { return a.tag == b.tag && a.ipay == b.ipay; };
-    if a.tag == 3 && b.tag == 3 { return true; };
-    if a.tag <= 2 && b.tag <= 2 {
-        if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) == __psa_as_float(b); };
-        return a.ipay == b.ipay;
-    };
-    return false;
-}
 
 fn __psa_dyn_ne(a: PsaVal, b: PsaVal) -> bool {
     return !(__psa_dyn_eq(a, b));
 }
 
-fn __psa_dyn_lt(a: PsaVal, b: PsaVal) -> bool {
-    if a.tag <= 2 && b.tag <= 2 {
-        if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) < __psa_as_float(b); };
-        return a.ipay < b.ipay;
-    };
-    if a.tag == 6 && b.tag == 6 { return __psa_str_cmp(a, b) < 0; };
-    panic(77012);
+// Identity (171-B, SEMANTICS.md): tag+payload equality. For the
+// boxed kinds the ipay payload IS the heap pointer, so this is
+// pointer identity; for singletons (tag 3, tag 2) it is exact;
+// for immediates it is the documented deterministic rule. The
+// last line is the NaN clause: two NaN payloads are the same
+// payload, so a NaN is identical to itself as in CPython.
+fn __psa_dyn_is(a: PsaVal, b: PsaVal) -> bool {
+    if a.tag != b.tag { return false; };
+    if a.ipay != b.ipay { return false; };
+    if a.fpay == b.fpay { return true; };
+    return a.fpay != a.fpay && b.fpay != b.fpay;
 }
 
-fn __psa_dyn_le(a: PsaVal, b: PsaVal) -> bool {
-    if a.tag <= 2 && b.tag <= 2 {
-        if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) <= __psa_as_float(b); };
-        return a.ipay <= b.ipay;
-    };
-    if a.tag == 6 && b.tag == 6 { return __psa_str_cmp(a, b) <= 0; };
-    panic(77012);
-}
 
-fn __psa_dyn_gt(a: PsaVal, b: PsaVal) -> bool {
-    if a.tag <= 2 && b.tag <= 2 {
-        if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) > __psa_as_float(b); };
-        return a.ipay > b.ipay;
-    };
-    if a.tag == 6 && b.tag == 6 { return __psa_str_cmp(a, b) > 0; };
-    panic(77012);
-}
 
-fn __psa_dyn_ge(a: PsaVal, b: PsaVal) -> bool {
-    if a.tag <= 2 && b.tag <= 2 {
-        if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) >= __psa_as_float(b); };
-        return a.ipay >= b.ipay;
-    };
-    if a.tag == 6 && b.tag == 6 { return __psa_str_cmp(a, b) >= 0; };
-    panic(77012);
-}
 
-fn __psa_dyn_truthy(v: PsaVal) -> bool {
-    if v.tag == 0 { return v.ipay != 0; };
-    if v.tag == 1 { return v.fpay != 0.0; };
-    if v.tag == 2 { return v.ipay != 0; };
-    if v.tag == 3 { return false; };
-    if v.tag == 4 { return __psa_list_len(v) != 0; };
-    if v.tag == 5 { return __psa_dict_len(v) != 0; };
-    if v.tag == 6 { return __psa_str_bytes_len(v) != 0; };
-    if v.tag == 8 { return __psa_obj_truthy(v); };
-    if v.tag == 9 { return true; };
-    if v.tag == 10 { return __psa_vec_len_h(v.ipay as ptr) != 0; };
-    if v.tag == 11 { return __psa_vec_len_h(v.ipay as ptr) != 0; };
-    if v.tag == 12 { return true; };
-    if v.tag == 13 { return true; };
-    if v.tag == 14 { return true; };
-    panic(77010);
-}
 
-fn __psa_dyn_neg(v: PsaVal) -> PsaVal {
-    if v.tag == 0 || v.tag == 2 {
-        if v.ipay == -9223372036854775807 - 1 { panic(77080); };
-        return __psa_box_int(-(v.ipay));
-    };
-    if v.tag == 1 { return __psa_box_float(-(v.fpay)); };
-    panic(77015);
-}
 
-fn __psa_dyn_bitnot(v: PsaVal) -> PsaVal {
-    if v.tag == 0 || v.tag == 2 { return __psa_box_int((-(v.ipay) - 1)); };
-    panic(77013);
-}
 
-fn __psa_dyn_bitand(a: PsaVal, b: PsaVal) -> PsaVal {
-    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) { return __psa_box_int(a.ipay & b.ipay); };
-    panic(77013);
-}
 
-fn __psa_dyn_bitor(a: PsaVal, b: PsaVal) -> PsaVal {
-    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) { return __psa_box_int(a.ipay | b.ipay); };
-    panic(77013);
-}
 
-fn __psa_dyn_bitxor(a: PsaVal, b: PsaVal) -> PsaVal {
-    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) { return __psa_box_int(a.ipay ^ b.ipay); };
-    panic(77013);
-}
 
-fn __psa_dyn_shl(a: PsaVal, b: PsaVal) -> PsaVal {
-    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) {
-        if b.ipay < 0 || b.ipay >= 64 { panic(77014); };
-        return __psa_box_int(a.ipay << b.ipay);
-    };
-    panic(77013);
-}
 
-fn __psa_dyn_shr(a: PsaVal, b: PsaVal) -> PsaVal {
-    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) {
-        if b.ipay < 0 || b.ipay >= 64 { panic(77014); };
-        return __psa_box_int(a.ipay >> b.ipay);
-    };
-    panic(77013);
-}
 
-fn __psa_unbox_int(v: PsaVal) -> i64 {
-    if v.tag == 0 { return v.ipay; };
-    if v.tag == 2 { return v.ipay; };
-    panic(77020);
-}
+
 
 fn __psa_unbox_float(v: PsaVal) -> f64 {
     if v.tag == 1 { return v.fpay; };
@@ -10817,21 +14410,6 @@ fn __psa_print_i64(x: i64) {
     sla_print_bytes(PTR_BYTE_ADD(&buf, 0), olen[0]);
 }
 
-fn __psa_print_repr(v: PsaVal) {
-    if v.tag == 0 { __psa_print_i64(v.ipay); return; };
-    if v.tag == 2 {
-        if v.ipay != 0 { sla_print_bytes(STR_PTR("True"), STR_LEN("True")); } else { sla_print_bytes(STR_PTR("False"), STR_LEN("False")); };
-        return;
-    };
-    if v.tag == 3 { sla_print_bytes(STR_PTR("None"), STR_LEN("None")); return; };
-    if v.tag == 4 { __psa_print_list_repr(v); return; };
-    if v.tag == 6 { __psa_print_str(__psa_str_repr(v)); return; };
-    if v.tag == 5 { __psa_print_dict_repr(v); return; };
-    if v.tag == 8 { __psa_print_str(__psa_obj_repr(v)); return; };
-    if v.tag == 10 { __psa_print_tuple_repr(v); return; };
-    if v.tag == 11 { __psa_print_set_repr(v); return; };
-    panic(77058);
-}
 
 fn __psa_print_dict_repr(v: PsaVal) {
     sla_print_bytes(STR_PTR("{"), STR_LEN("{"));
@@ -10859,45 +14437,7 @@ fn __psa_print_list_repr(v: PsaVal) {
     sla_print_bytes(STR_PTR("]"), STR_LEN("]"));
 }
 
-// The no-newline half of the dynamic printer (D5), for
-// multi-argument print and sep=/end= forms.
-fn __psa_print_dyn_nl(v: PsaVal) {
-    if v.tag == 4 { __psa_print_list_repr(v); return; };
-    if v.tag == 6 { __psa_print_str(v); return; };
-    if v.tag == 5 { __psa_print_dict_repr(v); return; };
-    if v.tag == 8 { __psa_print_str(__psa_obj_str(v)); return; };
-    if v.tag == 10 { __psa_print_tuple_repr(v); return; };
-    if v.tag == 11 { __psa_print_set_repr(v); return; };
-    if v.tag == 12 { __psa_print_str(__psa_file_str(v)); return; };
-    if v.tag == 13 { __psa_print_str(__psa_str_of(v)); return; };
-    if v.tag == 14 { __psa_print_str(__psa_str_of(v)); return; };
-    if v.tag == 0 { __psa_print_i64(v.ipay); return; };
-    if v.tag == 2 {
-        if v.ipay != 0 { sla_print_bytes(STR_PTR("True"), STR_LEN("True")); } else { sla_print_bytes(STR_PTR("False"), STR_LEN("False")); };
-        return;
-    };
-    if v.tag == 3 { sla_print_bytes(STR_PTR("None"), STR_LEN("None")); return; };
-    panic(77030);
-}
 
-fn __psa_print_dyn(v: PsaVal) -> i32 {
-    if v.tag == 4 { __psa_print_list_repr(v); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
-    if v.tag == 6 { __psa_print_str(v); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
-    if v.tag == 5 { __psa_print_dict_repr(v); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
-    if v.tag == 8 { __psa_print_str(__psa_obj_str(v)); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
-    if v.tag == 10 { __psa_print_tuple_repr(v); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
-    if v.tag == 11 { __psa_print_set_repr(v); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
-    if v.tag == 12 { __psa_print_str(__psa_file_str(v)); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
-    if v.tag == 13 { __psa_print_str(__psa_str_of(v)); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
-    if v.tag == 14 { __psa_print_str(__psa_str_of(v)); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
-    if v.tag == 0 { __psa_print_i64(v.ipay); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
-    if v.tag == 2 {
-        if v.ipay != 0 { println("True"); } else { println("False"); };
-        return 0;
-    };
-    if v.tag == 3 { println("None"); return 0; };
-    panic(77030);
-}
 
 fn __psa_vec_push_h(p: ptr, x: PsaVal) {
     let b = unsafe { Box::from_raw(p as *Vec<PsaVal>) };
@@ -10975,6 +14515,7 @@ fn __psa_dyn_len(v: PsaVal) -> i64 {
     if v.tag == 4 { return __psa_list_len(v); };
     if v.tag == 5 { return __psa_dict_len(v); };
     if v.tag == 6 { return __psa_str_len(v); };
+    if v.tag == 15 { return __psa_str_bytes_len(v); };
     if v.tag == 10 { return __psa_vec_len_h(v.ipay as ptr); };
     if v.tag == 11 { return __psa_vec_len_h(v.ipay as ptr); };
     panic(77052);
@@ -11087,21 +14628,6 @@ fn __psa_dict_new() -> PsaVal {
     return PsaVal { tag: 5, ipay: Box::into_raw(Box::new(xs)) as i64, fpay: 0.0 };
 }
 
-// Python key equivalence: the numeric family (int/float/bool)
-// compares by value across tags (1 == True == 1.0 are one key),
-// None equals only None, str compares by content. Container keys
-// never match (they are refused at set time, panic 77066).
-fn __psa_key_eq(a: PsaVal, b: PsaVal) -> bool {
-    if a.tag <= 2 && b.tag <= 2 {
-        if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) == __psa_as_float(b); };
-        return a.ipay == b.ipay;
-    };
-    if a.tag == 3 && b.tag == 3 { return true; };
-    if a.tag == 6 && b.tag == 6 { return __psa_str_eq(a, b); };
-    if a.tag == 10 && b.tag == 10 { return __psa_tuple_key_eq(a, b); };
-    if a.tag == 8 && b.tag == 8 { return a.ipay == b.ipay; };
-    return false;
-}
 
 // Entries-vec offset of the live entry whose key equals k, or -1.
 // Tombstone slots never match: their key tag is 4 and key_eq
@@ -11208,6 +14734,7 @@ fn __psa_dyn_get(v: PsaVal, k: PsaVal) -> PsaVal {
     if v.tag == 4 { return __psa_list_get(v, __psa_key_int(k)); };
     if v.tag == 5 { return __psa_dict_get(v, k); };
     if v.tag == 6 { return __psa_str_get_cp(v, __psa_key_int(k)); };
+    if v.tag == 15 { return __psa_bytes_get(v, __psa_key_int(k)); };
     if v.tag == 10 { return __psa_tuple_get(v, __psa_key_int(k)); };
     panic(77052);
 }
@@ -11216,6 +14743,7 @@ fn __psa_dyn_set(v: PsaVal, k: PsaVal, x: PsaVal) {
     if v.tag == 4 { __psa_list_set(v, __psa_key_int(k), x); return; };
     if v.tag == 5 { __psa_dict_set(v, k, x); return; };
     if v.tag == 6 { panic(77063); };
+    if v.tag == 15 { panic(77063); };
     panic(77052);
 }
 
@@ -11226,6 +14754,21 @@ fn __psa_dyn_contains(v: PsaVal, x: PsaVal) -> bool {
         if x.tag != 6 { panic(77062); };
         return __psa_str_contains(v, x);
     };
+    if v.tag == 15 {
+        if x.tag == 15 { return __psa_str_contains(v, x); };
+        if x.tag == 0 || x.tag == 2 {
+            // CPython also allows an int needle: `97 in b"abc"`.
+            if x.ipay < 0 || x.ipay > 255 { panic(77062); };
+            let n = __psa_str_bytes_len(v);
+            let i: i64 = 0;
+            while i < n {
+                if __psa_bytes_get_h(v.ipay as ptr, i) as i64 == x.ipay { return true; };
+                i = i + 1;
+            }
+            return false;
+        };
+        panic(77062);
+    };
     if v.tag == 10 { return __psa_tuple_contains(v, x); };
     if v.tag == 11 { return __psa_set_contains(v, x); };
     panic(77052);
@@ -11234,6 +14777,7 @@ fn __psa_dyn_contains(v: PsaVal, x: PsaVal) -> bool {
 fn __psa_iter_get(v: PsaVal, i: i64) -> PsaVal {
     if v.tag == 4 { return __psa_list_get(v, i); };
     if v.tag == 6 { return __psa_str_get_cp(v, i); };
+    if v.tag == 15 { return __psa_bytes_get(v, i); };
     if v.tag == 5 { return __psa_dict_key_at(v, i); };
     if v.tag == 10 { return __psa_tuple_get(v, i); };
     if v.tag == 11 { return __psa_vec_get_h(v.ipay as ptr, i); };
@@ -11272,6 +14816,116 @@ fn __psa_str_push(s: PsaVal, b: u8) -> PsaVal {
 
 fn __psa_str_bytes_len(v: PsaVal) -> i64 {
     return __psa_bytes_len_h(v.ipay as ptr);
+}
+
+// Bytes values (tag 15): the same Box<Vec<u8>> payload as a
+// dynamic string, but every operation is byte-wise (CPython
+// bytes semantics): indexing yields an int, len() counts
+// bytes, equality/ordering compare raw bytes, and printing
+// uses the b'...' repr form.
+
+fn __psa_bytes_new() -> PsaVal {
+    let xs: Vec<u8> = Vec::new();
+    return PsaVal { tag: 15, ipay: Box::into_raw(Box::new(xs)) as i64, fpay: 0.0 };
+}
+
+fn __psa_bytes_convert(v: PsaVal) -> PsaVal {
+    // bytes(x) for a dynamic x: an exact bytes value passes
+    // through unchanged (CPython returns the same object,
+    // and psa bytes are immutable, so aliasing is exact).
+    // Every other dynamic kind -- a str with no encoding
+    // argument, an int count, an iterable of ints -- is a
+    // registered gap (bytes constructor forms) and refuses
+    // loudly with the shared gap code instead of guessing
+    // a conversion.
+    if v.tag == 15 { return v; };
+    panic(77148);
+}
+
+fn __psa_bytes_get(v: PsaVal, idx: i64) -> PsaVal {
+    let n = __psa_str_bytes_len(v);
+    let j = idx;
+    if j < 0 { j = j + n; };
+    if j < 0 || j >= n { panic(77050); };
+    return __psa_box_int(__psa_bytes_get_h(v.ipay as ptr, j) as i64);
+}
+
+fn __psa_bytes_concat(a: PsaVal, b: PsaVal) -> PsaVal {
+    let out = __psa_bytes_new();
+    let na = __psa_str_bytes_len(a);
+    let i: i64 = 0;
+    while i < na { out = __psa_str_push(out, __psa_bytes_get_h(a.ipay as ptr, i)); i = i + 1; }
+    let nb = __psa_str_bytes_len(b);
+    let k: i64 = 0;
+    while k < nb { out = __psa_str_push(out, __psa_bytes_get_h(b.ipay as ptr, k)); k = k + 1; }
+    return out;
+}
+
+fn __psa_bytes_repeat(a: PsaVal, n: i64) -> PsaVal {
+    let out = __psa_bytes_new();
+    let r: i64 = 0;
+    while r < n {
+        let na = __psa_str_bytes_len(a);
+        let i: i64 = 0;
+        while i < na { out = __psa_str_push(out, __psa_bytes_get_h(a.ipay as ptr, i)); i = i + 1; }
+        r = r + 1;
+    }
+    return out;
+}
+
+fn __psa_bytes_slice(v: PsaVal, lo: PsaVal, hi: PsaVal, step: PsaVal) -> PsaVal {
+    let n = __psa_str_bytes_len(v);
+    let (start, stop, stp) = __psa_slice_bounds(n, __psa_slice_idx(lo), lo.tag != 3, __psa_slice_idx(hi), hi.tag != 3, __psa_slice_idx(step), step.tag != 3);
+    let out = __psa_bytes_new();
+    let i = start;
+    if stp > 0 {
+        while i < stop { out = __psa_str_push(out, __psa_bytes_get_h(v.ipay as ptr, i)); i = i + stp; }
+    } else {
+        while i > stop { out = __psa_str_push(out, __psa_bytes_get_h(v.ipay as ptr, i)); i = i + stp; }
+    };
+    return out;
+}
+
+fn __psa_bytes_repr(v: PsaVal) -> PsaVal {
+    // CPython bytes repr: a b prefix, then the str repr quote
+    // choice (single quotes unless the payload has a single
+    // quote and no double quote); printable ASCII passes
+    // through, backslash / the quote char / \t \n \r are
+    // escaped, every other byte becomes \xNN.
+    let n = __psa_str_bytes_len(v);
+    let has_sq = false;
+    let has_dq = false;
+    let i: i64 = 0;
+    while i < n {
+        let b = __psa_bytes_get_h(v.ipay as ptr, i);
+        if b == 39 { has_sq = true; };
+        if b == 34 { has_dq = true; };
+        i = i + 1;
+    }
+    let q: u8 = 39;
+    if has_sq && !has_dq { q = 34; };
+    let out = __psa_str_new();
+    out = __psa_str_push(out, 98);
+    out = __psa_str_push(out, q);
+    let k: i64 = 0;
+    while k < n {
+        let b = __psa_bytes_get_h(v.ipay as ptr, k);
+        if b == 92 { out = __psa_str_push(out, 92); out = __psa_str_push(out, 92); }
+        else if b == q { out = __psa_str_push(out, 92); out = __psa_str_push(out, q); }
+        else if b == 10 { out = __psa_str_push(out, 92); out = __psa_str_push(out, 110); }
+        else if b == 9 { out = __psa_str_push(out, 92); out = __psa_str_push(out, 116); }
+        else if b == 13 { out = __psa_str_push(out, 92); out = __psa_str_push(out, 114); }
+        else if b < 32 || b >= 127 {
+            out = __psa_str_push(out, 92);
+            out = __psa_str_push(out, 120);
+            out = __psa_str_push(out, __psa_hex_digit((b >> 4) as i64));
+            out = __psa_str_push(out, __psa_hex_digit((b & 15) as i64));
+        }
+        else { out = __psa_str_push(out, b); };
+        k = k + 1;
+    }
+    out = __psa_str_push(out, q);
+    return out;
 }
 
 fn __psa_str_len(v: PsaVal) -> i64 {
@@ -11540,6 +15194,7 @@ fn __psa_str_slice(v: PsaVal, lo: PsaVal, hi: PsaVal, step: PsaVal) -> PsaVal {
 fn __psa_dyn_slice(v: PsaVal, lo: PsaVal, hi: PsaVal, step: PsaVal) -> PsaVal {
     if v.tag == 4 { return __psa_list_slice(v, lo, hi, step); };
     if v.tag == 6 { return __psa_str_slice(v, lo, hi, step); };
+    if v.tag == 15 { return __psa_bytes_slice(v, lo, hi, step); };
     if v.tag == 10 { return __psa_tuple_slice(v, lo, hi, step); };
     panic(77052);
 }
@@ -11714,7 +15369,7 @@ fn __psa_print_set_repr(v: PsaVal) {
 // on a mismatch; psa panics 77077).
 
 fn __psa_unpack_check(v: PsaVal, n: i64) {
-    if v.tag == 4 || v.tag == 5 || v.tag == 6 || v.tag == 10 || v.tag == 11 {
+    if v.tag == 4 || v.tag == 5 || v.tag == 6 || v.tag == 10 || v.tag == 11 || v.tag == 15 {
         if __psa_dyn_len(v) != n { panic(77077); };
         return;
     };
@@ -11920,6 +15575,10 @@ fn __psa_type_base_name(v: PsaVal) -> PsaVal {
         out = __psa_str_push(out, 115u8); __psa_str_push(out, 116u8); __psa_str_push(out, 114u8);
         return out;
     };
+    if v.tag == 15 {
+        out = __psa_str_push(out, 98u8); __psa_str_push(out, 121u8); __psa_str_push(out, 116u8); __psa_str_push(out, 101u8); __psa_str_push(out, 115u8);
+        return out;
+    };
     if v.tag == 7 {
         out = __psa_str_push(out, 102u8); __psa_str_push(out, 117u8); __psa_str_push(out, 110u8); __psa_str_push(out, 99u8); __psa_str_push(out, 116u8); __psa_str_push(out, 105u8); __psa_str_push(out, 111u8); __psa_str_push(out, 110u8);
         return out;
@@ -11979,6 +15638,7 @@ fn __psa_type_name(v: PsaVal) -> PsaVal {
 // builders -- both panic 77030 rather than print a wrong text.
 fn __psa_str_of(v: PsaVal) -> PsaVal {
     if v.tag == 6 { return v; };
+    if v.tag == 15 { return __psa_bytes_repr(v); };
     if v.tag == 0 { return __psa_str_from_i64(v.ipay); };
     if v.tag == 2 { return __psa_str_from_bool(v.ipay != 0); };
     if v.tag == 3 {
@@ -12001,6 +15661,7 @@ fn __psa_str_of(v: PsaVal) -> PsaVal {
         out = __psa_str_push(out, 60u8); out = __psa_str_push(out, 99u8); out = __psa_str_push(out, 111u8); out = __psa_str_push(out, 114u8); out = __psa_str_push(out, 111u8); out = __psa_str_push(out, 117u8); out = __psa_str_push(out, 116u8); out = __psa_str_push(out, 105u8); out = __psa_str_push(out, 110u8); out = __psa_str_push(out, 101u8); out = __psa_str_push(out, 32u8); out = __psa_str_push(out, 111u8); out = __psa_str_push(out, 98u8); out = __psa_str_push(out, 106u8); out = __psa_str_push(out, 101u8); out = __psa_str_push(out, 99u8); out = __psa_str_push(out, 116u8); out = __psa_str_push(out, 62u8);
         return out;
     };
+    if v.tag == 17 { return __psa_big_to_psastr(v); };
     panic(77030);
 }
 
@@ -12010,6 +15671,7 @@ fn __psa_to_int(v: PsaVal) -> i64 {
     if v.tag == 2 { return v.ipay; };
     if v.tag == 1 { return v.fpay as i64; };
     if v.tag == 6 { return __psa_str_to_int(v); };
+    if v.tag == 17 { panic(77080); };
     panic(77075);
 }
 
@@ -12018,6 +15680,7 @@ fn __psa_to_float(v: PsaVal) -> f64 {
     if v.tag == 0 { return v.ipay as f64; };
     if v.tag == 2 { return v.ipay as f64; };
     if v.tag == 6 { return __psa_str_to_float(v); };
+    if v.tag == 17 { return __psa_big_as_float(v); };
     panic(77075);
 }
 
@@ -12060,13 +15723,14 @@ fn __psa_set_from(v: PsaVal) -> PsaVal {
 
 // isinstance against a builtin type code (D5): 0 int (bool
 // counts, as in CPython), 1 float, 2 bool, 3 str, 4 list,
-// 5 dict, 6 tuple, 7 set, 8 object, 9 NoneType.
+// 5 dict, 6 tuple, 7 set, 8 object, 9 NoneType, 10 bytes.
 
 fn __psa_is_type(v: PsaVal, code: i64) -> bool {
     if code == 0 { return v.tag == 0 || v.tag == 2; };
     if code == 1 { return v.tag == 1; };
     if code == 2 { return v.tag == 2; };
     if code == 3 { return v.tag == 6; };
+    if code == 10 { return v.tag == 15; };
     if code == 4 { return v.tag == 4; };
     if code == 5 { return v.tag == 5; };
     if code == 6 { return v.tag == 10; };
@@ -12803,6 +16467,855 @@ fn __psa_m_isalpha(v: PsaVal, name: PsaVal, args: PsaVal) -> PsaVal {
 
 "#;
 
+/// Arbitrary-precision int runtime (bigint batch): PART 1 glue
+/// plus PART 2 replacement bodies for the DYN_RUNTIME operators
+/// (the master copies were removed from DYN_RUNTIME at merge).
+/// Emitted under the same used_dyn gate as DYN_RUNTIME, plus
+/// the merge-added __psa_dyn_int glue (M9) at the end.
+const BIG_RUNTIME: &str = r#"// =====================================================================
+// BIG_RUNTIME — psa dyn arbitrary-precision int (PsaVal tag 17).
+//
+// Merge shape (see ../NOTES.md for the full checklist):
+//   * This text becomes a new const BIG_RUNTIME in emit.rs, emitted
+//     immediately AFTER DYN_RUNTIME under the same gate
+//     (emit.rs:844 `out.push_str(DYN_RUNTIME);`).
+//   * Header imports (emit.rs:792-815): add, under the same gate,
+//         @import "sla_std/bigint.sla"
+//     sla_std/bigint.sla is present, byte-identical, in both trees
+//     (sa_plugin_sla/sla_std/bigint.sla and sla/sla_std/bigint.sla,
+//     md5 1bb52dd26bedccf2f469b37160cf402b).
+//   * PART 1 below is new glue. PART 2 is FULL REPLACEMENT bodies for
+//     existing DYN_RUNTIME functions (copy-replace at merge); each is
+//     the master body plus its tag-17 branches, nothing else changed.
+//
+// Canonical form invariant: tag 17 carries ONLY values outside the
+// i64 range; every int-producing path returns through __psa_big_norm,
+// which demotes in-range results to tag 0. See ../SEMANTICS.md.
+// =====================================================================
+
+// ---------------------------------------------------------------------
+// PART 1 — glue
+// ---------------------------------------------------------------------
+
+// Read the sign of a boxed bigint without cloning the magnitude.
+fn __psa_big_sign(v: PsaVal) -> i64 {
+    let b = unsafe { Box::from_raw(v.ipay as *BigInt) };
+    let s = (*b).sign;
+    let rp: i64 = Box::into_raw(b) as i64;
+    return s;
+}
+
+// Clone the BigInt out of a tag-17 value (box round-trip idiom, same
+// as __psa_vec_get_h).
+fn __psa_big_unbox(v: PsaVal) -> BigInt {
+    let b = unsafe { Box::from_raw(v.ipay as *BigInt) };
+    let out = BigInt { sign: (*b).sign, mag: clone_mag(&(*b).mag) };
+    let rp: i64 = Box::into_raw(b) as i64;
+    return out;
+}
+
+// Any int-flavoured PsaVal (tag 0, 2 or 17) as a BigInt.
+fn __psa_big_val(v: PsaVal) -> BigInt {
+    if v.tag == 17 { return __psa_big_unbox(v); };
+    return big_from_i64(v.ipay);
+}
+
+fn __psa_big_box(b: BigInt) -> PsaVal {
+    return PsaVal { tag: 17, ipay: Box::into_raw(Box::new(b)) as i64, fpay: 0.0 };
+}
+
+// Does b fit the i64 range? Bound limbs (base 10^9, little-endian):
+//   i64::MAX  = 9223372036854775807 -> [854775807, 223372036, 9]
+//   |i64::MIN| = 9223372036854775808 -> [854775808, 223372036, 9]
+fn __psa_big_fits(b: BigInt) -> bool {
+    let n = len(b.mag);
+    if n <= 2 { return true; };
+    if n > 3 { return false; };
+    if b.mag[2] != 9 { return b.mag[2] < 9; };
+    if b.mag[1] != 223372036 { return b.mag[1] < 223372036; };
+    if b.sign < 0 { return b.mag[0] <= 854775808; };
+    return b.mag[0] <= 854775807;
+}
+
+// Precondition: __psa_big_fits(b). Accumulates negatively so the
+// i64::MIN magnitude (2^63) never overflows a positive intermediate.
+fn __psa_big_extract(b: BigInt) -> i64 {
+    let v: i64 = 0;
+    let i = len(b.mag);
+    while i > 0 {
+        i = i - 1;
+        v = v * 1000000000 - b.mag[i];
+    }
+    if b.sign > 0 { return -v; };
+    return v;
+}
+
+// The norm gate: EVERY int-producing dyn path returns through here.
+fn __psa_big_norm(b: BigInt) -> PsaVal {
+    if b.sign == 0 { return __psa_box_int(0); };
+    if __psa_big_fits(b) { return __psa_box_int(__psa_big_extract(b)); };
+    return __psa_big_box(b);
+}
+
+// Decimal text of a tag-17 value as a psa str (tag 6).
+fn __psa_big_to_psastr(v: PsaVal) -> PsaVal {
+    let b = __psa_big_unbox(v);
+    let s = big_to_decimal_str(&b);
+    let bs = s.as_bytes();
+    let out = __psa_str_new();
+    let i = 0;
+    while i < len(bs) {
+        out = __psa_str_push(out, bs[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+// Parse a psa str (tag 6, optional leading - or +) into a normed int.
+// Used for big literals (emit boxes the digit text as a tag-6 value)
+// and for int(str) results that overflow i64.
+fn __psa_big_from_psastr(v: PsaVal) -> PsaVal {
+    let n = __psa_str_bytes_len(v);
+    let digits: Vec<i64> = Vec::new();
+    let sign = 1;
+    let i = 0;
+    if n > 0 {
+        let c0 = __psa_str_byte(v, 0);
+        if c0 == 45 { sign = -1; i = 1; } else if c0 == 43 { i = 1; };
+    };
+    while i < n {
+        digits.push(__psa_str_byte(v, i) - 48);
+        i = i + 1;
+    }
+    return __psa_big_norm(big_from_digits(&digits, sign));
+}
+
+fn __psa_big_add(a: PsaVal, b: PsaVal) -> PsaVal {
+    let x = __psa_big_val(a);
+    let y = __psa_big_val(b);
+    return __psa_big_norm(big_add(&x, &y));
+}
+
+fn __psa_big_sub(a: PsaVal, b: PsaVal) -> PsaVal {
+    let x = __psa_big_val(a);
+    let y = __psa_big_val(b);
+    return __psa_big_norm(big_sub(&x, &y));
+}
+
+fn __psa_big_mul(a: PsaVal, b: PsaVal) -> PsaVal {
+    let x = __psa_big_val(a);
+    let y = __psa_big_val(b);
+    return __psa_big_norm(big_mul(&x, &y));
+}
+
+// sla_std big_divmod is already floor division (quotient rounded
+// toward -inf, remainder takes the divisor's sign — see the sign
+// adjustment at the tail of big_divmod in sla_std/bigint.sla), i.e.
+// exactly CPython // and %. Division by zero panics inside
+// big_divmod (sla_std panic 9001); see NOTES open point O2.
+fn __psa_big_floordiv(a: PsaVal, b: PsaVal) -> PsaVal {
+    let x = __psa_big_val(a);
+    let y = __psa_big_val(b);
+    let d = big_divmod(&x, &y);
+    return __psa_big_norm(d.q);
+}
+
+fn __psa_big_floormod(a: PsaVal, b: PsaVal) -> PsaVal {
+    let x = __psa_big_val(a);
+    let y = __psa_big_val(b);
+    let d = big_divmod(&x, &y);
+    return __psa_big_norm(d.r);
+}
+
+fn __psa_big_cmp(a: PsaVal, b: PsaVal) -> i64 {
+    let x = __psa_big_val(a);
+    let y = __psa_big_val(b);
+    return big_cmp(&x, &y);
+}
+
+// 2^k as a BigInt, k >= 0. Resource bound (SEMANTICS §7): results
+// past ~2^20 limbs (~31.4M bits) are refused with the overflow code.
+fn __psa_big_pow2(k: i64) -> BigInt {
+    if k > 31457280 { panic(77080); };
+    let r = big_one();
+    let base = big_from_i64(2);
+    let n = k;
+    while n > 0 {
+        if (n & 1) == 1 { r = big_mul(&r, &base); };
+        n = n >> 1;
+        if n > 0 {
+            let sq = BigInt { sign: base.sign, mag: clone_mag(&base.mag) };
+            base = big_mul(&base, &sq);
+        };
+    }
+    return r;
+}
+
+// Bigint power. Caller guarantees the exponent is a tag-0/2 value
+// >= 0; a tag-17 exponent is refused (SEMANTICS §7).
+fn __psa_big_pow(a: PsaVal, e: PsaVal) -> PsaVal {
+    if e.tag == 17 { panic(77080); };
+    let base = __psa_big_val(a);
+    let r = big_one();
+    let n = e.ipay;
+    while n > 0 {
+        if (n & 1) == 1 {
+            r = big_mul(&r, &base);
+            if len(r.mag) > 1048576 { panic(77080); };
+        };
+        n = n >> 1;
+        if n > 0 {
+            let sq = BigInt { sign: base.sign, mag: clone_mag(&base.mag) };
+            base = big_mul(&base, &sq);
+            if len(base.mag) > 1048576 { panic(77080); };
+        };
+    }
+    return __psa_big_norm(r);
+}
+
+fn __psa_big_shl(a: PsaVal, k: i64) -> PsaVal {
+    if k < 0 { panic(77014); };
+    let x = __psa_big_val(a);
+    let m = __psa_big_pow2(k);
+    return __psa_big_norm(big_mul(&x, &m));
+}
+
+// Arithmetic shift right == floor division by 2^k (CPython).
+fn __psa_big_shr(a: PsaVal, k: i64) -> PsaVal {
+    if k < 0 { panic(77014); };
+    let x = __psa_big_val(a);
+    let m = __psa_big_pow2(k);
+    let d = big_divmod(&x, &m);
+    return __psa_big_norm(d.q);
+}
+
+// Checked i64 power returning a PsaVal: the fast path stays in i64
+// (per-step checks identical in shape to __psa_dyn_mul's), overflow
+// promotes to the bigint path. Replaces the dyn use of __psa_ipow,
+// which wraps silently on overflow (pre-existing dyn defect, fixed
+// here for the dyn path only; the static path keeps __psa_ipow).
+fn __psa_ipow2(a: i64, e: i64) -> PsaVal {
+    let r: i64 = 1;
+    let b = a;
+    let n = e;
+    while n > 0 {
+        if (n & 1) == 1 {
+            if (r == -1 && b == -9223372036854775807 - 1) || (b == -1 && r == -9223372036854775807 - 1) {
+                return __psa_big_pow(__psa_box_int(a), __psa_box_int(e));
+            };
+            let t = r * b;
+            if r != 0 && t / r != b {
+                return __psa_big_pow(__psa_box_int(a), __psa_box_int(e));
+            };
+            r = t;
+        };
+        n = n >> 1;
+        if n > 0 {
+            let t = b * b;
+            if b != 0 && t / b != b {
+                return __psa_big_pow(__psa_box_int(a), __psa_box_int(e));
+            };
+            b = t;
+        };
+    }
+    return __psa_box_int(r);
+}
+
+// tag-17 -> f64 with CPython OverflowError semantics: a magnitude
+// past f64::MAX panics 77080 (its registered cp_surface IS
+// OverflowError). The bound is exact: f64::MAX as an integer is
+// 2^1024 - 2^971, built with the glue's own pow2 and compared in
+// the bigint domain — no decimal-string constants needed.
+fn __psa_big_as_float(v: PsaVal) -> f64 {
+    let b = __psa_big_unbox(v);
+    let hi = __psa_big_pow2(1024);
+    let lo = __psa_big_pow2(971);
+    let maxf = big_sub(&hi, &lo);
+    let ab = big_abs(&b);
+    if big_cmp(&ab, &maxf) > 0 { panic(77080); };
+    if b.sign == 0 { return 0.0; };
+    // Exact conversion (compile-batch fix for the staging O3 verify
+    // point: the decimal-string route through the naive
+    // __psa_str_to_float drifted an ulp on float(2^63)). Extract
+    // the top 53 bits with big_divmod, round to nearest (ties to
+    // even) in the integer domain, then scale by a power of two,
+    // which is exact in f64.
+    let top = ab.mag[len(ab.mag) - 1];
+    let td = 0;
+    let t = top;
+    while t > 0 {
+        td = td + 1;
+        t = t / 10;
+    }
+    let d = (len(ab.mag) - 1) * 9 + td;
+    let e = (d - 1) * 3321928 / 1000000;
+    let p = __psa_big_pow2(e);
+    while big_cmp(&ab, &p) < 0 {
+        e = e - 1;
+        p = __psa_big_pow2(e);
+    }
+    let p2 = __psa_big_pow2(e + 1);
+    while big_cmp(&ab, &p2) >= 0 {
+        e = e + 1;
+        p2 = __psa_big_pow2(e + 1);
+    }
+    let s = e - 52;
+    let q: i64 = 0;
+    if s >= 0 {
+        let ps = __psa_big_pow2(s);
+        let dm = big_divmod(&ab, &ps);
+        q = __psa_big_extract(dm.q);
+        if s > 0 {
+            let half = __psa_big_pow2(s - 1);
+            let c = big_cmp(&dm.r, &half);
+            if c > 0 || (c == 0 && (q & 1) == 1) { q = q + 1; };
+        };
+        if q == 9007199254740992 {
+            q = q / 2;
+            e = e + 1;
+        };
+    } else {
+        q = __psa_big_extract(ab);
+    };
+    let f = q as f64;    let sc = e - 52;
+    let i = 0;
+    if sc >= 0 {
+        while i < sc {
+            f = f * 2.0;
+            i = i + 1;
+        }
+    } else {
+        while i < (0 - sc) {
+            f = f / 2.0;
+            i = i + 1;
+        }
+    };
+    if b.sign < 0 { return 0.0 - f; };
+    return f;
+}
+
+// ---------------------------------------------------------------------
+// PART 2 — replacement bodies for DYN_RUNTIME functions.
+// Each is the master body with tag-17 branches added; all other
+// branches are byte-identical to master.
+// ---------------------------------------------------------------------
+
+// REPLACES __psa_as_float (emit.rs DYN_RUNTIME): tag 17 added.
+fn __psa_as_float(v: PsaVal) -> f64 {
+    if v.tag == 1 { return v.fpay; };
+    if v.tag == 0 || v.tag == 2 { return v.ipay as f64; };
+    if v.tag == 17 { return __psa_big_as_float(v); };
+    panic(77010);
+}
+
+// REPLACES __psa_dyn_add: i64 overflow promotes instead of
+// panic(77080); tag 17 goes to the bigint path.
+fn __psa_dyn_add(a: PsaVal, b: PsaVal) -> PsaVal {
+    if a.tag == 1 && (b.tag == 0 || b.tag == 2 || b.tag == 17) { return __psa_box_float(__psa_as_float(a) + __psa_as_float(b)); };
+    if b.tag == 1 && (a.tag == 0 || a.tag == 2 || a.tag == 17) { return __psa_box_float(__psa_as_float(a) + __psa_as_float(b)); };
+    if a.tag == 17 || b.tag == 17 { return __psa_big_add(a, b); };
+    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) {
+        if b.ipay > 0 && a.ipay > 9223372036854775807 - b.ipay { return __psa_big_add(a, b); };
+        if b.ipay < 0 && a.ipay < -9223372036854775807 - 1 - b.ipay { return __psa_big_add(a, b); };
+        return __psa_box_int(a.ipay + b.ipay);
+    };
+    if a.tag <= 2 && b.tag <= 2 { return __psa_box_float(__psa_as_float(a) + __psa_as_float(b)); };
+    if a.tag == 6 && b.tag == 6 { return __psa_str_concat(a, b); };
+    if a.tag == 15 && b.tag == 15 { return __psa_bytes_concat(a, b); };
+    panic(77011);
+}
+
+// REPLACES __psa_dyn_sub: same promotion rule.
+fn __psa_dyn_sub(a: PsaVal, b: PsaVal) -> PsaVal {
+    if a.tag == 1 && (b.tag == 0 || b.tag == 2 || b.tag == 17) { return __psa_box_float(__psa_as_float(a) - __psa_as_float(b)); };
+    if b.tag == 1 && (a.tag == 0 || a.tag == 2 || a.tag == 17) { return __psa_box_float(__psa_as_float(a) - __psa_as_float(b)); };
+    if a.tag == 17 || b.tag == 17 { return __psa_big_sub(a, b); };
+    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) {
+        if b.ipay < 0 && a.ipay > 9223372036854775807 + b.ipay { return __psa_big_sub(a, b); };
+        if b.ipay > 0 && a.ipay < -9223372036854775807 - 1 + b.ipay { return __psa_big_sub(a, b); };
+        return __psa_box_int(a.ipay - b.ipay);
+    };
+    if a.tag <= 2 && b.tag <= 2 { return __psa_box_float(__psa_as_float(a) - __psa_as_float(b)); };
+    panic(77011);
+}
+
+// REPLACES __psa_dyn_mul: same promotion rule; str/bytes repeat
+// counts may now be tag 17 — a repeat count past i64 is refused
+// (CPython would attempt an astronomically large allocation).
+fn __psa_dyn_mul(a: PsaVal, b: PsaVal) -> PsaVal {
+    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) {
+        let x = a.ipay;
+        let y = b.ipay;
+        if (x == -1 && y == -9223372036854775807 - 1) || (y == -1 && x == -9223372036854775807 - 1) { return __psa_big_mul(a, b); };
+        let r = x * y;
+        if x != 0 && r / x != y { return __psa_big_mul(a, b); };
+        return __psa_box_int(r);
+    };
+    if a.tag == 17 || b.tag == 17 {
+        if a.tag == 1 && (b.tag == 0 || b.tag == 2 || b.tag == 17) { return __psa_box_float(__psa_as_float(a) * __psa_as_float(b)); };
+        if b.tag == 1 && (a.tag == 0 || a.tag == 2 || a.tag == 17) { return __psa_box_float(__psa_as_float(a) * __psa_as_float(b)); };
+        if a.tag == 6 || b.tag == 6 || a.tag == 15 || b.tag == 15 { panic(77080); };
+        return __psa_big_mul(a, b);
+    };
+    if a.tag <= 2 && b.tag <= 2 { return __psa_box_float(__psa_as_float(a) * __psa_as_float(b)); };
+    if a.tag == 6 && (b.tag == 0 || b.tag == 2) { return __psa_str_repeat(a, b.ipay); };
+    if b.tag == 6 && (a.tag == 0 || a.tag == 2) { return __psa_str_repeat(b, a.ipay); };
+    if a.tag == 15 && (b.tag == 0 || b.tag == 2) { return __psa_bytes_repeat(a, b.ipay); };
+    if b.tag == 15 && (a.tag == 0 || a.tag == 2) { return __psa_bytes_repeat(b, a.ipay); };
+    panic(77011);
+}
+
+// REPLACES __psa_dyn_floordiv: int path exact via big_divmod when
+// either side is tag 17 or the i64 corner (MIN // -1) promotes.
+fn __psa_dyn_floordiv(a: PsaVal, b: PsaVal) -> PsaVal {
+    if a.tag == 1 && (b.tag == 0 || b.tag == 2 || b.tag == 17) { return __psa_box_float(__psa_dyn_floor_f(__psa_as_float(a) / __psa_as_float(b))); };
+    if b.tag == 1 && (a.tag == 0 || a.tag == 2 || a.tag == 17) { return __psa_box_float(__psa_dyn_floor_f(__psa_as_float(a) / __psa_as_float(b))); };
+    if a.tag == 17 || b.tag == 17 { return __psa_big_floordiv(a, b); };
+    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) {
+        if a.ipay == -9223372036854775807 - 1 && b.ipay == -1 { return __psa_big_floordiv(a, b); };
+        return __psa_box_int(__psa_floordiv(a.ipay, b.ipay));
+    };
+    if a.tag <= 2 && b.tag <= 2 { return __psa_box_float(__psa_dyn_floor_f(__psa_as_float(a) / __psa_as_float(b))); };
+    panic(77011);
+}
+
+// REPLACES __psa_dyn_mod: same routing (MIN % -1 == 0 already holds
+// on the i64 path and on the bigint path alike).
+fn __psa_dyn_mod(a: PsaVal, b: PsaVal) -> PsaVal {
+    if (a.tag == 1 && (b.tag == 0 || b.tag == 2 || b.tag == 17)) || (b.tag == 1 && (a.tag == 0 || a.tag == 2 || a.tag == 17)) {
+        let fa = __psa_as_float(a);
+        let fb = __psa_as_float(b);
+        return __psa_box_float(fa - __psa_dyn_floor_f(fa / fb) * fb);
+    };
+    if a.tag == 17 || b.tag == 17 { return __psa_big_floormod(a, b); };
+    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) { return __psa_box_int(__psa_floormod(a.ipay, b.ipay)); };
+    if a.tag <= 2 && b.tag <= 2 {
+        let fa = __psa_as_float(a);
+        let fb = __psa_as_float(b);
+        return __psa_box_float(fa - __psa_dyn_floor_f(fa / fb) * fb);
+    };
+    panic(77011);
+}
+
+// REPLACES __psa_dyn_pow: checked i64 path (__psa_ipow2) with
+// promotion; negative exponent keeps the float route; a tag-17
+// exponent on an int base is refused per SEMANTICS §7 (a float
+// base still takes the float route, where as_float refuses past
+// the f64 range).
+fn __psa_dyn_pow(a: PsaVal, b: PsaVal) -> PsaVal {
+    if b.tag == 17 {
+        if a.tag == 1 { return __psa_box_float(sa_math_pow(__psa_as_float(a), __psa_big_as_float(b))); };
+        panic(77080);
+    };
+    if a.tag == 17 {
+        if b.tag == 1 { return __psa_box_float(sa_math_pow(__psa_big_as_float(a), b.fpay)); };
+        if (b.tag == 0 || b.tag == 2) && b.ipay >= 0 { return __psa_big_pow(a, b); };
+        if (b.tag == 0 || b.tag == 2) && b.ipay < 0 { return __psa_box_float(sa_math_pow(__psa_big_as_float(a), __psa_as_float(b))); };
+        panic(77011);
+    };
+    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) && b.ipay >= 0 { return __psa_ipow2(a.ipay, b.ipay); };
+    if a.tag <= 2 && b.tag <= 2 { return __psa_box_float(sa_math_pow(__psa_as_float(a), __psa_as_float(b))); };
+    panic(77011);
+}
+
+// REPLACES __psa_dyn_eq: tag-17 pairs compare by value; a tag-17
+// against tag 0/2 is unequal BY THE CANONICAL FORM (disjoint
+// ranges); against float it goes through as_float (precision
+// caveat registered in NOTES O3 — exact float<->bigint comparison
+// is a follow-up, not silently claimed here).
+fn __psa_dyn_eq(a: PsaVal, b: PsaVal) -> bool {
+    if a.tag == 17 && b.tag == 17 {
+        let x = __psa_big_unbox(a);
+        let y = __psa_big_unbox(b);
+        return big_eq(&x, &y);
+    };
+    if a.tag == 17 || b.tag == 17 {
+        if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) == __psa_as_float(b); };
+        return false;
+    };
+    if a.tag == 5 && b.tag == 5 { return __psa_dict_eq(a, b); };
+    if a.tag == 5 || b.tag == 5 { return false; };
+    if a.tag == 4 && b.tag == 4 { return __psa_list_eq(a, b); };
+    if a.tag == 6 && b.tag == 6 { return __psa_str_eq(a, b); };
+    if a.tag == 15 && b.tag == 15 { return __psa_str_eq(a, b); };
+    if a.tag == 10 && b.tag == 10 { return __psa_tuple_eq(a, b); };
+    if a.tag == 11 && b.tag == 11 { return __psa_set_eq(a, b); };
+    if a.tag == 8 || a.tag == 9 || a.tag == 16 || b.tag == 8 || b.tag == 9 || b.tag == 16 { return a.tag == b.tag && a.ipay == b.ipay; };
+    if a.tag == 3 && b.tag == 3 { return true; };
+    if a.tag <= 2 && b.tag <= 2 {
+        if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) == __psa_as_float(b); };
+        return a.ipay == b.ipay;
+    };
+    return false;
+}
+
+// REPLACES __psa_dyn_lt / __psa_dyn_le / __psa_dyn_gt / __psa_dyn_ge:
+// int-vs-int comparisons are exact via big_cmp whenever a tag 17
+// participates; int-vs-float uses as_float (NOTES O3 caveat).
+fn __psa_dyn_lt(a: PsaVal, b: PsaVal) -> bool {
+    if a.tag == 17 || b.tag == 17 {
+        if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) < __psa_as_float(b); };
+        return __psa_big_cmp(a, b) < 0;
+    };
+    if a.tag <= 2 && b.tag <= 2 {
+        if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) < __psa_as_float(b); };
+        return a.ipay < b.ipay;
+    };
+    if a.tag == 6 && b.tag == 6 { return __psa_str_cmp(a, b) < 0; };
+    if a.tag == 15 && b.tag == 15 { return __psa_str_cmp(a, b) < 0; };
+    panic(77012);
+}
+
+fn __psa_dyn_le(a: PsaVal, b: PsaVal) -> bool {
+    if a.tag == 17 || b.tag == 17 {
+        if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) <= __psa_as_float(b); };
+        return __psa_big_cmp(a, b) <= 0;
+    };
+    if a.tag <= 2 && b.tag <= 2 {
+        if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) <= __psa_as_float(b); };
+        return a.ipay <= b.ipay;
+    };
+    if a.tag == 6 && b.tag == 6 { return __psa_str_cmp(a, b) <= 0; };
+    if a.tag == 15 && b.tag == 15 { return __psa_str_cmp(a, b) <= 0; };
+    panic(77012);
+}
+
+fn __psa_dyn_gt(a: PsaVal, b: PsaVal) -> bool {
+    if a.tag == 17 || b.tag == 17 {
+        if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) > __psa_as_float(b); };
+        return __psa_big_cmp(a, b) > 0;
+    };
+    if a.tag <= 2 && b.tag <= 2 {
+        if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) > __psa_as_float(b); };
+        return a.ipay > b.ipay;
+    };
+    if a.tag == 6 && b.tag == 6 { return __psa_str_cmp(a, b) > 0; };
+    if a.tag == 15 && b.tag == 15 { return __psa_str_cmp(a, b) > 0; };
+    panic(77012);
+}
+
+fn __psa_dyn_ge(a: PsaVal, b: PsaVal) -> bool {
+    if a.tag == 17 || b.tag == 17 {
+        if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) >= __psa_as_float(b); };
+        return __psa_big_cmp(a, b) >= 0;
+    };
+    if a.tag <= 2 && b.tag <= 2 {
+        if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) >= __psa_as_float(b); };
+        return a.ipay >= b.ipay;
+    };
+    if a.tag == 6 && b.tag == 6 { return __psa_str_cmp(a, b) >= 0; };
+    if a.tag == 15 && b.tag == 15 { return __psa_str_cmp(a, b) >= 0; };
+    panic(77012);
+}
+
+// REPLACES __psa_dyn_truthy: tag 17 added (nonzero sign == truthy).
+fn __psa_dyn_truthy(v: PsaVal) -> bool {
+    if v.tag == 0 { return v.ipay != 0; };
+    if v.tag == 1 { return v.fpay != 0.0; };
+    if v.tag == 2 { return v.ipay != 0; };
+    if v.tag == 3 { return false; };
+    if v.tag == 4 { return __psa_list_len(v) != 0; };
+    if v.tag == 5 { return __psa_dict_len(v) != 0; };
+    if v.tag == 6 { return __psa_str_bytes_len(v) != 0; };
+    if v.tag == 15 { return __psa_str_bytes_len(v) != 0; };
+    if v.tag == 8 { return __psa_obj_truthy(v); };
+    if v.tag == 9 { return true; };
+    if v.tag == 10 { return __psa_vec_len_h(v.ipay as ptr) != 0; };
+    if v.tag == 11 { return __psa_vec_len_h(v.ipay as ptr) != 0; };
+    if v.tag == 12 { return true; };
+    if v.tag == 13 { return true; };
+    if v.tag == 14 { return true; };
+    if v.tag == 16 { return true; };
+    if v.tag == 17 { return __psa_big_sign(v) != 0; };
+    panic(77010);
+}
+
+// REPLACES __psa_dyn_neg: negating i64::MIN promotes (it is the
+// demotion gateway for the -9223372036854775808 literal as well).
+fn __psa_dyn_neg(v: PsaVal) -> PsaVal {
+    if v.tag == 17 {
+        let x = __psa_big_unbox(v);
+        return __psa_big_norm(big_neg(&x));
+    };
+    if v.tag == 0 || v.tag == 2 {
+        if v.ipay == -9223372036854775807 - 1 { return __psa_big_neg_of(v); };
+        return __psa_box_int(-(v.ipay));
+    };
+    if v.tag == 1 { return __psa_box_float(-(v.fpay)); };
+    panic(77015);
+}
+
+// Helper for __psa_dyn_neg's promotion edge.
+fn __psa_big_neg_of(v: PsaVal) -> PsaVal {
+    let x = big_from_i64(v.ipay);
+    return __psa_big_norm(big_neg(&x));
+}
+
+// REPLACES __psa_dyn_bitnot: ~x == -x-1 in both domains.
+fn __psa_dyn_bitnot(v: PsaVal) -> PsaVal {
+    if v.tag == 17 {
+        let x = __psa_big_unbox(v);
+        let nx = big_neg(&x);
+        let one = big_one();
+        return __psa_big_norm(big_sub(&nx, &one));
+    };
+    if v.tag == 0 || v.tag == 2 { return __psa_box_int((-(v.ipay) - 1)); };
+    panic(77013);
+}
+
+// REPLACES __psa_dyn_bitand / __psa_dyn_bitor / __psa_dyn_bitxor:
+// bitwise ops on tag 17 are LOUDLY REFUSED in this batch — the
+// sla_std base has no bitwise surface and infinite-two's-complement
+// semantics on a sign-magnitude base must not be improvised
+// (SEMANTICS §3, NOTES follow-up F1).
+fn __psa_dyn_bitand(a: PsaVal, b: PsaVal) -> PsaVal {
+    if a.tag == 17 || b.tag == 17 { panic(77013); };
+    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) { return __psa_box_int(a.ipay & b.ipay); };
+    panic(77013);
+}
+
+fn __psa_dyn_bitor(a: PsaVal, b: PsaVal) -> PsaVal {
+    if a.tag == 17 || b.tag == 17 { panic(77013); };
+    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) { return __psa_box_int(a.ipay | b.ipay); };
+    panic(77013);
+}
+
+fn __psa_dyn_bitxor(a: PsaVal, b: PsaVal) -> PsaVal {
+    if a.tag == 17 || b.tag == 17 { panic(77013); };
+    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) { return __psa_box_int(a.ipay ^ b.ipay); };
+    panic(77013);
+}
+
+// REPLACES __psa_dyn_shl: CPython shifts are unbounded — counts
+// >= 64 and overflowing results promote to the bigint path
+// instead of the current panic(77014) (which stays for negative
+// counts only).
+fn __psa_dyn_shl(a: PsaVal, b: PsaVal) -> PsaVal {
+    if b.tag == 17 {
+        if a.tag != 0 && a.tag != 2 && a.tag != 17 { panic(77013); };
+        if __psa_big_sign(b) < 0 { panic(77014); };
+        panic(77080);
+    };
+    if a.tag == 17 {
+        if b.tag == 0 || b.tag == 2 { return __psa_big_shl(a, b.ipay); };
+        panic(77013);
+    };
+    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) {
+        if b.ipay < 0 { panic(77014); };
+        if b.ipay >= 64 { return __psa_big_shl(a, b.ipay); };
+        let r = a.ipay << b.ipay;
+        if (r >> b.ipay) != a.ipay { return __psa_big_shl(a, b.ipay); };
+        return __psa_box_int(r);
+    };
+    panic(77013);
+}
+
+// REPLACES __psa_dyn_shr: arithmetic shift; a tag-17 left operand
+// goes through floor division by 2^k (exact CPython semantics).
+fn __psa_dyn_shr(a: PsaVal, b: PsaVal) -> PsaVal {
+    if b.tag == 17 {
+        if __psa_big_sign(b) < 0 { panic(77014); };
+        if a.tag == 0 || a.tag == 2 {
+            if a.ipay >= 0 { return __psa_box_int(0); };
+            return __psa_box_int(-1);
+        };
+        if a.tag == 17 {
+            if __psa_big_sign(a) >= 0 { return __psa_box_int(0); };
+            return __psa_box_int(-1);
+        };
+        panic(77013);
+    };
+    if a.tag == 17 {
+        if b.tag == 0 || b.tag == 2 { return __psa_big_shr(a, b.ipay); };
+        panic(77013);
+    };
+    if (a.tag == 0 || a.tag == 2) && (b.tag == 0 || b.tag == 2) {
+        if b.ipay < 0 { panic(77014); };
+        if b.ipay >= 64 {
+            if a.ipay >= 0 { return __psa_box_int(0); };
+            return __psa_box_int(-1);
+        };
+        return __psa_box_int(a.ipay >> b.ipay);
+    };
+    panic(77013);
+}
+
+// REPLACES __psa_unbox_int: a tag-17 value can never satisfy a
+// static i64 slot (canonical form) — overflow refusal, not a
+// type error.
+fn __psa_unbox_int(v: PsaVal) -> i64 {
+    if v.tag == 0 { return v.ipay; };
+    if v.tag == 2 { return v.ipay; };
+    if v.tag == 17 { panic(77080); };
+    panic(77020);
+}
+
+// REPLACES __psa_key_eq: dict/set key equality. By the canonical
+// form a tag-17 key only ever equals another tag-17 key with the
+// same value; float keys keep the existing float route.
+fn __psa_key_eq(a: PsaVal, b: PsaVal) -> bool {
+    if a.tag == 17 && b.tag == 17 {
+        let x = __psa_big_unbox(a);
+        let y = __psa_big_unbox(b);
+        return big_eq(&x, &y);
+    };
+    if a.tag == 17 || b.tag == 17 {
+        if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) == __psa_as_float(b); };
+        return false;
+    };
+    if a.tag <= 2 && b.tag <= 2 {
+        if a.tag == 1 || b.tag == 1 { return __psa_as_float(a) == __psa_as_float(b); };
+        return a.ipay == b.ipay;
+    };
+    if a.tag == 3 && b.tag == 3 { return true; };
+    if a.tag == 6 && b.tag == 6 { return __psa_str_eq(a, b); };
+    if a.tag == 15 && b.tag == 15 { return __psa_str_eq(a, b); };
+    if a.tag == 10 && b.tag == 10 { return __psa_tuple_key_eq(a, b); };
+    if a.tag == 8 && b.tag == 8 { return a.ipay == b.ipay; };
+    return false;
+}
+
+// REPLACES __psa_print_repr: tag-17 branch (decimal text).
+fn __psa_print_repr(v: PsaVal) {
+    if v.tag == 0 { __psa_print_i64(v.ipay); return; };
+    if v.tag == 17 { __psa_print_str(__psa_big_to_psastr(v)); return; };
+    if v.tag == 2 {
+        if v.ipay != 0 { sla_print_bytes(STR_PTR("True"), STR_LEN("True")); } else { sla_print_bytes(STR_PTR("False"), STR_LEN("False")); };
+        return;
+    };
+    if v.tag == 3 { sla_print_bytes(STR_PTR("None"), STR_LEN("None")); return; };
+    if v.tag == 4 { __psa_print_list_repr(v); return; };
+    if v.tag == 6 { __psa_print_str(__psa_str_repr(v)); return; };
+    if v.tag == 15 { __psa_print_str(__psa_bytes_repr(v)); return; };
+    if v.tag == 5 { __psa_print_dict_repr(v); return; };
+    if v.tag == 8 { __psa_print_str(__psa_obj_repr(v)); return; };
+    if v.tag == 10 { __psa_print_tuple_repr(v); return; };
+    if v.tag == 11 { __psa_print_set_repr(v); return; };
+    panic(77058);
+}
+
+// REPLACES __psa_print_dyn_nl: tag-17 branch.
+fn __psa_print_dyn_nl(v: PsaVal) {
+    if v.tag == 4 { __psa_print_list_repr(v); return; };
+    if v.tag == 6 { __psa_print_str(v); return; };
+    if v.tag == 15 { __psa_print_str(__psa_bytes_repr(v)); return; };
+    if v.tag == 5 { __psa_print_dict_repr(v); return; };
+    if v.tag == 8 { __psa_print_str(__psa_obj_str(v)); return; };
+    if v.tag == 10 { __psa_print_tuple_repr(v); return; };
+    if v.tag == 11 { __psa_print_set_repr(v); return; };
+    if v.tag == 12 { __psa_print_str(__psa_file_str(v)); return; };
+    if v.tag == 13 { __psa_print_str(__psa_str_of(v)); return; };
+    if v.tag == 14 { __psa_print_str(__psa_str_of(v)); return; };
+    if v.tag == 0 { __psa_print_i64(v.ipay); return; };
+    if v.tag == 17 { __psa_print_str(__psa_big_to_psastr(v)); return; };
+    if v.tag == 2 {
+        if v.ipay != 0 { sla_print_bytes(STR_PTR("True"), STR_LEN("True")); } else { sla_print_bytes(STR_PTR("False"), STR_LEN("False")); };
+        return;
+    };
+    if v.tag == 3 { sla_print_bytes(STR_PTR("None"), STR_LEN("None")); return; };
+    panic(77030);
+}
+
+// REPLACES __psa_print_dyn: tag-17 branch.
+fn __psa_print_dyn(v: PsaVal) -> i32 {
+    if v.tag == 4 { __psa_print_list_repr(v); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
+    if v.tag == 6 { __psa_print_str(v); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
+    if v.tag == 15 { __psa_print_str(__psa_bytes_repr(v)); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
+    if v.tag == 5 { __psa_print_dict_repr(v); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
+    if v.tag == 8 { __psa_print_str(__psa_obj_str(v)); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
+    if v.tag == 10 { __psa_print_tuple_repr(v); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
+    if v.tag == 11 { __psa_print_set_repr(v); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
+    if v.tag == 12 { __psa_print_str(__psa_file_str(v)); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
+    if v.tag == 13 { __psa_print_str(__psa_str_of(v)); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
+    if v.tag == 14 { __psa_print_str(__psa_str_of(v)); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
+    if v.tag == 0 { __psa_print_i64(v.ipay); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
+    if v.tag == 17 { __psa_print_str(__psa_big_to_psastr(v)); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
+    if v.tag == 2 {
+        if v.ipay != 0 { println("True"); } else { println("False"); };
+        return 0;
+    };
+    if v.tag == 3 { println("None"); return 0; };
+    panic(77030);
+}
+
+// PATCH to __psa_str_of (emit.rs, the D5 string-conversion block):
+// insert before its final panic(77030):
+//     if v.tag == 17 { return __psa_big_to_psastr(v); };
+
+// PATCH to __psa_to_float: insert before panic(77075):
+//     if v.tag == 17 { return __psa_big_as_float(v); };
+
+// PATCH to __psa_to_int: tag 17 can never yield an i64 — insert
+// before panic(77075):
+//     if v.tag == 17 { panic(77080); };
+// (The DYNAMIC int() builtin gains its bigint behaviour through
+// __psa_big_from_psastr for str inputs and through norm-preserving
+// passthrough for tag-17 inputs — see NOTES merge point M9.)
+
+// ---------------------------------------------------------------------
+// Merge-added glue (compile batch, M9): the dynamic int() builtin.
+// Tag 17 passes through untouched; a tag-6 string is parsed with
+// __psa_str_to_int's surface (surrounding spaces, optional sign,
+// digits; malformed input panics 77079) but overflow promotes to a
+// bigint instead of wrapping; every other tag goes through the
+// static conversion and re-boxes.
+// ---------------------------------------------------------------------
+fn __psa_dyn_int(v: PsaVal) -> PsaVal {
+    if v.tag == 17 { return v; };
+    if v.tag == 6 {
+        let n = __psa_str_bytes_len(v);
+        let i = 0;
+        while i < n {
+            if !(__psa_str_is_space(__psa_str_byte(v, i))) { break; };
+            i = i + 1;
+        }
+        let neg = false;
+        if i < n {
+            if __psa_str_byte(v, i) == 43 || __psa_str_byte(v, i) == 45 {
+                neg = __psa_str_byte(v, i) == 45;
+                i = i + 1;
+            };
+        };
+        let dstart = i;
+        let any = false;
+        let acc: i64 = 0;
+        let big = false;
+        while i < n {
+            let b = __psa_str_byte(v, i);
+            if b < 48 || b > 57 { break; };
+            if !(big) {
+                if acc > (9223372036854775807 - (b - 48)) / 10 {
+                    big = true;
+                } else {
+                    acc = acc * 10 + (b - 48);
+                };
+            };
+            any = true;
+            i = i + 1;
+        }
+        let dend = i;
+        while i < n {
+            if !(__psa_str_is_space(__psa_str_byte(v, i))) { break; };
+            i = i + 1;
+        }
+        if !(any) || i != n { panic(77079); };
+        if big {
+            let digits = __psa_str_new();
+            if neg { digits = __psa_str_push(digits, 45u8); };
+            let j = dstart;
+            while j < dend {
+                digits = __psa_str_push(digits, __psa_str_byte(v, j));
+                j = j + 1;
+            }
+            return __psa_big_from_psastr(digits);
+        };
+        if neg { return __psa_box_int(0 - acc); };
+        return __psa_box_int(acc);
+    };
+    return __psa_box_int(__psa_to_int(v));
+}
+"#;
+
 /// D6 runtime, part 1 (emitted with every dynamic program):
 /// exception values and the file-value payload accessors. An
 /// exception instance is an ordinary tag-8 object; construction
@@ -12848,6 +17361,7 @@ fn __psa_exc_store(v: PsaVal) {
 // missing repr-to-string builders, exactly like str().
 fn __psa_repr_of(v: PsaVal) -> PsaVal {
     if v.tag == 6 { return __psa_str_repr(v); };
+    if v.tag == 15 { return __psa_bytes_repr(v); };
     if v.tag == 8 { return __psa_obj_repr(v); };
     if v.tag == 0 { return __psa_str_from_i64(v.ipay); };
     if v.tag == 2 { return __psa_str_from_bool(v.ipay != 0); };
@@ -12975,6 +17489,1134 @@ fn __psa_file_str(v: PsaVal) -> PsaVal {
     out = __psa_str_push(out, 39u8);
     out = __psa_str_push(out, 62u8);
     return out;
+}
+
+// ---- f-string format specs (task 171-A) ----
+// __psa_format_value(v, conv, spec) implements CPython 3.12's
+// format-spec mini-language for the value kinds psa supports:
+// [[fill]align][sign][#][0][width][grouping][.precision][type]
+// for str / int / float / bool / None and dynamic values.
+// conv: 0 = none, 1 = !r, 2 = !s, 3 = !a; spec is the
+// evaluated spec text (tag 6, possibly empty). A malformed
+// spec, or one invalid for the value's kind, panics 77085
+// (CPython ValueError); a non-empty spec on a value kind that
+// takes no spec (None, containers, objects, ...) panics 77086
+// (CPython TypeError). Codes 77085/77086 are new in this batch
+// and must be registered in PANIC-CODES.json at integration.
+
+struct PsaFmt {
+    fill: PsaVal,
+    has_fill: bool,
+    align: i64,
+    sign: i64,
+    alt: bool,
+    zero: bool,
+    width: i64,
+    group: i64,
+    prec: i64,
+    typ: i64
+}
+
+fn __psa_fmt_space() -> PsaVal {
+    let s = __psa_str_new();
+    s = __psa_str_push(s, 32u8);
+    return s;
+}
+
+fn __psa_fmt_default() -> PsaFmt {
+    return PsaFmt { fill: __psa_fmt_space(), has_fill: false, align: 0, sign: 0, alt: false, zero: false, width: 0, group: 0, prec: -1, typ: 0 };
+}
+
+fn __psa_fmt_defaulted(f: PsaFmt) -> bool {
+    return !f.has_fill && f.align == 0 && f.sign == 0 && !f.alt && !f.zero && f.width == 0 && f.group == 0 && f.prec == -1 && f.typ == 0;
+}
+
+fn __psa_fmt_is_align(b: i64) -> bool {
+    return b == 60 || b == 62 || b == 94 || b == 61;
+}
+
+fn __psa_fmt_cp_len(b: i64) -> i64 {
+    // Byte length of the UTF-8 code point whose lead byte
+    // is b (the spec text is well-formed UTF-8: it was a
+    // dynamic string built by psa code).
+    if b < 128 { return 1; };
+    if b / 32 == 6 { return 2; };
+    if b / 16 == 14 { return 3; };
+    return 4;
+}
+
+fn __psa_fmt_sub(s: PsaVal, a: i64, b: i64) -> PsaVal {
+    // Bytes [a, b) of a dynamic string, as a new string.
+    let out = __psa_str_new();
+    let i = a;
+    while i < b {
+        out = __psa_str_push(out, __psa_str_byte(s, i) as u8);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn __psa_fmt_cat(a: PsaVal, b: PsaVal) -> PsaVal {
+    let out = __psa_str_new();
+    out = __psa_str_append_str(out, a);
+    out = __psa_str_append_str(out, b);
+    return out;
+}
+
+fn __psa_fmt_rev(s: PsaVal) -> PsaVal {
+    let out = __psa_str_new();
+    let i = __psa_str_bytes_len(s);
+    while i > 0 {
+        i = i - 1;
+        out = __psa_str_push(out, __psa_str_byte(s, i) as u8);
+    }
+    return out;
+}
+
+fn __psa_fmt_parse(spec: PsaVal) -> PsaFmt {
+    // Parse the format-spec mini-language over the spec's
+    // bytes. Malformed input panics 77085.
+    let fill_v = __psa_fmt_space();
+    let has_fill = false;
+    let align_v: i64 = 0;
+    let sign_v: i64 = 0;
+    let alt_v = false;
+    let zero_v = false;
+    let width_v: i64 = 0;
+    let group_v: i64 = 0;
+    let prec_v: i64 = -1;
+    let typ_v: i64 = 0;
+    let n = __psa_str_bytes_len(spec);
+    let i: i64 = 0;
+    // [[fill]align]: fill is one code point, recognised only
+    // when an align character follows it.
+    if n >= 1 {
+        let l = __psa_fmt_cp_len(__psa_str_byte(spec, 0));
+        if l < n && __psa_fmt_is_align(__psa_str_byte(spec, l)) {
+            fill_v = __psa_fmt_sub(spec, 0, l);
+            has_fill = true;
+            align_v = __psa_str_byte(spec, l);
+            i = l + 1;
+        } else if __psa_fmt_is_align(__psa_str_byte(spec, 0)) {
+            align_v = __psa_str_byte(spec, 0);
+            i = 1;
+        };
+    };
+    if has_fill {
+        let fb = __psa_str_byte(fill_v, 0);
+        if fb == 123 || fb == 125 { panic(77085); };
+    };
+    // [sign]
+    if i < n {
+        let b = __psa_str_byte(spec, i);
+        if b == 43 || b == 45 || b == 32 {
+            sign_v = b;
+            i = i + 1;
+        };
+    };
+    // [#]
+    if i < n && __psa_str_byte(spec, i) == 35 {
+        alt_v = true;
+        i = i + 1;
+    };
+    // [0]: the zero flag. It makes '0' the fill (unless a
+    // fill was given explicitly) and, for numbers with no
+    // explicit align, selects '=' alignment.
+    if i < n && __psa_str_byte(spec, i) == 48 {
+        zero_v = true;
+        i = i + 1;
+    };
+    // [width]
+    let wdone = false;
+    while i < n && !wdone {
+        let b = __psa_str_byte(spec, i);
+        if b >= 48 && b <= 57 {
+            width_v = width_v * 10 + (b - 48);
+            i = i + 1;
+        } else {
+            wdone = true;
+        };
+    }
+    // [grouping option]
+    if i < n {
+        let b = __psa_str_byte(spec, i);
+        if b == 44 || b == 95 {
+            group_v = b;
+            i = i + 1;
+        };
+    };
+    // [.precision]
+    if i < n && __psa_str_byte(spec, i) == 46 {
+        i = i + 1;
+        if i >= n { panic(77085); };
+        let b0 = __psa_str_byte(spec, i);
+        if b0 < 48 || b0 > 57 { panic(77085); };
+        prec_v = 0;
+        let pdone = false;
+        while i < n && !pdone {
+            let b = __psa_str_byte(spec, i);
+            if b >= 48 && b <= 57 {
+                prec_v = prec_v * 10 + (b - 48);
+                i = i + 1;
+            } else {
+                pdone = true;
+            };
+        }
+    };
+    // [type]: a single byte; anything after it is an error.
+    if i < n {
+        typ_v = __psa_str_byte(spec, i);
+        i = i + 1;
+    };
+    if i != n { panic(77085); };
+    return PsaFmt { fill: fill_v, has_fill: has_fill, align: align_v, sign: sign_v, alt: alt_v, zero: zero_v, width: width_v, group: group_v, prec: prec_v, typ: typ_v };
+}
+
+fn __psa_fmt_fill(f: PsaFmt) -> PsaVal {
+    // The effective fill character: the explicit fill, else
+    // '0' when the zero flag is set, else the parsed default
+    // (a space).
+    if f.has_fill { return f.fill; };
+    if f.zero {
+        let s = __psa_str_new();
+        s = __psa_str_push(s, 48u8);
+        return s;
+    };
+    return f.fill;
+}
+
+fn __psa_fmt_is_zero_fill(f: PsaFmt) -> bool {
+    if f.has_fill {
+        return __psa_str_bytes_len(f.fill) == 1 && __psa_str_byte(f.fill, 0) == 48;
+    };
+    return f.zero;
+}
+
+fn __psa_fmt_repeat(out: PsaVal, fill: PsaVal, count: i64) -> PsaVal {
+    let i: i64 = 0;
+    while i < count {
+        out = __psa_str_append_str(out, fill);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn __psa_fmt_pad(body: PsaVal, fill: PsaVal, align: i64, width: i64) -> PsaVal {
+    // Whole-body padding; width counts code points. '=' is
+    // treated like '>' here: the numeric paths that honour
+    // '=' split the sign/prefix off first (pad_split).
+    let bl = __psa_str_len(body);
+    if bl >= width { return body; };
+    let pad = width - bl;
+    if align == 60 {
+        let out = __psa_str_new();
+        out = __psa_str_append_str(out, body);
+        return __psa_fmt_repeat(out, fill, pad);
+    };
+    if align == 94 {
+        // Centred: the left side gets pad / 2 (CPython puts
+        // the odd extra character on the right).
+        let left = pad / 2;
+        let out = __psa_str_new();
+        out = __psa_fmt_repeat(out, fill, left);
+        out = __psa_str_append_str(out, body);
+        return __psa_fmt_repeat(out, fill, pad - left);
+    };
+    let out = __psa_str_new();
+    out = __psa_fmt_repeat(out, fill, pad);
+    out = __psa_str_append_str(out, body);
+    return out;
+}
+
+fn __psa_fmt_pad_split(pfx: PsaVal, rest: PsaVal, fill: PsaVal, width: i64) -> PsaVal {
+    // '=' alignment: padding goes between the sign/prefix
+    // and the digits.
+    let total = __psa_str_len(pfx) + __psa_str_len(rest);
+    let out = __psa_str_new();
+    out = __psa_str_append_str(out, pfx);
+    if total < width {
+        out = __psa_fmt_repeat(out, fill, width - total);
+    };
+    out = __psa_str_append_str(out, rest);
+    return out;
+}
+
+fn __psa_fmt_group(digs: PsaVal, sep: i64, size: i64) -> PsaVal {
+    // Insert separator `sep` every `size` digits from the
+    // right of an ASCII digit string.
+    let n = __psa_str_bytes_len(digs);
+    let out = __psa_str_new();
+    let i: i64 = 0;
+    while i < n {
+        if i > 0 && (n - i) % size == 0 {
+            out = __psa_str_push(out, sep as u8);
+        };
+        out = __psa_str_push(out, __psa_str_byte(digs, i) as u8);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn __psa_fmt_prepend_zero(digs: PsaVal) -> PsaVal {
+    let out = __psa_str_new();
+    out = __psa_str_push(out, 48u8);
+    out = __psa_str_append_str(out, digs);
+    return out;
+}
+
+fn __psa_fmt_num_assemble(pfx: PsaVal, intpart: PsaVal, rest: PsaVal, f: PsaFmt, grp: i64, gsize: i64) -> PsaVal {
+    // Shared tail of the numeric formatters: pfx is the sign
+    // (plus the base prefix for ints, folded in by the
+    // caller), intpart the ungrouped integer digits, rest
+    // the fraction/exponent/suffix text. grp is the grouping
+    // separator byte to apply to intpart (0 = none), gsize
+    // the group size (3 for decimal, 4 for binary bases).
+    let fill = __psa_fmt_fill(f);
+    let align = f.align;
+    if align == 0 {
+        if f.zero {
+            align = 61;
+        } else {
+            align = 62;
+        };
+    };
+    if align == 61 && grp != 0 && __psa_fmt_is_zero_fill(f) {
+        // Zero padding with grouping: the zeros join the
+        // digit run and the separators are recomputed, so
+        // the result may overshoot the width (CPython:
+        // format(1234, '08,') == '0,001,234').
+        let ip = intpart;
+        let done = false;
+        while !done {
+            let g = __psa_fmt_group(ip, grp, gsize);
+            let total = __psa_str_len(pfx) + __psa_str_len(g) + __psa_str_len(rest);
+            if total >= f.width {
+                ip = g;
+                done = true;
+            } else {
+                ip = __psa_fmt_prepend_zero(ip);
+            };
+        }
+        let out = __psa_str_new();
+        out = __psa_str_append_str(out, pfx);
+        out = __psa_str_append_str(out, ip);
+        out = __psa_str_append_str(out, rest);
+        return out;
+    };
+    let ip2 = intpart;
+    if grp != 0 {
+        ip2 = __psa_fmt_group(intpart, grp, gsize);
+    };
+    if align == 61 {
+        let joined = __psa_fmt_cat(ip2, rest);
+        return __psa_fmt_pad_split(pfx, joined, fill, f.width);
+    };
+    let whole = __psa_fmt_cat(__psa_fmt_cat(pfx, ip2), rest);
+    return __psa_fmt_pad(whole, fill, align, f.width);
+}
+
+fn __psa_fmt_digit_char(d: i64, upper: bool) -> i64 {
+    if d < 10 { return 48 + d; };
+    if upper { return 55 + d; };
+    return 87 + d;
+}
+
+fn __psa_fmt_int_digits(x: i64, base: i64, upper: bool) -> PsaVal {
+    // Digits of |x| in `base`. Extracted from the signed
+    // value itself (x % base takes the sign of x, x / base
+    // truncates toward zero), so i64::MIN is exact; a
+    // magnitude-first version would overflow on -i64::MIN.
+    let rev = __psa_str_new();
+    if x == 0 {
+        rev = __psa_str_push(rev, 48u8);
+        return rev;
+    };
+    let v = x;
+    while v != 0 {
+        let d = v % base;
+        if d < 0 { d = 0 - d; };
+        rev = __psa_str_push(rev, __psa_fmt_digit_char(d, upper) as u8);
+        v = v / base;
+    }
+    return __psa_fmt_rev(rev);
+}
+
+fn __psa_fmt_push_cp(out: PsaVal, cp: i64) -> PsaVal {
+    // Append the UTF-8 encoding of code point cp.
+    if cp < 128 {
+        out = __psa_str_push(out, cp as u8);
+        return out;
+    };
+    if cp < 2048 {
+        out = __psa_str_push(out, (192 + cp / 64) as u8);
+        out = __psa_str_push(out, (128 + cp % 64) as u8);
+        return out;
+    };
+    if cp < 65536 {
+        out = __psa_str_push(out, (224 + cp / 4096) as u8);
+        out = __psa_str_push(out, (128 + (cp / 64) % 64) as u8);
+        out = __psa_str_push(out, (128 + cp % 64) as u8);
+        return out;
+    };
+    out = __psa_str_push(out, (240 + cp / 262144) as u8);
+    out = __psa_str_push(out, (128 + (cp / 4096) % 64) as u8);
+    out = __psa_str_push(out, (128 + (cp / 64) % 64) as u8);
+    out = __psa_str_push(out, (128 + cp % 64) as u8);
+    return out;
+}
+
+fn __psa_fmt_dec_mul(digs: PsaVal, m: i64) -> PsaVal {
+    // Multiply an LSD-first ASCII digit string by a small
+    // positive int; the result is LSD-first too.
+    let out = __psa_str_new();
+    let n = __psa_str_bytes_len(digs);
+    let carry: i64 = 0;
+    let i: i64 = 0;
+    while i < n {
+        let cur = (__psa_str_byte(digs, i) - 48) * m + carry;
+        out = __psa_str_push(out, (48 + cur % 10) as u8);
+        carry = cur / 10;
+        i = i + 1;
+    }
+    while carry > 0 {
+        out = __psa_str_push(out, (48 + carry % 10) as u8);
+        carry = carry / 10;
+    }
+    return out;
+}
+
+fn __psa_fmt_f64_digits(x: f64) -> (PsaVal, i64) {
+    // Exact decimal digits of a finite, non-negative f64:
+    // returns (digits, exp10) with x = digits * 10^exp10,
+    // digits an MSD-first ASCII string with no leading zero
+    // (except the single "0" for zero itself).
+    if x == 0.0 {
+        let z = __psa_str_new();
+        z = __psa_str_push(z, 48u8);
+        return (z, 0);
+    };
+    // Normalise x = m * 2^e with m in [1, 2) by exact binary
+    // scaling (scaling by powers of two is exact, subnormal
+    // inputs included).
+    let m = x;
+    let e: i64 = 0;
+    while m >= 4294967296.0 {
+        m = m / 4294967296.0;
+        e = e + 32;
+    }
+    while m >= 2.0 {
+        m = m / 2.0;
+        e = e + 1;
+    }
+    while m < 1.0 {
+        if m < 1.0 / 4294967296.0 {
+            m = m * 4294967296.0;
+            e = e - 32;
+        } else {
+            m = m * 2.0;
+            e = e - 1;
+        };
+    }
+    // Extract the 53-bit mantissa: x = mant * 2^(e-52),
+    // using only exact operations (doubling a value in
+    // [0, 2) and subtracting 1.0 never round).
+    let mant: i64 = 1;
+    let frac = m - 1.0;
+    let i: i64 = 0;
+    while i < 52 {
+        frac = frac * 2.0;
+        mant = mant * 2;
+        if frac >= 1.0 {
+            mant = mant + 1;
+            frac = frac - 1.0;
+        };
+        i = i + 1;
+    }
+    // Decimal digits of mant * 2^(e-52) via a decimal
+    // bignum: for e-52 >= 0 multiply by 2 that many times;
+    // else multiply by 5 and track the power of ten.
+    let e2 = e - 52;
+    let digs = __psa_fmt_rev(__psa_str_from_i64(mant));
+    let exp10: i64 = 0;
+    if e2 >= 0 {
+        let k: i64 = 0;
+        while k < e2 {
+            digs = __psa_fmt_dec_mul(digs, 2);
+            k = k + 1;
+        }
+    };
+    if e2 < 0 {
+        let k: i64 = 0;
+        while k < 0 - e2 {
+            digs = __psa_fmt_dec_mul(digs, 5);
+            k = k + 1;
+        }
+        exp10 = e2;
+    };
+    return (__psa_fmt_rev(digs), exp10);
+}
+
+fn __psa_fmt_digit_at(digs: PsaVal, len: i64, exp10: i64, place: i64) -> i64 {
+    // The digit at the 10^place position of the value whose
+    // MSD-first digits are `digs` (0 outside the digit run).
+    let idx = len - 1 - (place - exp10);
+    if idx < 0 || idx >= len { return 0; };
+    return __psa_str_byte(digs, idx) - 48;
+}
+
+fn __psa_fmt_inc(digs: PsaVal) -> PsaVal {
+    // Add 1 to an MSD-first ASCII digit string.
+    let rev = __psa_fmt_rev(digs);
+    let n = __psa_str_bytes_len(rev);
+    let out = __psa_str_new();
+    let carry: i64 = 1;
+    let i: i64 = 0;
+    while i < n {
+        let cur = (__psa_str_byte(rev, i) - 48) + carry;
+        if cur >= 10 {
+            out = __psa_str_push(out, 48u8);
+            carry = 1;
+        } else {
+            out = __psa_str_push(out, (48 + cur) as u8);
+            carry = 0;
+        };
+        i = i + 1;
+    }
+    if carry == 1 {
+        out = __psa_str_push(out, 49u8);
+    };
+    return __psa_fmt_rev(out);
+}
+
+fn __psa_fmt_round_sig(digs: PsaVal, exp10: i64, keep: i64) -> (PsaVal, i64) {
+    // Round an exact MSD-first digit string to `keep`
+    // significant digits, half-even, exactly. Returns the
+    // rounded digits (exactly `keep` of them, unless the
+    // input was shorter) and the adjusted exp10.
+    let len = __psa_str_bytes_len(digs);
+    if keep >= len { return (digs, exp10); };
+    let rd = __psa_str_byte(digs, keep) - 48;
+    let tail = false;
+    let i = keep + 1;
+    while i < len {
+        if __psa_str_byte(digs, i) != 48 { tail = true; };
+        i = i + 1;
+    }
+    let up = false;
+    if rd > 5 { up = true; };
+    if rd == 5 {
+        if tail {
+            up = true;
+        } else {
+            let last = __psa_str_byte(digs, keep - 1) - 48;
+            if last % 2 == 1 { up = true; };
+        };
+    };
+    let out = __psa_fmt_sub(digs, 0, keep);
+    if !up { return (out, exp10 + (len - keep)); };
+    let inc = __psa_fmt_inc(out);
+    if __psa_str_bytes_len(inc) > keep {
+        // 999.. rounded up: renormalise to a 1 followed by
+        // zeros, one power of ten higher.
+        let rn = __psa_str_new();
+        rn = __psa_str_push(rn, 49u8);
+        let z: i64 = 1;
+        while z < keep {
+            rn = __psa_str_push(rn, 48u8);
+            z = z + 1;
+        }
+        return (rn, exp10 + (len - keep) + 1);
+    };
+    return (inc, exp10 + (len - keep));
+}
+
+fn __psa_fmt_strip(digs: PsaVal, exp10: i64) -> (PsaVal, i64) {
+    // Drop trailing zeros from a digit string, adjusting
+    // exp10 so the value is unchanged.
+    let len = __psa_str_bytes_len(digs);
+    let nl = len;
+    while nl > 1 && __psa_str_byte(digs, nl - 1) == 48 {
+        nl = nl - 1;
+    }
+    return (__psa_fmt_sub(digs, 0, nl), exp10 + (len - nl));
+}
+
+fn __psa_fmt_strip_frac(fp: PsaVal) -> PsaVal {
+    // Drop trailing zeros from a fraction digit string; an
+    // all-zero fraction becomes empty.
+    let nl = __psa_str_bytes_len(fp);
+    while nl > 0 && __psa_str_byte(fp, nl - 1) == 48 {
+        nl = nl - 1;
+    }
+    return __psa_fmt_sub(fp, 0, nl);
+}
+
+fn __psa_fmt_parts_plain(digs: PsaVal, exp10: i64) -> (PsaVal, PsaVal) {
+    // Split exact digits into (integer, fraction) digit
+    // strings with no rounding: every digit of the value
+    // appears exactly once across the two parts.
+    let len = __psa_str_bytes_len(digs);
+    let point = len + exp10;
+    let ip = __psa_str_new();
+    let fp = __psa_str_new();
+    if point <= 0 {
+        ip = __psa_str_push(ip, 48u8);
+        let z: i64 = 0;
+        while z < 0 - point {
+            fp = __psa_str_push(fp, 48u8);
+            z = z + 1;
+        }
+        fp = __psa_str_append_str(fp, digs);
+        return (ip, fp);
+    };
+    if point >= len {
+        ip = __psa_str_append_str(ip, digs);
+        let z: i64 = 0;
+        while z < point - len {
+            ip = __psa_str_push(ip, 48u8);
+            z = z + 1;
+        }
+        return (ip, fp);
+    };
+    ip = __psa_str_append_str(ip, __psa_fmt_sub(digs, 0, point));
+    fp = __psa_str_append_str(fp, __psa_fmt_sub(digs, point, len));
+    return (ip, fp);
+}
+
+fn __psa_fmt_fixed_parts(digs: PsaVal, exp10: i64, prec: i64) -> (PsaVal, PsaVal) {
+    // (integer_digits, fraction_digits) for f-style
+    // formatting with exactly `prec` fraction digits,
+    // rounded half-even at the cut, exactly.
+    let len = __psa_str_bytes_len(digs);
+    let cut = 0 - prec - 1;
+    let rd = __psa_fmt_digit_at(digs, len, exp10, cut);
+    let tail = false;
+    let pl = cut - 1;
+    while pl >= exp10 {
+        if __psa_fmt_digit_at(digs, len, exp10, pl) != 0 { tail = true; };
+        pl = pl - 1;
+    }
+    let up = false;
+    if rd > 5 { up = true; };
+    if rd == 5 {
+        if tail {
+            up = true;
+        } else {
+            let last = __psa_fmt_digit_at(digs, len, exp10, cut + 1);
+            if last % 2 == 1 { up = true; };
+        };
+    };
+    let top = len - 1 + exp10;
+    if top < 0 { top = 0; };
+    let ip = __psa_str_new();
+    let p = top;
+    while p >= 0 {
+        ip = __psa_str_push(ip, (48 + __psa_fmt_digit_at(digs, len, exp10, p)) as u8);
+        p = p - 1;
+    }
+    let fp = __psa_str_new();
+    let q: i64 = 1;
+    while q <= prec {
+        fp = __psa_str_push(fp, (48 + __psa_fmt_digit_at(digs, len, exp10, 0 - q)) as u8);
+        q = q + 1;
+    }
+    if !up { return (ip, fp); };
+    let inc = __psa_fmt_inc(__psa_fmt_cat(ip, fp));
+    let il = __psa_str_bytes_len(inc) - prec;
+    let nip = __psa_fmt_sub(inc, 0, il);
+    let nfp = __psa_fmt_sub(inc, il, __psa_str_bytes_len(inc));
+    return (nip, nfp);
+}
+
+fn __psa_fmt_sci_parts(digs: PsaVal, exp10: i64, prec: i64) -> (PsaVal, i64) {
+    // (mantissa digits of length prec+1, decimal exponent
+    // of the leading digit) for e-style formatting.
+    let (r, e10) = __psa_fmt_round_sig(digs, exp10, prec + 1);
+    let exp = __psa_str_bytes_len(r) - 1 + e10;
+    let out = __psa_str_new();
+    let rl = __psa_str_bytes_len(r);
+    let i: i64 = 0;
+    while i < prec + 1 {
+        if i < rl {
+            out = __psa_str_push(out, __psa_str_byte(r, i) as u8);
+        } else {
+            out = __psa_str_push(out, 48u8);
+        };
+        i = i + 1;
+    }
+    return (out, exp);
+}
+
+fn __psa_fmt_exp_str(e: i64) -> PsaVal {
+    // Exponent text: a sign and at least two digits.
+    let out = __psa_str_new();
+    let a = e;
+    if e < 0 {
+        out = __psa_str_push(out, 45u8);
+        a = 0 - e;
+    } else {
+        out = __psa_str_push(out, 43u8);
+    };
+    let ds = __psa_str_from_i64(a);
+    if __psa_str_bytes_len(ds) == 1 {
+        out = __psa_str_push(out, 48u8);
+    };
+    out = __psa_str_append_str(out, ds);
+    return out;
+}
+
+fn __psa_fmt_shortest(x: f64) -> (PsaVal, i64) {
+    // Shortest digits that round back to x (x >= 0, finite):
+    // round the exact digits to p significant digits for
+    // p = 1..17 and parse each candidate back with the
+    // runtime's own decimal parser. Returns (digits, exp10).
+    let (digs, exp10) = __psa_fmt_f64_digits(x);
+    if x == 0.0 { return (digs, exp10); };
+    // Fallback if no candidate parses back exactly (the
+    // runtime parser is not correctly rounded for every
+    // 17-digit input): the 17-digit rounding, never the raw
+    // digit string.
+    let (rd, re10) = __psa_fmt_round_sig(digs, exp10, 17);
+    let found = false;
+    let p: i64 = 1;
+    while p <= 17 && !found {
+        let (r, e10) = __psa_fmt_round_sig(digs, exp10, p);
+        let cand = __psa_str_new();
+        cand = __psa_str_push(cand, __psa_str_byte(r, 0) as u8);
+        if __psa_str_bytes_len(r) > 1 {
+            cand = __psa_str_push(cand, 46u8);
+            cand = __psa_str_append_str(cand, __psa_fmt_sub(r, 1, __psa_str_bytes_len(r)));
+        };
+        cand = __psa_str_push(cand, 101u8);
+        let ex = __psa_str_bytes_len(r) - 1 + e10;
+        cand = __psa_str_append_str(cand, __psa_fmt_exp_str(ex));
+        if __psa_str_to_float(cand) == x {
+            rd = r;
+            re10 = e10;
+            found = true;
+        };
+        p = p + 1;
+    }
+    return (rd, re10);
+}
+
+fn __psa_fmt_float(x: f64, f: PsaFmt) -> PsaVal {
+    let t = f.typ;
+    if t == 115 { panic(77085); };
+    let is_pct = t == 37;
+    let kind = t;
+    if kind == 110 { kind = 103; };
+    if !(kind == 0 || kind == 101 || kind == 69 || kind == 102 || kind == 70 || kind == 103 || kind == 71 || is_pct) {
+        panic(77085);
+    };
+    let neg = false;
+    if x < 0.0 { neg = true; };
+    if x == 0.0 && 1.0 / x < 0.0 { neg = true; };
+    let ax = x;
+    if neg { ax = 0.0 - x; };
+    let vx = ax;
+    if is_pct { vx = ax * 100.0; };
+    let pfx = __psa_str_new();
+    if neg { pfx = __psa_str_push(pfx, 45u8); };
+    if !neg && f.sign == 43 { pfx = __psa_str_push(pfx, 43u8); };
+    if !neg && f.sign == 32 { pfx = __psa_str_push(pfx, 32u8); };
+    // inf / nan: no digits, but the sign, the width and
+    // padding still apply (and zero padding pads with '0',
+    // as CPython does: format(inf, '010f') == '0000000inf').
+    if vx != vx || (vx != 0.0 && vx * 2.0 == vx) {
+        let word = __psa_str_new();
+        let upper = kind == 70 || kind == 71 || kind == 69;
+        if vx != vx {
+            if upper {
+                word = __psa_str_push(word, 78u8);
+                word = __psa_str_push(word, 65u8);
+                word = __psa_str_push(word, 78u8);
+            } else {
+                word = __psa_str_push(word, 110u8);
+                word = __psa_str_push(word, 97u8);
+                word = __psa_str_push(word, 110u8);
+            };
+        } else {
+            if upper {
+                word = __psa_str_push(word, 73u8);
+                word = __psa_str_push(word, 78u8);
+                word = __psa_str_push(word, 70u8);
+            } else {
+                word = __psa_str_push(word, 105u8);
+                word = __psa_str_push(word, 110u8);
+                word = __psa_str_push(word, 102u8);
+            };
+        };
+        if is_pct { word = __psa_str_push(word, 37u8); };
+        let fill = __psa_fmt_fill(f);
+        let al = f.align;
+        if al == 0 {
+            if f.zero {
+                al = 61;
+            } else {
+                al = 62;
+            };
+        };
+        if al == 61 {
+            return __psa_fmt_pad_split(pfx, word, fill, f.width);
+        };
+        return __psa_fmt_pad(__psa_fmt_cat(pfx, word), fill, al, f.width);
+    };
+    let (digs, exp10) = __psa_fmt_f64_digits(vx);
+    if kind == 102 || kind == 70 || is_pct {
+        let prec = f.prec;
+        if prec == -1 { prec = 6; };
+        let (ip, fp) = __psa_fmt_fixed_parts(digs, exp10, prec);
+        let rest = __psa_str_new();
+        if prec > 0 {
+            rest = __psa_str_push(rest, 46u8);
+            rest = __psa_str_append_str(rest, fp);
+        };
+        if prec == 0 && f.alt { rest = __psa_str_push(rest, 46u8); };
+        if is_pct { rest = __psa_str_push(rest, 37u8); };
+        return __psa_fmt_num_assemble(pfx, ip, rest, f, f.group, 3);
+    };
+    if kind == 101 || kind == 69 {
+        let prec = f.prec;
+        if prec == -1 { prec = 6; };
+        let (md, ex) = __psa_fmt_sci_parts(digs, exp10, prec);
+        let rest = __psa_str_new();
+        rest = __psa_str_push(rest, __psa_str_byte(md, 0) as u8);
+        if prec > 0 {
+            rest = __psa_str_push(rest, 46u8);
+            rest = __psa_str_append_str(rest, __psa_fmt_sub(md, 1, __psa_str_bytes_len(md)));
+        };
+        if prec == 0 && f.alt { rest = __psa_str_push(rest, 46u8); };
+        if kind == 69 {
+            rest = __psa_str_push(rest, 69u8);
+        } else {
+            rest = __psa_str_push(rest, 101u8);
+        };
+        rest = __psa_str_append_str(rest, __psa_fmt_exp_str(ex));
+        // Grouping is accepted but never shows in scientific
+        // form (a single digit before the point), as in
+        // CPython.
+        return __psa_fmt_num_assemble(pfx, __psa_str_new(), rest, f, 0, 3);
+    };
+    if kind == 103 || kind == 71 {
+        // 'g' / 'G' (and 'n', mapped to 'g' above): round to
+        // `prec` significant digits; scientific form iff the
+        // decimal exponent is < -4 or >= prec.
+        let prec = f.prec;
+        if prec == -1 { prec = 6; };
+        if prec == 0 { prec = 1; };
+        let (r, e10) = __psa_fmt_round_sig(digs, exp10, prec);
+        let xx = __psa_str_bytes_len(r) - 1 + e10;
+        if xx < -4 || xx >= prec {
+            let md = r;
+            let i = __psa_str_bytes_len(md);
+            while i < prec {
+                md = __psa_str_push(md, 48u8);
+                i = i + 1;
+            }
+            let frac = __psa_fmt_sub(md, 1, __psa_str_bytes_len(md));
+            if !f.alt { frac = __psa_fmt_strip_frac(frac); };
+            let rest = __psa_str_new();
+            rest = __psa_str_push(rest, __psa_str_byte(md, 0) as u8);
+            if __psa_str_bytes_len(frac) > 0 || f.alt {
+                rest = __psa_str_push(rest, 46u8);
+                rest = __psa_str_append_str(rest, frac);
+            };
+            if kind == 71 {
+                rest = __psa_str_push(rest, 69u8);
+            } else {
+                rest = __psa_str_push(rest, 101u8);
+            };
+            rest = __psa_str_append_str(rest, __psa_fmt_exp_str(xx));
+            return __psa_fmt_num_assemble(pfx, __psa_str_new(), rest, f, 0, 3);
+        };
+        let (ip, fp) = __psa_fmt_fixed_parts(digs, exp10, prec - 1 - xx);
+        let fpd = fp;
+        if !f.alt { fpd = __psa_fmt_strip_frac(fp); };
+        let rest = __psa_str_new();
+        if __psa_str_bytes_len(fpd) > 0 {
+            rest = __psa_str_push(rest, 46u8);
+            rest = __psa_str_append_str(rest, fpd);
+        };
+        if f.alt && __psa_str_bytes_len(fpd) == 0 {
+            rest = __psa_str_push(rest, 46u8);
+        };
+        return __psa_fmt_num_assemble(pfx, ip, rest, f, f.group, 3);
+    };
+    // No type code (''): with a precision, digits are rounded
+    // to max(prec, 1) significant digits and scientific form
+    // is chosen iff the exponent is < -4 or >= prec - 1
+    // (CPython's '' rule, one lower than 'g'); without a
+    // precision, the shortest round-trip digits are used and
+    // scientific form starts at exponent 16, as in repr.
+    // Either way trailing zeros are stripped (unless '#')
+    // and a bare integer result gains a '.0'.
+    let pp = f.prec;
+    let r = digs;
+    let e10 = exp10;
+    if pp == -1 {
+        let (sr, se) = __psa_fmt_shortest(vx);
+        r = sr;
+        e10 = se;
+    } else {
+        if pp == 0 { pp = 1; };
+        let (sr, se) = __psa_fmt_round_sig(digs, exp10, pp);
+        r = sr;
+        e10 = se;
+    };
+    if !f.alt {
+        let (sr, se) = __psa_fmt_strip(r, e10);
+        r = sr;
+        e10 = se;
+    };
+    let xx = __psa_str_bytes_len(r) - 1 + e10;
+    let sci = false;
+    if xx < -4 { sci = true; };
+    if pp == -1 && xx >= 16 { sci = true; };
+    if pp != -1 && xx >= pp - 1 { sci = true; };
+    if sci {
+        let rest = __psa_str_new();
+        rest = __psa_str_push(rest, __psa_str_byte(r, 0) as u8);
+        let frac = __psa_fmt_sub(r, 1, __psa_str_bytes_len(r));
+        if __psa_str_bytes_len(frac) > 0 || f.alt {
+            rest = __psa_str_push(rest, 46u8);
+            rest = __psa_str_append_str(rest, frac);
+        };
+        rest = __psa_str_push(rest, 101u8);
+        rest = __psa_str_append_str(rest, __psa_fmt_exp_str(xx));
+        return __psa_fmt_num_assemble(pfx, __psa_str_new(), rest, f, 0, 3);
+    };
+    let (ip, fp) = __psa_fmt_parts_plain(r, e10);
+    let rest = __psa_str_new();
+    if __psa_str_bytes_len(fp) > 0 {
+        rest = __psa_str_push(rest, 46u8);
+        rest = __psa_str_append_str(rest, fp);
+    } else {
+        if f.alt {
+            rest = __psa_str_push(rest, 46u8);
+        } else {
+            rest = __psa_str_push(rest, 46u8);
+            rest = __psa_str_push(rest, 48u8);
+        };
+    };
+    return __psa_fmt_num_assemble(pfx, ip, rest, f, f.group, 3);
+}
+
+fn __psa_fmt_float_text(x: f64) -> PsaVal {
+    // str(float) / repr(float): the '' format with no spec.
+    return __psa_fmt_float(x, __psa_fmt_default());
+}
+
+fn __psa_fmt_int_fixed(x: i64, f: PsaFmt) -> PsaVal {
+    // 'f' / 'F' on an int: exact fixed-point (the digits are
+    // the integer's own; the fraction is all zeros).
+    let prec = f.prec;
+    if prec == -1 { prec = 6; };
+    let pfx = __psa_str_new();
+    if x < 0 { pfx = __psa_str_push(pfx, 45u8); };
+    if x >= 0 && f.sign == 43 { pfx = __psa_str_push(pfx, 43u8); };
+    if x >= 0 && f.sign == 32 { pfx = __psa_str_push(pfx, 32u8); };
+    let digs = __psa_fmt_int_digits(x, 10, false);
+    let rest = __psa_str_new();
+    if prec > 0 {
+        rest = __psa_str_push(rest, 46u8);
+        let i: i64 = 0;
+        while i < prec {
+            rest = __psa_str_push(rest, 48u8);
+            i = i + 1;
+        }
+    };
+    if prec == 0 && f.alt { rest = __psa_str_push(rest, 46u8); };
+    return __psa_fmt_num_assemble(pfx, digs, rest, f, f.group, 3);
+}
+
+fn __psa_fmt_int(x: i64, is_bool: bool, f: PsaFmt) -> PsaVal {
+    if is_bool && __psa_fmt_defaulted(f) {
+        return __psa_str_from_bool(x != 0);
+    };
+    let t = f.typ;
+    if t == 102 || t == 70 {
+        return __psa_fmt_int_fixed(x, f);
+    };
+    if t == 101 || t == 69 || t == 103 || t == 71 || t == 37 {
+        // Float presentation types on an int go through the
+        // float formatter, as in CPython (exact while
+        // |x| < 2^53; 'f'/'F' above are exact at any size).
+        return __psa_fmt_float(x as f64, f);
+    };
+    if t == 115 { panic(77085); };
+    if f.prec != -1 { panic(77085); };
+    if t == 99 {
+        // 'c': the code point itself. Sign, '#' and grouping
+        // are errors; '=' alignment pads before the
+        // character, like '>'.
+        if f.sign != 0 || f.alt || f.group != 0 { panic(77085); };
+        if x < 0 || x > 1114111 { panic(77085); };
+        let body = __psa_str_new();
+        body = __psa_fmt_push_cp(body, x);
+        let al = f.align;
+        if al == 0 { al = 62; };
+        return __psa_fmt_pad(body, __psa_fmt_fill(f), al, f.width);
+    };
+    if !(t == 0 || t == 100 || t == 110 || t == 98 || t == 111 || t == 120 || t == 88) {
+        panic(77085);
+    };
+    let base: i64 = 10;
+    let upper = false;
+    if t == 98 { base = 2; };
+    if t == 111 { base = 8; };
+    if t == 120 { base = 16; };
+    if t == 88 {
+        base = 16;
+        upper = true;
+    };
+    if f.group == 44 && base != 10 { panic(77085); };
+    let neg = x < 0;
+    let pfx = __psa_str_new();
+    if neg { pfx = __psa_str_push(pfx, 45u8); };
+    if !neg && f.sign == 43 { pfx = __psa_str_push(pfx, 43u8); };
+    if !neg && f.sign == 32 { pfx = __psa_str_push(pfx, 32u8); };
+    if f.alt {
+        if base == 2 {
+            pfx = __psa_str_push(pfx, 48u8);
+            pfx = __psa_str_push(pfx, 98u8);
+        };
+        if base == 8 {
+            pfx = __psa_str_push(pfx, 48u8);
+            pfx = __psa_str_push(pfx, 111u8);
+        };
+        if base == 16 {
+            pfx = __psa_str_push(pfx, 48u8);
+            if upper {
+                pfx = __psa_str_push(pfx, 88u8);
+            } else {
+                pfx = __psa_str_push(pfx, 120u8);
+            };
+        };
+    };
+    let digs = __psa_fmt_int_digits(x, base, upper);
+    let gsize: i64 = 3;
+    if base != 10 { gsize = 4; };
+    return __psa_fmt_num_assemble(pfx, digs, __psa_str_new(), f, f.group, gsize);
+}
+
+fn __psa_fmt_str(s: PsaVal, f: PsaFmt) -> PsaVal {
+    if f.typ != 0 && f.typ != 115 { panic(77085); };
+    if f.sign != 0 { panic(77085); };
+    if f.alt { panic(77085); };
+    if f.group != 0 { panic(77085); };
+    if f.align == 61 { panic(77085); };
+    let body = s;
+    if f.prec >= 0 {
+        // Precision truncates to that many code points.
+        let endb = __psa_str_cp_start(s, f.prec);
+        if endb >= 0 {
+            body = __psa_fmt_sub(s, 0, endb);
+        };
+    };
+    let al = f.align;
+    if al == 0 { al = 60; };
+    return __psa_fmt_pad(body, __psa_fmt_fill(f), al, f.width);
+}
+
+fn __psa_fmt_hex(out: PsaVal, val: i64, width: i64) -> PsaVal {
+    // Append exactly `width` lowercase hex digits of val.
+    let div: i64 = 1;
+    let k: i64 = 1;
+    while k < width {
+        div = div * 16;
+        k = k + 1;
+    }
+    while div > 0 {
+        let d = (val / div) % 16;
+        out = __psa_str_push(out, __psa_fmt_digit_char(d, false) as u8);
+        div = div / 16;
+    }
+    return out;
+}
+
+fn __psa_fmt_ascii_escape(s: PsaVal) -> PsaVal {
+    // ascii(): the repr text with every non-ASCII code
+    // point escaped as \xNN, \uNNNN or \UNNNNNNNN.
+    let out = __psa_str_new();
+    let n = __psa_str_bytes_len(s);
+    let i: i64 = 0;
+    while i < n {
+        let b = __psa_str_byte(s, i);
+        if b < 128 {
+            out = __psa_str_push(out, b as u8);
+            i = i + 1;
+        } else {
+            let len = __psa_fmt_cp_len(b);
+            let cp = b % 64;
+            if len == 3 { cp = b % 16; };
+            if len == 4 { cp = b % 8; };
+            let j: i64 = 1;
+            while j < len {
+                cp = cp * 64 + (__psa_str_byte(s, i + j) % 64);
+                j = j + 1;
+            }
+            out = __psa_str_push(out, 92u8);
+            if cp < 256 {
+                out = __psa_str_push(out, 120u8);
+                out = __psa_fmt_hex(out, cp, 2);
+            } else if cp < 65536 {
+                out = __psa_str_push(out, 117u8);
+                out = __psa_fmt_hex(out, cp, 4);
+            } else {
+                out = __psa_str_push(out, 85u8);
+                out = __psa_fmt_hex(out, cp, 8);
+            };
+            i = i + len;
+        };
+    }
+    return out;
+}
+
+fn __psa_fmt_conv(v: PsaVal, conv: i64) -> PsaVal {
+    // The conversion step of a formatted field: !s -> str,
+    // !r -> repr, !a -> repr then ASCII-escape (the escape
+    // itself happens in __psa_format_value). Floats use the
+    // shortest-round-trip text for both str and repr
+    // (CPython: str(float) == repr(float) since 3.1).
+    if v.tag == 1 {
+        return __psa_fmt_float_text(v.fpay);
+    };
+    if conv == 2 {
+        return __psa_str_of(v);
+    };
+    return __psa_repr_of(v);
+}
+
+fn __psa_format_spec(v: PsaVal, spec: PsaVal) -> PsaVal {
+    if v.tag != 6 && v.tag != 0 && v.tag != 2 && v.tag != 1 {
+        // None, containers, bytes, objects and the rest:
+        // CPython raises TypeError for ANY non-empty spec on
+        // these (object.__format__), before the spec text is
+        // even parsed. An empty spec is plain str().
+        if __psa_str_bytes_len(spec) > 0 { panic(77086); };
+        return __psa_str_of(v);
+    };
+    let f = __psa_fmt_parse(spec);
+    if v.tag == 6 { return __psa_fmt_str(v, f); };
+    if v.tag == 0 { return __psa_fmt_int(v.ipay, false, f); };
+    if v.tag == 2 { return __psa_fmt_int(v.ipay, true, f); };
+    return __psa_fmt_float(v.fpay, f);
+}
+
+fn __psa_format_value(v: PsaVal, conv: i64, spec: PsaVal) -> PsaVal {
+    // Entry point called by psa's emit for every f-string
+    // field that carries a conversion, a debug marker or a
+    // format spec. With a conversion, the converted text is
+    // formatted under string rules (CPython).
+    if conv != 0 {
+        let s = __psa_fmt_conv(v, conv);
+        if conv == 3 {
+            s = __psa_fmt_ascii_escape(s);
+        };
+        return __psa_fmt_str(s, __psa_fmt_parse(spec));
+    };
+    return __psa_format_spec(v, spec);
 }
 
 "#;

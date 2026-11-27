@@ -2,6 +2,7 @@
 //! Unsupported Python constructs fail loudly here or in the emitter.
 
 use crate::ast::*;
+use crate::diag::Diagnostic;
 use crate::lexer::{Tok, Token};
 
 pub struct Parser {
@@ -9,8 +10,107 @@ pub struct Parser {
     pos: usize,
 }
 
-fn perr(line: u32, msg: &str) -> String {
-    format!("psa parse error at line {}: {}", line, msg)
+fn perr(line: u32, msg: &str) -> Diagnostic {
+    Diagnostic::parse(line, msg)
+}
+
+/// Anchor of one token in the file being parsed (P0b). `source` is
+/// 0 here: the parser only ever sees one file at a time, and the
+/// driver (`merge_imports`) rewrites `source` for imported modules.
+fn anchor_of(t: &Token) -> SourceAnchor {
+    SourceAnchor { source: 0, line: t.line, col: t.col, col_byte: Some(t.col_byte) }
+}
+
+/// Human wording for a token, for `expected X, found Y` messages:
+/// grammar words instead of the Tok enum's Debug names (census
+/// section 3: the `{:?}` leak made parse errors unreadable).
+fn tok_word(t: &Tok) -> String {
+    let s = match t {
+        Tok::Ident(_) => "a name",
+        Tok::Int(_) => "an integer",
+        Tok::BigInt(_) => "an integer",
+        Tok::Float(_) => "a float",
+        Tok::Str(_) => "a string",
+        Tok::FStr(_) => "an f-string",
+        Tok::Bytes(_) => "a bytes literal",
+        Tok::Walrus => "`:=`",
+        Tok::Def => "`def`",
+        Tok::Class => "`class`",
+        Tok::Return => "`return`",
+        Tok::If => "`if`",
+        Tok::Elif => "`elif`",
+        Tok::Else => "`else`",
+        Tok::While => "`while`",
+        Tok::For => "`for`",
+        Tok::In => "`in`",
+        Tok::Is => "`is`",
+        Tok::Break => "`break`",
+        Tok::Continue => "`continue`",
+        Tok::Pass => "`pass`",
+        Tok::And => "`and`",
+        Tok::Or => "`or`",
+        Tok::Not => "`not`",
+        Tok::True => "`True`",
+        Tok::False => "`False`",
+        Tok::NoneLit => "`None`",
+        Tok::Lambda => "`lambda`",
+        Tok::Try => "`try`",
+        Tok::Except => "`except`",
+        Tok::Finally => "`finally`",
+        Tok::Raise => "`raise`",
+        Tok::With => "`with`",
+        Tok::Import => "`import`",
+        Tok::From => "`from`",
+        Tok::Yield => "`yield`",
+        Tok::Async => "`async`",
+        Tok::Await => "`await`",
+        Tok::LParen => "`(`",
+        Tok::RParen => "`)`",
+        Tok::LBracket => "`[`",
+        Tok::RBracket => "`]`",
+        Tok::LBrace => "`{`",
+        Tok::RBrace => "`}`",
+        Tok::Comma => "`,`",
+        Tok::Colon => "`:`",
+        Tok::Dot => "`.`",
+        Tok::Plus => "`+`",
+        Tok::Minus => "`-`",
+        Tok::Star => "`*`",
+        Tok::Slash => "`/`",
+        Tok::FloorDiv => "`//`",
+        Tok::Percent => "`%`",
+        Tok::Pow => "`**`",
+        Tok::BitAnd => "`&`",
+        Tok::BitOr => "`|`",
+        Tok::BitXor => "`^`",
+        Tok::Tilde => "`~`",
+        Tok::Shl => "`<<`",
+        Tok::Shr => "`>>`",
+        Tok::EqEq => "`==`",
+        Tok::NotEq => "`!=`",
+        Tok::Lt => "`<`",
+        Tok::LtEq => "`<=`",
+        Tok::Gt => "`>`",
+        Tok::GtEq => "`>=`",
+        Tok::Assign => "`=`",
+        Tok::PlusEq => "`+=`",
+        Tok::MinusEq => "`-=`",
+        Tok::StarEq => "`*=`",
+        Tok::SlashEq => "`/=`",
+        Tok::FloorDivEq => "`//=`",
+        Tok::PercentEq => "`%=`",
+        Tok::PowEq => "`**=`",
+        Tok::BitAndEq => "`&=`",
+        Tok::BitOrEq => "`|=`",
+        Tok::BitXorEq => "`^=`",
+        Tok::ShlEq => "`<<=`",
+        Tok::ShrEq => "`>>=`",
+        Tok::Newline => "a newline",
+        Tok::Indent => "an indented block",
+        Tok::Dedent => "a dedent",
+        Tok::Eof => "end of file",
+    };
+    s.to_string()
 }
 
 impl Parser {
@@ -36,6 +136,49 @@ impl Parser {
         self.toks[self.pos].line
     }
 
+    fn cur_tok(&self) -> &Token {
+        &self.toks[self.pos]
+    }
+
+    /// Column of the current token (1-based character column, P0b).
+    fn col(&self) -> u32 {
+        self.cur_tok().col
+    }
+
+    /// Anchor of the current token, in the file being parsed
+    /// (source 0; `merge_imports` rewrites `source` for modules).
+    fn anchor(&self) -> SourceAnchor {
+        anchor_of(self.cur_tok())
+    }
+
+    /// The token just consumed. Call only right after a `bump` /
+    /// `expect` that consumed a real token (never Eof).
+    fn prev_tok(&self) -> &Token {
+        &self.toks[self.pos - 1]
+    }
+
+    /// Span from `start` to just past a single-character closing
+    /// token (`)` / `]`) that was just consumed.
+    fn span_past(&self, start: SourceAnchor, closer: &Token) -> ExprSpan {
+        ExprSpan {
+            start,
+            end_line: closer.line,
+            end_col: closer.col + 1,
+            end_col_byte: Some(closer.col_byte + 1),
+        }
+    }
+
+    /// Span from `start` to just past the identifier in `tok`
+    /// (an attribute name just consumed).
+    fn span_to_ident_end(&self, start: SourceAnchor, tok: &Token, name: &str) -> ExprSpan {
+        ExprSpan {
+            start,
+            end_line: tok.line,
+            end_col: tok.col + name.chars().count() as u32,
+            end_col_byte: Some(tok.col_byte + name.len() as u32),
+        }
+    }
+
     fn bump(&mut self) -> Tok {
         let t = self.toks[self.pos].tok.clone();
         if self.pos + 1 < self.toks.len() {
@@ -44,12 +187,19 @@ impl Parser {
         t
     }
 
-    fn expect(&mut self, t: &Tok) -> Result<(), String> {
+    fn expect(&mut self, t: &Tok) -> Result<(), Diagnostic> {
         if self.peek() == t {
             self.bump();
             Ok(())
         } else {
-            Err(perr(self.line(), &format!("expected {:?}, found {:?}", t, self.peek())))
+            // The offending token is the current one: its column is
+            // the error's column (P0b — this is what makes a_parse's
+            // JSON site carry a real col).
+            Err(Diagnostic::parse_col(
+                self.line(),
+                self.col(),
+                &format!("expected {}, found {}", tok_word(t), tok_word(self.peek())),
+            ))
         }
     }
 
@@ -59,7 +209,7 @@ impl Parser {
         }
     }
 
-    pub fn parse_program(&mut self) -> Result<Program, String> {
+    pub fn parse_program(&mut self) -> Result<Program, Diagnostic> {
         let mut prog = Program {
             funcs: Vec::new(),
             classes: Vec::new(),
@@ -69,6 +219,9 @@ impl Parser {
             const_names: Vec::new(),
             modules: Vec::new(),
             std_imports: Vec::new(),
+            // sources[0] (the main file) is filled in by the driver
+            // (P0b); the parser never knows the file's path.
+            sources: Vec::new(),
         };
         self.skip_newlines();
         while !matches!(self.peek(), Tok::Eof) {
@@ -98,8 +251,9 @@ impl Parser {
     /// assignments (`name = expr`); anything else is refused
     /// loudly. Nested class definitions never reach here: a
     /// `class` token inside a block fails in parse_stmt.
-    fn parse_class(&mut self) -> Result<ClassDef, String> {
+    fn parse_class(&mut self) -> Result<ClassDef, Diagnostic> {
         let line = self.line();
+        let anchor = self.anchor();
         self.expect(&Tok::Class)?;
         let name = match self.bump() {
             Tok::Ident(n) => n,
@@ -182,11 +336,12 @@ impl Parser {
             attrs.push((aname, value));
         }
         self.expect(&Tok::Dedent)?;
-        Ok(ClassDef { name, base, methods, attrs, line })
+        Ok(ClassDef { name, base, methods, attrs, line, anchor })
     }
 
-    fn parse_func(&mut self, is_async: bool) -> Result<Func, String> {
+    fn parse_func(&mut self, is_async: bool) -> Result<Func, Diagnostic> {
         let line = self.line();
+        let anchor = self.anchor();
         if is_async {
             self.expect(&Tok::Async)?;
         }
@@ -278,12 +433,12 @@ impl Parser {
         self.expect(&Tok::RParen)?;
         self.expect(&Tok::Colon)?;
         let body = self.parse_block()?;
-        Ok(Func { name, params, vararg, kwarg, is_async, body, line })
+        Ok(Func { name, params, vararg, kwarg, is_async, body, line, anchor })
     }
 
     /// After a colon: either an indented block or a single simple statement
     /// on the same line (v0.1 supports the block form; one-liners too).
-    fn parse_block(&mut self) -> Result<Vec<Stmt>, String> {
+    fn parse_block(&mut self) -> Result<Vec<Stmt>, Diagnostic> {
         if matches!(self.peek(), Tok::Newline) {
             self.bump();
             self.expect(&Tok::Indent)?;
@@ -307,7 +462,7 @@ impl Parser {
         }
     }
 
-    fn parse_stmt(&mut self) -> Result<Stmt, String> {
+    fn parse_stmt(&mut self) -> Result<Stmt, Diagnostic> {
         // `match` is a soft keyword: a statement starting with
         // the identifier `match` is a match statement only when
         // a subject expression and a colon follow.
@@ -318,17 +473,31 @@ impl Parser {
             Tok::If => self.parse_if(),
             Tok::Try => self.parse_try(),
             Tok::With => self.parse_with(),
+            // D8: a def nested inside a function body. The
+            // closure-conversion pass lifts it to a synthetic
+            // top-level def; `async def` parses the same way
+            // and is refused there (D8 v1).
+            Tok::Def => {
+                let f = self.parse_func(false)?;
+                Ok(Stmt::Def(f))
+            }
+            Tok::Async => {
+                let f = self.parse_func(true)?;
+                Ok(Stmt::Def(f))
+            }
             Tok::Import | Tok::From => Err(perr(
                 self.line(),
                 "import is only allowed at the top level of a module in v1 (D6)",
             )),
             Tok::While => {
                 let line = self.line();
+                let anchor = self.anchor();
                 self.bump();
-                let cond = self.parse_expr()?;
+                let cond = self.parse_condition_expr()?;
                 self.expect(&Tok::Colon)?;
                 let body = self.parse_block()?;
-                Ok(Stmt::While { cond, body, line })
+                let els = self.parse_loop_else()?;
+                Ok(Stmt::While { cond, body, els, line, anchor })
             }
             Tok::For => self.parse_for(),
             _ => {
@@ -339,10 +508,11 @@ impl Parser {
         }
     }
 
-    fn parse_if(&mut self) -> Result<Stmt, String> {
+    fn parse_if(&mut self) -> Result<Stmt, Diagnostic> {
         let line = self.line();
+        let anchor = self.anchor();
         self.expect(&Tok::If)?;
-        let cond = self.parse_expr()?;
+        let cond = self.parse_condition_expr()?;
         self.expect(&Tok::Colon)?;
         let body = self.parse_block()?;
         let mut arms = vec![(cond, body)];
@@ -354,7 +524,7 @@ impl Parser {
             match self.peek().clone() {
                 Tok::Elif => {
                     self.bump();
-                    let c = self.parse_expr()?;
+                    let c = self.parse_condition_expr()?;
                     self.expect(&Tok::Colon)?;
                     let b = self.parse_block()?;
                     arms.push((c, b));
@@ -371,11 +541,12 @@ impl Parser {
                 }
             }
         }
-        Ok(Stmt::If { arms, els, line })
+        Ok(Stmt::If { arms, els, line, anchor })
     }
 
-    fn parse_for(&mut self) -> Result<Stmt, String> {
+    fn parse_for(&mut self) -> Result<Stmt, Diagnostic> {
         let line = self.line();
+        let anchor = self.anchor();
         self.expect(&Tok::For)?;
         let mut vars = Vec::new();
         loop {
@@ -402,7 +573,8 @@ impl Parser {
                     "continue inside a for-each loop is not supported in v0.7 (use while)",
                 ));
             }
-            return Ok(Stmt::ForEach { vars, iter, body, line });
+            let els = self.parse_loop_else()?;
+            return Ok(Stmt::ForEach { vars, iter, body, els, line, anchor });
         }
         if vars.len() > 1 {
             return Err(perr(
@@ -443,13 +615,14 @@ impl Parser {
                 "continue inside a for-range loop is not supported in v0.1 (use while)",
             ));
         }
-        Ok(Stmt::ForRange { var, start, stop, body, line })
+        let els = self.parse_loop_else()?;
+        Ok(Stmt::ForRange { var, start, stop, body, els, line, anchor })
     }
 
     /// `import a[.b]` / `from a[.b] import x [as y], ...` at
     /// the top level (D6). Module aliasing (`import a as b`)
     /// and star imports are refused loudly in v1.
-    fn parse_import(&mut self) -> Result<Import, String> {
+    fn parse_import(&mut self) -> Result<Import, Diagnostic> {
         let line = self.line();
         if matches!(self.peek(), Tok::Import) {
             self.bump();
@@ -506,7 +679,7 @@ impl Parser {
     }
 
     /// A dotted module path: `a` or `a.b` or `a.b.c`.
-    fn parse_module_path(&mut self, line: u32) -> Result<String, String> {
+    fn parse_module_path(&mut self, line: u32) -> Result<String, Diagnostic> {
         let mut parts = Vec::new();
         loop {
             match self.bump() {
@@ -544,8 +717,9 @@ impl Parser {
 
     /// `match <subject>: (case <pattern> [if <guard>]: block)+`
     /// (D7). Case bodies are indented blocks, as in Python.
-    fn parse_match(&mut self) -> Result<Stmt, String> {
+    fn parse_match(&mut self) -> Result<Stmt, Diagnostic> {
         let line = self.line();
+        let anchor = self.anchor();
         self.bump(); // the `match` identifier
         let subject = self.parse_expr()?;
         self.expect(&Tok::Colon)?;
@@ -564,6 +738,7 @@ impl Parser {
                 continue;
             }
             let cline = self.line();
+            let canchor = self.anchor();
             match self.bump() {
                 Tok::Ident(n) if n == "case" => {}
                 t => {
@@ -576,26 +751,26 @@ impl Parser {
             let pattern = self.parse_pattern()?;
             let guard = if matches!(self.peek(), Tok::If) {
                 self.bump();
-                Some(self.parse_expr()?)
+                Some(self.parse_condition_expr()?)
             } else {
                 None
             };
             self.expect(&Tok::Colon)?;
             let body = self.parse_block()?;
-            cases.push(MatchCase { pattern, guard, body, line: cline });
+            cases.push(MatchCase { pattern, guard, body, line: cline, anchor: canchor });
         }
         self.expect(&Tok::Dedent)?;
         if cases.is_empty() {
             return Err(perr(line, "a match statement needs at least one case"));
         }
-        Ok(Stmt::Match { subject, cases, line })
+        Ok(Stmt::Match { subject, cases, line, anchor })
     }
 
     /// One match pattern (D7 v1 subset). OR alternatives are
     /// split on BitOr at this level; a sequence pattern is a
     /// bracketed or parenthesised comma list; anything else is
     /// a single atom.
-    fn parse_pattern(&mut self) -> Result<Pattern, String> {
+    fn parse_pattern(&mut self) -> Result<Pattern, Diagnostic> {
         let line = self.line();
         let first = self.parse_pattern_atom()?;
         if matches!(self.peek(), Tok::BitOr) {
@@ -609,7 +784,7 @@ impl Parser {
         Ok(first)
     }
 
-    fn parse_pattern_atom(&mut self) -> Result<Pattern, String> {
+    fn parse_pattern_atom(&mut self) -> Result<Pattern, Diagnostic> {
         let line = self.line();
         match self.peek().clone() {
             Tok::LBracket => {
@@ -643,6 +818,10 @@ impl Parser {
                 self.bump();
                 Ok(Pattern::Lit(Expr::Int(v)))
             }
+            Tok::BigInt(s) => {
+                self.bump();
+                Ok(Pattern::Lit(Expr::BigInt(s)))
+            }
             Tok::Float(v) => {
                 self.bump();
                 Ok(Pattern::Lit(Expr::Float(v)))
@@ -650,6 +829,10 @@ impl Parser {
             Tok::Str(s) => {
                 self.bump();
                 Ok(Pattern::Lit(Expr::Str(s)))
+            }
+            Tok::Bytes(bs) => {
+                self.bump();
+                Ok(Pattern::Lit(Expr::Bytes(bs)))
             }
             Tok::True => {
                 self.bump();
@@ -667,6 +850,12 @@ impl Parser {
                 self.bump();
                 match self.bump() {
                     Tok::Int(v) => Ok(Pattern::Lit(Expr::Int(-v))),
+                    // Negative pattern: fold the sign into the digit
+                    // string (the only place Expr::BigInt may carry
+                    // '-'; the runtime parser __psa_big_from_psastr
+                    // accepts it and the norm gate demotes -2^63 back
+                    // to a tag-0 value).
+                    Tok::BigInt(s) => Ok(Pattern::Lit(Expr::BigInt(format!("-{s}")))),
                     Tok::Float(v) => Ok(Pattern::Lit(Expr::Float(-v))),
                     t => Err(perr(
                         line,
@@ -714,7 +903,7 @@ impl Parser {
         }
     }
 
-    fn parse_pattern_seq(&mut self, close: &Tok) -> Result<Vec<Pattern>, String> {
+    fn parse_pattern_seq(&mut self, close: &Tok) -> Result<Vec<Pattern>, Diagnostic> {
         let mut pats = Vec::new();
         if matches!(self.peek(), t if t == close) {
             self.bump();
@@ -739,8 +928,9 @@ impl Parser {
     /// [finally: block]` (D6). A try needs at least one except
     /// or a finally; else requires an except; a bare except
     /// must be the last handler (CPython's rules).
-    fn parse_try(&mut self) -> Result<Stmt, String> {
+    fn parse_try(&mut self) -> Result<Stmt, Diagnostic> {
         let line = self.line();
+        let anchor = self.anchor();
         self.expect(&Tok::Try)?;
         self.expect(&Tok::Colon)?;
         let body = self.parse_block()?;
@@ -752,6 +942,7 @@ impl Parser {
             self.skip_newlines();
             match self.peek().clone() {
                 Tok::Except if finally.is_none() && els.is_none() => {
+                    let hanchor = self.anchor();
                     self.bump();
                     let hline = self.line();
                     let mut classes: Vec<String> = Vec::new();
@@ -802,7 +993,7 @@ impl Parser {
                     };
                     self.expect(&Tok::Colon)?;
                     let hbody = self.parse_block()?;
-                    handlers.push(ExcHandler { classes, bind, body: hbody, line: hline });
+                    handlers.push(ExcHandler { classes, bind, body: hbody, line: hline, anchor: hanchor });
                 }
                 Tok::Else if finally.is_none() && els.is_none() => {
                     self.bump();
@@ -832,13 +1023,14 @@ impl Parser {
                 return Err(perr(line, "a bare `except:` clause must be the last except clause"));
             }
         }
-        Ok(Stmt::Try { body, handlers, els, finally, line })
+        Ok(Stmt::Try { body, handlers, els, finally, line, anchor })
     }
 
     /// `with <expr> [as name] (, <expr> [as name])* : block`
     /// (D6).
-    fn parse_with(&mut self) -> Result<Stmt, String> {
+    fn parse_with(&mut self) -> Result<Stmt, Diagnostic> {
         let line = self.line();
+        let anchor = self.anchor();
         self.expect(&Tok::With)?;
         let mut items: Vec<(Expr, Option<String>)> = Vec::new();
         loop {
@@ -866,25 +1058,26 @@ impl Parser {
         }
         self.expect(&Tok::Colon)?;
         let body = self.parse_block()?;
-        Ok(Stmt::With { items, body, line })
+        Ok(Stmt::With { items, body, line, anchor })
     }
 
-    fn parse_simple_stmt(&mut self) -> Result<Stmt, String> {
+    fn parse_simple_stmt(&mut self) -> Result<Stmt, Diagnostic> {
         let line = self.line();
+        let anchor = self.anchor();
         match self.peek().clone() {
             Tok::Yield => {
                 self.bump();
                 if matches!(self.peek(), Tok::Newline) {
-                    Ok(Stmt::Yield { value: None, line })
+                    Ok(Stmt::Yield { value: None, line, anchor })
                 } else {
                     let v = self.parse_expr()?;
-                    Ok(Stmt::Yield { value: Some(v), line })
+                    Ok(Stmt::Yield { value: Some(v), line, anchor })
                 }
             }
             Tok::Raise => {
                 self.bump();
                 if matches!(self.peek(), Tok::Newline) {
-                    Ok(Stmt::Raise { value: None, line })
+                    Ok(Stmt::Raise { value: None, line, anchor })
                 } else {
                     let v = self.parse_expr()?;
                     if matches!(self.peek(), Tok::From) {
@@ -893,13 +1086,13 @@ impl Parser {
                             "exception chaining (`raise X from Y`) is not supported yet (D6 v1)",
                         ));
                     }
-                    Ok(Stmt::Raise { value: Some(v), line })
+                    Ok(Stmt::Raise { value: Some(v), line, anchor })
                 }
             }
             Tok::Return => {
                 self.bump();
                 if matches!(self.peek(), Tok::Newline) {
-                    Ok(Stmt::Return { value: None, line })
+                    Ok(Stmt::Return { value: None, line, anchor })
                 } else {
                     let v = self.parse_expr()?;
                     if matches!(self.peek(), Tok::Comma) {
@@ -915,38 +1108,79 @@ impl Parser {
                         Ok(Stmt::Return {
                             value: Some(Expr::TupleLit(elems)),
                             line,
+                            anchor,
                         })
                     } else {
-                        Ok(Stmt::Return { value: Some(v), line })
+                        Ok(Stmt::Return { value: Some(v), line, anchor })
                     }
                 }
             }
             Tok::Break => {
                 self.bump();
-                Ok(Stmt::Break { line })
+                Ok(Stmt::Break { line, anchor })
             }
             Tok::Continue => {
                 self.bump();
-                Ok(Stmt::Continue { line })
+                Ok(Stmt::Continue { line, anchor })
             }
             Tok::Pass => {
                 self.bump();
-                Ok(Stmt::Pass { line })
+                Ok(Stmt::Pass { line, anchor })
+            }
+            // D8: `global a, b` / `nonlocal a, b` (soft
+            // keywords, like assert/del). Consumed by the
+            // closure-conversion pass.
+            Tok::Ident(name) if name == "global" || name == "nonlocal" => {
+                let is_global = name == "global";
+                self.bump();
+                let mut names = Vec::new();
+                loop {
+                    match self.bump() {
+                        Tok::Ident(n) => names.push(n),
+                        t => {
+                            return Err(perr(
+                                line,
+                                &format!(
+                                    "expected a name in a {} declaration, found {:?}",
+                                    if is_global { "global" } else { "nonlocal" },
+                                    t
+                                ),
+                            ))
+                        }
+                    }
+                    if matches!(self.peek(), Tok::Comma) {
+                        self.bump();
+                        continue;
+                    }
+                    break;
+                }
+                if is_global {
+                    Ok(Stmt::Global { names, line, anchor })
+                } else {
+                    Ok(Stmt::Nonlocal { names, line, anchor })
+                }
             }
             Tok::Ident(name) if name == "assert" => {
                 self.bump();
                 let cond = self.parse_expr()?;
+                // The message is a diagnostic label: it is carried
+                // into the AST and written to stderr at the failure
+                // site before panic(77040) (census section 0.6 --
+                // it used to be parsed, validated and dropped).
+                let mut msg = None;
                 if matches!(self.peek(), Tok::Comma) {
                     self.bump();
-                    let msg = self.parse_expr()?;
-                    if !matches!(msg, Expr::Str(_)) {
-                        return Err(perr(
-                            line,
-                            "assert message must be a string literal in v1 (it is a diagnostic label; psa panics with a code)",
-                        ));
+                    match self.parse_expr()? {
+                        Expr::Str(s) => msg = Some(s),
+                        _ => {
+                            return Err(perr(
+                                line,
+                                "assert message must be a string literal in v1 (it is a diagnostic label; psa panics with a code)",
+                            ));
+                        }
                     }
                 }
-                Ok(Stmt::Assert { cond, line })
+                Ok(Stmt::Assert { cond, line, msg, anchor })
             }
             Tok::Ident(name) if name == "del" => {
                 self.bump();
@@ -966,14 +1200,18 @@ impl Parser {
                                 "del of an attribute cannot be combined with other del targets in v1",
                             ));
                         }
+                        // The first name token, for the chain's span start (P0b).
+                        let first_anchor = self.anchor();
                         let first = match self.bump() {
                             Tok::Ident(n) => n,
                             _ => unreachable!(),
                         };
-                        let mut base = Expr::Name(first);
+                        let first_span = ExprSpan::from_name(first_anchor, &first);
+                        let mut base = Expr::Name(first, first_span);
                         let mut attr: Option<String> = None;
                         while matches!(self.peek(), Tok::Dot) {
                             self.bump();
+                            let attr_tok = self.cur_tok().clone();
                             let n = match self.bump() {
                                 Tok::Ident(n) => n,
                                 t => {
@@ -987,7 +1225,10 @@ impl Parser {
                                 }
                             };
                             if let Some(prev) = attr.take() {
-                                base = Expr::Attr(Box::new(base), prev);
+                                let span = self.span_to_ident_end(
+                                    first_anchor, &attr_tok, &prev,
+                                );
+                                base = Expr::Attr(Box::new(base), prev, span);
                             }
                             attr = Some(n);
                         }
@@ -995,6 +1236,7 @@ impl Parser {
                             base,
                             name: attr.expect("del attribute target"),
                             line,
+                            anchor,
                         });
                     }
                 }
@@ -1024,7 +1266,7 @@ impl Parser {
                     }
                     break;
                 }
-                Ok(Stmt::Del { targets, line })
+                Ok(Stmt::Del { targets, line, anchor })
             }
             Tok::Ident(name) => {
                 // Multiple assignment: `a, b = v1, v2` (comma after the
@@ -1086,9 +1328,9 @@ impl Parser {
                         // the chained form keeps MultiAssign.
                         if multi && values.len() == 1 {
                             let value = values.into_iter().next().unwrap();
-                            return Ok(Stmt::Unpack { names, value, line });
+                            return Ok(Stmt::Unpack { names, value, line, anchor });
                         }
-                        return Ok(Stmt::MultiAssign { names, values, line });
+                        return Ok(Stmt::MultiAssign { names, values, line, anchor });
                     }
                 }
                 // Index assignment: name[expr] (=|+=|-=|*=) expr — try it
@@ -1114,6 +1356,7 @@ impl Parser {
                                     op,
                                     value,
                                     line,
+                                    anchor,
                                 });
                             }
                         }
@@ -1125,16 +1368,23 @@ impl Parser {
                 // expression statement falls through.
                 if matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Dot)) {
                     let save = self.pos;
+                    // The first name token, for the chain's span start (P0b).
+                    let base_anchor = self.anchor();
                     self.bump(); // first name
-                    let mut base = Expr::Name(name.clone());
+                    let mut base =
+                        Expr::Name(name.clone(), ExprSpan::from_name(base_anchor, &name));
                     let mut attr: Option<String> = None;
                     let mut shape_ok = true;
                     while matches!(self.peek(), Tok::Dot) {
                         self.bump();
+                        let attr_tok = self.cur_tok().clone();
                         match self.bump() {
                             Tok::Ident(n) => {
                                 if let Some(prev) = attr.take() {
-                                    base = Expr::Attr(Box::new(base), prev);
+                                    let span = self.span_to_ident_end(
+                                        base_anchor, &attr_tok, &prev,
+                                    );
+                                    base = Expr::Attr(Box::new(base), prev, span);
                                 }
                                 attr = Some(n);
                             }
@@ -1159,6 +1409,7 @@ impl Parser {
                                     op,
                                     value,
                                     line,
+                                    anchor,
                                 });
                             }
                         }
@@ -1186,35 +1437,77 @@ impl Parser {
                                 name,
                                 value: Expr::TupleLit(elems),
                                 line,
+                                anchor,
                             });
                         }
-                        Ok(Stmt::Assign { name, value, line })
+                        Ok(Stmt::Assign { name, value, line, anchor })
                     }
                     Some(t) if aug_op(&t).is_some() => {
                         self.bump(); // name
                         let optok = self.bump();
                         let op = aug_op(&optok).unwrap();
                         let value = self.parse_expr()?;
-                        Ok(Stmt::AugAssign { name, op, value, line })
+                        Ok(Stmt::AugAssign { name, op, value, line, anchor })
                     }
                     _ => {
                         let e = self.parse_expr()?;
-                        Ok(Stmt::ExprStmt { value: e, line })
+                        Ok(Stmt::ExprStmt { value: e, line, anchor })
                     }
                 }
             }
             _ => {
                 let e = self.parse_expr()?;
-                Ok(Stmt::ExprStmt { value: e, line })
+                Ok(Stmt::ExprStmt { value: e, line, anchor })
             }
         }
     }
 
-    pub fn parse_expr(&mut self) -> Result<Expr, String> {
+    pub fn parse_expr(&mut self) -> Result<Expr, Diagnostic> {
         if matches!(self.peek(), Tok::Lambda) {
             return self.parse_lambda();
         }
         self.parse_ternary()
+    }
+
+    /// A condition position (if/elif/while condition, a
+    /// comprehension `if` clause, a match guard): CPython allows
+    /// a BARE assignment expression here (`while line := next():`)
+    /// where other expression positions demand parentheses. A
+    /// bare walrus is exactly `Name := <full expression>`.
+    /// Also used for call arguments and subscript parts, which
+    /// are named-expression positions in CPython's grammar
+    /// (`f(x := 5)`, `a[x := 5]` are legal unparenthesised).
+    fn parse_condition_expr(&mut self) -> Result<Expr, Diagnostic> {
+        if matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek2(), Tok::Walrus) {
+            let name = match self.bump() {
+                Tok::Ident(n) => n,
+                _ => unreachable!(),
+            };
+            self.bump(); // :=
+            let value = self.parse_expr()?;
+            return Ok(Expr::Walrus { name, value: Box::new(value) });
+        }
+        self.parse_expr()
+    }
+
+    /// The optional `else:` clause after a loop body (loop-else:
+    /// it runs when the loop finishes without `break`). Mirrors
+    /// parse_if's continuation scan: blank lines are skipped for
+    /// the lookahead and the position is restored when no else
+    /// follows. An else belonging to an enclosing construct is
+    /// always shielded by a Dedent token, so it is never stolen.
+    fn parse_loop_else(&mut self) -> Result<Option<Vec<Stmt>>, Diagnostic> {
+        let save = self.pos;
+        self.skip_newlines();
+        if matches!(self.peek(), Tok::Else) {
+            self.bump();
+            self.expect(&Tok::Colon)?;
+            let body = self.parse_block()?;
+            Ok(Some(body))
+        } else {
+            self.pos = save;
+            Ok(None)
+        }
     }
 
     /// `lambda a, b: body` (D3). Plain identifier parameters
@@ -1222,7 +1515,7 @@ impl Parser {
     /// are refused loudly here (the desugared def could carry
     /// them, but a lambda's signature cannot be pinned from a
     /// direct call site, so they ride on a later slice).
-    fn parse_lambda(&mut self) -> Result<Expr, String> {
+    fn parse_lambda(&mut self) -> Result<Expr, Diagnostic> {
         let line = self.line();
         self.bump();
         let mut params: Vec<String> = Vec::new();
@@ -1264,7 +1557,7 @@ impl Parser {
     /// Python conditional expression: `then if cond else els`. The `then`
     /// operand is an or-expression; the else branch is a full expression
     /// (so `a if c1 else b if c2 else d` chains like elif).
-    fn parse_ternary(&mut self) -> Result<Expr, String> {
+    fn parse_ternary(&mut self) -> Result<Expr, Diagnostic> {
         let then = self.parse_or()?;
         if matches!(self.peek(), Tok::If) {
             self.bump();
@@ -1280,7 +1573,7 @@ impl Parser {
         Ok(then)
     }
 
-    fn parse_or(&mut self) -> Result<Expr, String> {
+    fn parse_or(&mut self) -> Result<Expr, Diagnostic> {
         let mut lhs = self.parse_and()?;
         while matches!(self.peek(), Tok::Or) {
             self.bump();
@@ -1290,7 +1583,7 @@ impl Parser {
         Ok(lhs)
     }
 
-    fn parse_and(&mut self) -> Result<Expr, String> {
+    fn parse_and(&mut self) -> Result<Expr, Diagnostic> {
         let mut lhs = self.parse_not()?;
         while matches!(self.peek(), Tok::And) {
             self.bump();
@@ -1300,7 +1593,7 @@ impl Parser {
         Ok(lhs)
     }
 
-    fn parse_not(&mut self) -> Result<Expr, String> {
+    fn parse_not(&mut self) -> Result<Expr, Diagnostic> {
         if matches!(self.peek(), Tok::Not) {
             self.bump();
             let e = self.parse_not()?;
@@ -1309,12 +1602,17 @@ impl Parser {
         self.parse_cmp()
     }
 
-    fn parse_cmp(&mut self) -> Result<Expr, String> {
+    fn parse_cmp(&mut self) -> Result<Expr, Diagnostic> {
         let mut operands = vec![self.parse_bitor()?];
         let mut ops: Vec<BinOp> = Vec::new();
         loop {
             let not_in = matches!(self.peek(), Tok::Not)
                 && matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::In));
+            // `is not` is one operator (CPython): `is` directly
+            // followed by `not`. The reverse order (`not is`) is
+            // not an operator and stays a parse error downstream.
+            let is_not = matches!(self.peek(), Tok::Is)
+                && matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Not));
             let op = match self.peek() {
                 Tok::EqEq => BinOp::Eq,
                 Tok::NotEq => BinOp::NotEq,
@@ -1323,6 +1621,11 @@ impl Parser {
                 Tok::Gt => BinOp::Gt,
                 Tok::GtEq => BinOp::GtEq,
                 Tok::In => BinOp::In,
+                Tok::Is if is_not => {
+                    self.bump();
+                    BinOp::IsNot
+                }
+                Tok::Is => BinOp::Is,
                 Tok::Not if not_in => {
                     self.bump();
                     BinOp::NotIn
@@ -1363,7 +1666,7 @@ impl Parser {
         Ok(acc.unwrap())
     }
 
-    fn parse_bitor(&mut self) -> Result<Expr, String> {
+    fn parse_bitor(&mut self) -> Result<Expr, Diagnostic> {
         let mut lhs = self.parse_bitxor()?;
         while matches!(self.peek(), Tok::BitOr) {
             self.bump();
@@ -1373,7 +1676,7 @@ impl Parser {
         Ok(lhs)
     }
 
-    fn parse_bitxor(&mut self) -> Result<Expr, String> {
+    fn parse_bitxor(&mut self) -> Result<Expr, Diagnostic> {
         let mut lhs = self.parse_bitand()?;
         while matches!(self.peek(), Tok::BitXor) {
             self.bump();
@@ -1383,7 +1686,7 @@ impl Parser {
         Ok(lhs)
     }
 
-    fn parse_bitand(&mut self) -> Result<Expr, String> {
+    fn parse_bitand(&mut self) -> Result<Expr, Diagnostic> {
         let mut lhs = self.parse_shift()?;
         while matches!(self.peek(), Tok::BitAnd) {
             self.bump();
@@ -1393,7 +1696,7 @@ impl Parser {
         Ok(lhs)
     }
 
-    fn parse_shift(&mut self) -> Result<Expr, String> {
+    fn parse_shift(&mut self) -> Result<Expr, Diagnostic> {
         let mut lhs = self.parse_add()?;
         loop {
             let op = match self.peek() {
@@ -1408,7 +1711,7 @@ impl Parser {
         Ok(lhs)
     }
 
-    fn parse_add(&mut self) -> Result<Expr, String> {
+    fn parse_add(&mut self) -> Result<Expr, Diagnostic> {
         let mut lhs = self.parse_mul()?;
         loop {
             let op = match self.peek() {
@@ -1423,7 +1726,7 @@ impl Parser {
         Ok(lhs)
     }
 
-    fn parse_mul(&mut self) -> Result<Expr, String> {
+    fn parse_mul(&mut self) -> Result<Expr, Diagnostic> {
         let mut lhs = self.parse_unary()?;
         loop {
             let op = match self.peek() {
@@ -1440,7 +1743,7 @@ impl Parser {
         Ok(lhs)
     }
 
-    fn parse_unary(&mut self) -> Result<Expr, String> {
+    fn parse_unary(&mut self) -> Result<Expr, Diagnostic> {
         if matches!(self.peek(), Tok::Await) {
             self.bump();
             let e = self.parse_unary()?;
@@ -1466,7 +1769,7 @@ impl Parser {
     /// Python power: `primary ** factor`, right-associative, and binding
     /// tighter than a unary minus on its left (`-2 ** 2 == -4`), while the
     /// exponent itself may carry a sign (`2 ** -1`).
-    fn parse_power(&mut self) -> Result<Expr, String> {
+    fn parse_power(&mut self) -> Result<Expr, Diagnostic> {
         let base = self.parse_postfix()?;
         if matches!(self.peek(), Tok::Pow) {
             self.bump();
@@ -1476,7 +1779,12 @@ impl Parser {
         Ok(base)
     }
 
-    fn parse_postfix(&mut self) -> Result<Expr, String> {
+    fn parse_postfix(&mut self) -> Result<Expr, Diagnostic> {
+        // Start anchor of the whole postfix chain (P0b): the first
+        // token of the base atom. Every Call/Index/Attr built in
+        // this call starts here; nested postfix calls capture their
+        // own start the same way.
+        let base_start = self.anchor();
         let mut e = self.parse_atom()?;
         loop {
             match self.peek() {
@@ -1518,7 +1826,12 @@ impl Parser {
                                     "positional argument follows keyword argument",
                                 ));
                             }
-                            args.push(self.parse_expr()?);
+                            // A positional argument is a named
+                            // expression in CPython's grammar:
+                            // `f(x := 5)` is legal bare. (Keyword
+                            // values above stay parse_expr —
+                            // `f(k=x := 5)` is a SyntaxError.)
+                            args.push(self.parse_condition_expr()?);
                             if matches!(self.peek(), Tok::Comma) {
                                 self.bump();
                             } else {
@@ -1527,38 +1840,51 @@ impl Parser {
                         }
                     }
                     self.expect(&Tok::RParen)?;
-                    e = Expr::Call(Box::new(e), args, kwargs);
+                    let call_span = self.span_past(base_start, self.prev_tok());
+                    e = Expr::Call(Box::new(e), args, kwargs, call_span);
                 }
                 Tok::LBracket => {
                     self.bump();
+                    // Subscript parts are named expressions in
+                    // CPython's grammar: `a[x := 5]` (and slice
+                    // bounds) are legal unparenthesised.
                     let mut lo = None;
                     if !matches!(self.peek(), Tok::Colon) {
-                        lo = Some(Box::new(self.parse_expr()?));
+                        lo = Some(Box::new(self.parse_condition_expr()?));
                     }
                     if matches!(self.peek(), Tok::Colon) {
                         self.bump();
                         let mut hi = None;
                         if !matches!(self.peek(), Tok::Colon | Tok::RBracket) {
-                            hi = Some(Box::new(self.parse_expr()?));
+                            hi = Some(Box::new(self.parse_condition_expr()?));
                         }
                         let mut step = None;
                         if matches!(self.peek(), Tok::Colon) {
                             self.bump();
                             if !matches!(self.peek(), Tok::RBracket) {
-                                step = Some(Box::new(self.parse_expr()?));
+                                step = Some(Box::new(self.parse_condition_expr()?));
                             }
                         }
                         self.expect(&Tok::RBracket)?;
                         e = Expr::Slice(Box::new(e), lo, hi, step);
                     } else {
                         self.expect(&Tok::RBracket)?;
-                        e = Expr::Index(Box::new(e), lo.unwrap());
+                        let index_span = self.span_past(base_start, self.prev_tok());
+                        e = Expr::Index(Box::new(e), lo.unwrap(), index_span);
                     }
                 }
                 Tok::Dot => {
                     self.bump();
+                    // The attribute-name token, for the Attr span's
+                    // end (P0b). Captured before the bump consumes it.
+                    let method_tok = self.cur_tok().clone();
                     let method = match self.bump() {
                         Tok::Ident(n) => n,
+                        // Keywords are legal attribute names in
+                        // CPython (`obj.is`); `is` lexed as an
+                        // identifier before 171-B, so keep it
+                        // readable here.
+                        Tok::Is => "is".to_string(),
                         t => {
                             return Err(perr(
                                 self.line(),
@@ -1568,14 +1894,18 @@ impl Parser {
                     };
                     if !matches!(self.peek(), Tok::LParen) {
                         // Attribute access (D4): `base.name`.
-                        e = Expr::Attr(Box::new(e), method);
+                        let attr_span =
+                            self.span_to_ident_end(base_start, &method_tok, &method);
+                        e = Expr::Attr(Box::new(e), method, attr_span);
                         continue;
                     }
                     self.expect(&Tok::LParen)?;
                     let mut args = Vec::new();
                     if !matches!(self.peek(), Tok::RParen) {
                         loop {
-                            args.push(self.parse_expr()?);
+                            // Method-call arguments are named
+                            // expressions too (see the Call branch).
+                            args.push(self.parse_condition_expr()?);
                             if matches!(self.peek(), Tok::Comma) {
                                 self.bump();
                             } else {
@@ -1585,7 +1915,7 @@ impl Parser {
                     }
                     self.expect(&Tok::RParen)?;
                     match e {
-                        Expr::Name(n) => {
+                        Expr::Name(n, _) => {
                             e = Expr::MethodCall { obj: n, method, args };
                         }
                         // D5: a method call on a general base
@@ -1594,11 +1924,11 @@ impl Parser {
                         // attribute, which the emitter routes to
                         // the builtin method set or getattr.
                         _ => {
-                            e = Expr::Call(
-                                Box::new(Expr::Attr(Box::new(e), method)),
-                                args,
-                                Vec::new(),
-                            );
+                            let attr_span =
+                                self.span_to_ident_end(base_start, &method_tok, &method);
+                            let attr = Expr::Attr(Box::new(e), method, attr_span);
+                            let call_span = self.span_past(base_start, self.prev_tok());
+                            e = Expr::Call(Box::new(attr), args, Vec::new(), call_span);
                         }
                     }
                 }
@@ -1614,7 +1944,7 @@ impl Parser {
     /// loudly). The iterable is an or-expression: an
     /// unparenthesised ternary there would swallow the first
     /// `if` clause, exactly as in CPython's grammar.
-    fn parse_comp_clauses(&mut self) -> Result<Vec<CompClause>, String> {
+    fn parse_comp_clauses(&mut self) -> Result<Vec<CompClause>, Diagnostic> {
         let mut clauses = Vec::new();
         loop {
             if matches!(self.peek(), Tok::For) {
@@ -1638,7 +1968,7 @@ impl Parser {
                 clauses.push(CompClause::For { var, iter });
             } else if matches!(self.peek(), Tok::If) {
                 self.bump();
-                let cond = self.parse_expr()?;
+                let cond = self.parse_condition_expr()?;
                 clauses.push(CompClause::If(cond));
             } else {
                 break;
@@ -1650,34 +1980,57 @@ impl Parser {
         Ok(clauses)
     }
 
-    fn parse_atom(&mut self) -> Result<Expr, String> {
+    fn parse_atom(&mut self) -> Result<Expr, Diagnostic> {
         let line = self.line();
+        // Start anchor of this atom (P0b): the current token is the
+        // atom's first token. Used for the Name span below; the
+        // postfix layer captures its own start the same way.
+        let start = self.anchor();
         match self.bump() {
             Tok::Int(v) => Ok(Expr::Int(v)),
+            Tok::BigInt(s) => Ok(Expr::BigInt(s)),
             Tok::Float(v) => Ok(Expr::Float(v)),
             Tok::Str(s) => Ok(Expr::Str(s)),
+            Tok::Bytes(bs) => Ok(Expr::Bytes(bs)),
             Tok::FStr(parts) => {
                 let mut out = Vec::new();
                 for p in parts {
-                    match p {
-                        crate::lexer::FPart::Lit(s) => out.push(FStrPart::Lit(s)),
-                        crate::lexer::FPart::Expr(src) => {
-                            out.push(FStrPart::Expr(parse_fstr_expr(&src, line)?))
-                        }
-                    }
+                    out.push(parse_fstr_part(p, line)?);
                 }
                 Ok(Expr::FStr(out))
             }
             Tok::True => Ok(Expr::Bool(true)),
             Tok::False => Ok(Expr::Bool(false)),
             Tok::NoneLit => Ok(Expr::NoneLit),
-            Tok::Ident(n) => Ok(Expr::Name(n)),
+            Tok::Ident(n) => {
+                let span = ExprSpan::from_name(start, &n);
+                Ok(Expr::Name(n, span))
+            }
             Tok::LParen => {
                 if matches!(self.peek(), Tok::RParen) {
                     self.bump();
                     return Ok(Expr::TupleLit(Vec::new()));
                 }
                 let first = self.parse_expr()?;
+                if matches!(self.peek(), Tok::Walrus) {
+                    // `(name := value)`: the parenthesised
+                    // assignment expression, legal in any
+                    // expression position. The target must be a
+                    // plain name (CPython's rule).
+                    let name = match first {
+                        Expr::Name(n, _) => n,
+                        _ => {
+                            return Err(perr(
+                                line,
+                                "the target of := must be a plain name",
+                            ))
+                        }
+                    };
+                    self.bump();
+                    let value = self.parse_expr()?;
+                    self.expect(&Tok::RParen)?;
+                    return Ok(Expr::Walrus { name, value: Box::new(value) });
+                }
                 if matches!(self.peek(), Tok::For) {
                     let clauses = self.parse_comp_clauses()?;
                     self.expect(&Tok::RParen)?;
@@ -1811,10 +2164,10 @@ fn aug_op(t: &Tok) -> Option<BinOp> {
 /// True when an expression is pure and deterministic, so evaluating it
 /// twice yields the same value with no observable difference (used by
 /// chained comparisons, which duplicate their middle operands).
-fn duplicable(e: &Expr) -> bool {
+pub(crate) fn duplicable(e: &Expr) -> bool {
     match e {
-        Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::NoneLit | Expr::Name(_) => true,
-        Expr::Index(a, b) => duplicable(a) && duplicable(b),
+        Expr::Int(_) | Expr::BigInt(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::NoneLit | Expr::Name(_, _) => true,
+        Expr::Index(a, b, _) => duplicable(a) && duplicable(b),
         Expr::Slice(a, lo, hi, st) => {
             duplicable(a)
                 && [lo, hi, st]
@@ -1829,25 +2182,64 @@ fn duplicable(e: &Expr) -> bool {
 
 /// Re-parse the source of one f-string `{...}` interpolation as an
 /// expression of its own.
-fn parse_fstr_expr(src: &str, line: u32) -> Result<Expr, String> {
-    let toks = crate::lexer::lex(src)
-        .map_err(|e| perr(line, &format!("in f-string: {}", e)))?;
+/// Annotate a diagnostic raised inside an f-string interpolation:
+/// the inner lexer/parser saw only the fragment, so its line is
+/// fragment-relative; re-anchor it at the f-string's own line and
+/// record the context in the note instead of flattening the inner
+/// diagnostic into a message string.
+fn fstr_ctx(mut d: Diagnostic, line: u32) -> Diagnostic {
+    if let Some(s) = d.sites.first_mut() {
+        s.line = line;
+    }
+    d.with_note("raised inside an f-string expression".to_string())
+}
+
+fn parse_fstr_expr(src: &str, line: u32) -> Result<Expr, Diagnostic> {
+    let toks = crate::lexer::lex(src).map_err(|d| fstr_ctx(d, line))?;
     let mut p = Parser::new(toks);
-    let e = p.parse_expr().map_err(|e| {
-        perr(
-            line,
-            &format!(
-                "in f-string expression (format specs and conversions are not supported in D0): {}",
-                e
-            ),
-        )
-    })?;
+    let e = p.parse_expr().map_err(|d| fstr_ctx(d, line))?;
     match p.peek() {
         Tok::Newline | Tok::Eof => Ok(e),
         t => Err(perr(
             line,
-            &format!("trailing token {:?} in f-string expression", t),
+            &format!("trailing token {} in f-string expression", tok_word(t)),
         )),
+    }
+}
+
+/// Build one AST f-string part from a scanned part. A format
+/// spec is parsed recursively: the spec source is scanned as a
+/// mini f-string whose nested fields may carry their own
+/// conversions and specs.
+fn parse_fstr_part(p: crate::lexer::FPart, line: u32) -> Result<FStrPart, Diagnostic> {
+    match p {
+        crate::lexer::FPart::Lit(s) => Ok(FStrPart::Lit(s)),
+        crate::lexer::FPart::Expr(src) => Ok(FStrPart::Field {
+            value: parse_fstr_expr(&src, line)?,
+            conv: None,
+            debug: None,
+            spec: None,
+        }),
+        crate::lexer::FPart::Fmt { src, conv, debug, spec } => {
+            let spec = match spec {
+                Some(spec_src) => {
+                    let raw = crate::lexer::scan_fstring_fragment(&spec_src, line)
+                        .map_err(|d| fstr_ctx(d, line))?;
+                    let mut parts = Vec::new();
+                    for sp in raw {
+                        parts.push(parse_fstr_part(sp, line)?);
+                    }
+                    Some(parts)
+                }
+                None => None,
+            };
+            Ok(FStrPart::Field {
+                value: parse_fstr_expr(&src, line)?,
+                conv,
+                debug,
+                spec,
+            })
+        }
     }
 }
 
@@ -1867,8 +2259,20 @@ fn contains_continue(stmts: &[Stmt]) -> bool {
                     }
                 }
             }
-            Stmt::While { .. } => {
-                // A continue inside a nested while belongs to that while.
+            Stmt::While { els, .. }
+            | Stmt::ForRange { els, .. }
+            | Stmt::ForEach { els, .. } => {
+                // A continue inside a nested loop's BODY belongs
+                // to that loop and is not scanned. A continue in
+                // its ELSE clause, however, targets the loop this
+                // scan is protecting (the else clause sits outside
+                // the nested loop), so the else body is scanned
+                // like ordinary body code.
+                if let Some(b) = els {
+                    if contains_continue(b) {
+                        return true;
+                    }
+                }
             }
             Stmt::Try { body, handlers, els, finally, .. } => {
                 // A continue inside a try inside the loop still

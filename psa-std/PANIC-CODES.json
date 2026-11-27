@@ -1,0 +1,786 @@
+{
+ "version": 1,
+ "codes": {
+  "77010": {
+   "rule": "dyn-operand-type",
+   "category": "runtime-core",
+   "cp_surface": "TypeError",
+   "summary": "dynamic value has the wrong type for truthiness / float coercion",
+   "fix": "check the value's type with isinstance before the operation"
+  },
+  "77011": {
+   "rule": "dyn-arith-type",
+   "category": "runtime-core",
+   "cp_surface": "TypeError",
+   "summary": "arithmetic on dynamic values of the wrong type",
+   "fix": "convert operands to numbers first (int()/float())"
+  },
+  "77012": {
+   "rule": "dyn-compare-type",
+   "category": "runtime-core",
+   "cp_surface": "TypeError",
+   "summary": "ordering comparison between incomparable dynamic values",
+   "fix": "compare values of the same type"
+  },
+  "77013": {
+   "rule": "dyn-bitwise-type",
+   "category": "runtime-core",
+   "cp_surface": "TypeError",
+   "summary": "bitwise operation on a non-int dynamic value",
+   "fix": "convert the operand with int()"
+  },
+  "77014": {
+   "rule": "dyn-shift-type",
+   "category": "runtime-core",
+   "cp_surface": "TypeError",
+   "summary": "shift operation on a non-int dynamic value",
+   "fix": "convert the operand with int()"
+  },
+  "77015": {
+   "rule": "dyn-neg-type",
+   "category": "runtime-core",
+   "cp_surface": "TypeError",
+   "summary": "unary minus on a non-number dynamic value",
+   "fix": "check the value is a number first"
+  },
+  "77020": {
+   "rule": "unbox-int",
+   "category": "runtime-core",
+   "cp_surface": "TypeError",
+   "summary": "a dynamic value that is not an int was used as an int",
+   "fix": "guard with isinstance(x, int)"
+  },
+  "77021": {
+   "rule": "unbox-float",
+   "category": "runtime-core",
+   "cp_surface": "TypeError",
+   "summary": "a dynamic value that is not a float was used as a float",
+   "fix": "guard with isinstance(x, float)"
+  },
+  "77022": {
+   "rule": "unbox-bool",
+   "category": "runtime-core",
+   "cp_surface": "TypeError",
+   "summary": "a dynamic value that is not a bool was used as a bool",
+   "fix": "guard with isinstance(x, bool)"
+  },
+  "77030": {
+   "rule": "float-text-unavailable",
+   "category": "runtime-core",
+   "cp_surface": null,
+   "summary": "printing/repr of a float is unavailable (f64 text defect)",
+   "fix": "print the value via int parts, or avoid float printing until the formatter lands"
+  },
+  "77040": {
+   "rule": "assert-failed",
+   "category": "runtime-core",
+   "cp_surface": "AssertionError",
+   "summary": "an assert condition was false",
+   "fix": "inspect the asserted condition; the assert message is written to stderr before this panic when one was given"
+  },
+  "77050": {
+   "rule": "index-out-of-range",
+   "category": "runtime-core",
+   "cp_surface": "IndexError",
+   "summary": "list/string index out of range",
+   "fix": "check len() before indexing"
+  },
+  "77052": {
+   "rule": "not-subscriptable",
+   "category": "runtime-core",
+   "cp_surface": "TypeError",
+   "summary": "subscript or container operation on a value that does not support it",
+   "fix": "check the value's type before subscripting"
+  },
+  "77054": {
+   "rule": "missing-key",
+   "category": "runtime-core",
+   "cp_surface": "KeyError",
+   "summary": "dict key not present",
+   "fix": "use .get-style access or check `in` first"
+  },
+  "77058": {
+   "rule": "repr-unsupported",
+   "category": "runtime-core",
+   "cp_surface": null,
+   "summary": "printing a nested container repr is not supported",
+   "fix": "print elements individually"
+  },
+  "77062": {
+   "rule": "contains-non-container",
+   "category": "runtime-core",
+   "cp_surface": "TypeError",
+   "summary": "`in` used on a non-container value",
+   "fix": "use `in` on a list/dict/set/str value"
+  },
+  "77063": {
+   "rule": "set-operand-type",
+   "category": "runtime-core",
+   "cp_surface": "TypeError",
+   "summary": "set built or updated from a wrong-typed value",
+   "fix": "pass an iterable of hashable values"
+  },
+  "77064": {
+   "rule": "slice-bound-type",
+   "category": "runtime-core",
+   "cp_surface": "TypeError",
+   "summary": "slice bound is not an int",
+   "fix": "use int slice bounds or omit them"
+  },
+  "77065": {
+   "rule": "slice-index-type",
+   "category": "runtime-core",
+   "cp_surface": "TypeError",
+   "summary": "slice index is not an int",
+   "fix": "use int indices"
+  },
+  "77066": {
+   "rule": "unhashable",
+   "category": "runtime-core",
+   "cp_surface": "TypeError",
+   "summary": "unhashable value used as a dict key or set element",
+   "fix": "use an int/float/bool/str/None key"
+  },
+  "77067": {
+   "rule": "not-callable",
+   "category": "runtime-core",
+   "cp_surface": "TypeError",
+   "summary": "a non-callable value was called",
+   "fix": "check the value holds a function"
+  },
+  "77068": {
+   "rule": "call-arity",
+   "category": "runtime-core",
+   "cp_surface": "TypeError",
+   "summary": "wrong number of arguments at a dynamic call boundary",
+   "fix": "match the callee's parameter count"
+  },
+  "77069": {
+   "rule": "attribute-not-found",
+   "category": "runtime-core",
+   "cp_surface": "AttributeError",
+   "summary": "attribute not found on a dynamic value",
+   "fix": "check the attribute name spelling; the value may be of a different class than expected"
+  },
+  "77072": {
+   "rule": "setattr-non-object",
+   "category": "runtime-core",
+   "cp_surface": "AttributeError",
+   "summary": "attribute assignment on a non-object value",
+   "fix": "assign attributes on class instances"
+  },
+  "77073": {
+   "rule": "call-args-mismatch",
+   "category": "runtime-core",
+   "cp_surface": "TypeError",
+   "summary": "object called with arguments its __call__ does not take",
+   "fix": "call it with no arguments"
+  },
+  "77074": {
+   "rule": "init-returned-value",
+   "category": "runtime-core",
+   "cp_surface": "TypeError",
+   "summary": "__init__ returned a non-None value",
+   "fix": "remove the return value from __init__"
+  },
+  "77075": {
+   "rule": "method-wrong-type",
+   "category": "runtime-core",
+   "cp_surface": "TypeError",
+   "summary": "method called on a value of the wrong type",
+   "fix": "call the method on a value of the supporting type"
+  },
+  "77076": {
+   "rule": "value-not-in-list",
+   "category": "runtime-core",
+   "cp_surface": "ValueError",
+   "summary": "list.index/remove did not find the element",
+   "fix": "check membership with `in` first"
+  },
+  "77077": {
+   "rule": "unpack-length",
+   "category": "runtime-core",
+   "cp_surface": "ValueError",
+   "summary": "unpacking length does not match the value count",
+   "fix": "match the number of targets to the sequence length"
+  },
+  "77079": {
+   "rule": "str-parse",
+   "category": "runtime-core",
+   "cp_surface": "ValueError",
+   "summary": "a string could not be parsed as int/float",
+   "fix": "validate the string before converting"
+  },
+  "77080": {
+   "rule": "int-overflow",
+   "category": "runtime-core",
+   "cp_surface": "OverflowError",
+   "summary": "integer does not fit the target range (static i64 slot, float conversion, or resource bound); dynamic ints are arbitrary precision",
+   "fix": "keep the value dynamic, or shrink it before a static/float conversion"
+  },
+  "77081": {
+   "rule": "stop-iteration",
+   "category": "runtime-core",
+   "cp_surface": "StopIteration",
+   "summary": "next() on an exhausted generator",
+   "fix": "catch StopIteration or iterate with for"
+  },
+  "77082": {
+   "rule": "await-non-coroutine",
+   "category": "runtime-core",
+   "cp_surface": "TypeError",
+   "summary": "await on a value that is not a coroutine",
+   "fix": "await the result of calling an async def"
+  },
+  "77085": {
+   "rule": "fstring-bad-spec",
+   "category": "runtime-core",
+   "cp_surface": "ValueError",
+   "summary": "f-string format spec is malformed or invalid for the value's kind",
+   "fix": "fix the format spec after the `:` in the replacement field"
+  },
+  "77086": {
+   "rule": "fstring-spec-unsupported",
+   "category": "runtime-core",
+   "cp_surface": "TypeError",
+   "summary": "f-string format spec given for a value that takes no spec (None, containers, objects)",
+   "fix": "remove the format spec, or format a scalar value"
+  },
+  "77100": {
+   "rule": "uncaught-exception",
+   "category": "runtime-core",
+   "cp_surface": null,
+   "summary": "an exception propagated out of the program",
+   "fix": "wrap the call in try/except"
+  },
+  "77101": {
+   "rule": "pending-exception",
+   "category": "runtime-core",
+   "cp_surface": null,
+   "summary": "a pending exception was found crossing a call boundary",
+   "fix": "an inner raise was not handled; check the callee"
+  },
+  "77110": {
+   "rule": "file-error",
+   "category": "runtime-core",
+   "cp_surface": "OSError",
+   "summary": "a file operation failed",
+   "fix": "check the path and that the file is open"
+  },
+  "77111": {
+   "rule": "file-state",
+   "category": "runtime-core",
+   "cp_surface": "ValueError",
+   "summary": "a method was called on a closed or wrong file object",
+   "fix": "do not use a file object after close"
+  },
+  "77130": {
+   "rule": "json-structure",
+   "category": "json",
+   "cp_surface": null,
+   "summary": "malformed JSON or a value that cannot be serialized",
+   "fix": "validate the input / value shape"
+  },
+  "77131": {
+   "rule": "json-trailing-data",
+   "category": "json",
+   "cp_surface": null,
+   "summary": "trailing data after the JSON value",
+   "fix": "pass exactly one JSON document"
+  },
+  "77132": {
+   "rule": "math-arg-type",
+   "category": "math",
+   "cp_surface": "TypeError",
+   "summary": "argument of the wrong type",
+   "fix": "pass ints/floats as documented"
+  },
+  "77133": {
+   "rule": "math-domain",
+   "category": "math",
+   "cp_surface": "ValueError",
+   "summary": "domain error (e.g. factorial of a negative)",
+   "fix": "check the argument range first"
+  },
+  "77134": {
+   "rule": "math-range",
+   "category": "math",
+   "cp_surface": "OverflowError",
+   "summary": "result outside the representable range",
+   "fix": "keep inputs smaller; results are i64-bounded"
+  },
+  "77135": {
+   "rule": "string-arg-type",
+   "category": "string",
+   "cp_surface": "TypeError",
+   "summary": "argument of the wrong type",
+   "fix": "pass a string"
+  },
+  "77136": {
+   "rule": "string-arg-value",
+   "category": "string",
+   "cp_surface": "ValueError",
+   "summary": "argument value not accepted",
+   "fix": "check the argument value"
+  },
+  "77140": {
+   "rule": "collections-arg-type",
+   "category": "collections",
+   "cp_surface": "TypeError",
+   "summary": "argument of the wrong type",
+   "fix": "pass values of the documented types"
+  },
+  "77141": {
+   "rule": "collections-arg-value",
+   "category": "collections",
+   "cp_surface": "ValueError",
+   "summary": "bad value / missing key / pop from empty",
+   "fix": "check membership and emptiness first"
+  },
+  "77142": {
+   "rule": "itertools-arg-type",
+   "category": "itertools",
+   "cp_surface": "TypeError",
+   "summary": "argument of the wrong type",
+   "fix": "pass values of the documented types"
+  },
+  "77143": {
+   "rule": "itertools-arg-value",
+   "category": "itertools",
+   "cp_surface": "ValueError",
+   "summary": "argument value not accepted",
+   "fix": "check counts are non-negative etc."
+  },
+  "77144": {
+   "rule": "functools-arg-type",
+   "category": "functools",
+   "cp_surface": "TypeError",
+   "summary": "argument of the wrong type (incl. reduce of empty with no initial)",
+   "fix": "pass an initial value for reduce on maybe-empty input"
+  },
+  "77146": {
+   "rule": "not-callable-arg",
+   "category": "shared",
+   "cp_surface": "TypeError",
+   "summary": "an argument that must be callable is not",
+   "fix": "pass a function or lambda"
+  },
+  "77148": {
+   "rule": "registered-gap-refusal",
+   "category": "shared",
+   "cp_surface": null,
+   "summary": "the operation is a registered psa_std gap and refuses loudly",
+   "fix": "use the workaround named in the module README"
+  },
+  "77149": {
+   "rule": "not-iterable-arg",
+   "category": "shared",
+   "cp_surface": "TypeError",
+   "summary": "an argument that must be iterable is not",
+   "fix": "pass a list/dict/str value"
+  },
+  "77150": {
+   "rule": "random-arg-type",
+   "category": "random",
+   "cp_surface": "TypeError",
+   "summary": "argument of the wrong type",
+   "fix": "pass ints as documented"
+  },
+  "77151": {
+   "rule": "random-arg-value",
+   "category": "random",
+   "cp_surface": "ValueError",
+   "summary": "argument value not accepted (e.g. empty range)",
+   "fix": "check the range is non-empty"
+  },
+  "77152": {
+   "rule": "base64-arg-type",
+   "category": "base64",
+   "cp_surface": "TypeError",
+   "summary": "argument of the wrong type",
+   "fix": "pass a string"
+  },
+  "77153": {
+   "rule": "base64-invalid-input",
+   "category": "base64",
+   "cp_surface": "ValueError",
+   "summary": "input is not valid base64/base32/base16",
+   "fix": "validate the encoded input"
+  },
+  "77154": {
+   "rule": "heapq-arg-type",
+   "category": "heapq",
+   "cp_surface": "TypeError",
+   "summary": "argument of the wrong type",
+   "fix": "pass a list heap"
+  },
+  "77155": {
+   "rule": "heapq-empty",
+   "category": "heapq",
+   "cp_surface": "IndexError",
+   "summary": "pop/replace from an empty heap",
+   "fix": "check the heap is non-empty"
+  },
+  "77156": {
+   "rule": "bisect-arg-type",
+   "category": "bisect",
+   "cp_surface": "TypeError",
+   "summary": "argument of the wrong type",
+   "fix": "pass a sorted list and a comparable value"
+  },
+  "77157": {
+   "rule": "bisect-arg-value",
+   "category": "bisect",
+   "cp_surface": "ValueError",
+   "summary": "argument value not accepted (e.g. negative lo)",
+   "fix": "keep lo/hi within bounds"
+  },
+  "77158": {
+   "rule": "random-source-failed",
+   "category": "random",
+   "cp_surface": "OSError",
+   "summary": "the OS random source failed",
+   "fix": "retry; the failure is environmental"
+  },
+  "77160": {
+   "rule": "argparse-arg-type",
+   "category": "argparse",
+   "cp_surface": "TypeError",
+   "summary": "argument of the wrong type at the API boundary",
+   "fix": "pass values of the documented types"
+  },
+  "77161": {
+   "rule": "argparse-parse-error",
+   "category": "argparse",
+   "cp_surface": null,
+   "summary": "command-line parse error (details were written to stderr)",
+   "fix": "read the stderr usage message above the panic"
+  },
+  "77162": {
+   "rule": "argparse-help",
+   "category": "argparse",
+   "cp_surface": null,
+   "summary": "-h/--help was requested (help was written to stdout)",
+   "fix": "not an error: the program asked for help"
+  },
+  "77163": {
+   "rule": "datetime-invalid",
+   "category": "datetime",
+   "cp_surface": "ValueError",
+   "summary": "invalid date/time value",
+   "fix": "check month/day/hour ranges"
+  },
+  "77164": {
+   "rule": "os-arg-value",
+   "category": "os",
+   "cp_surface": "ValueError",
+   "summary": "argument value not accepted (e.g. overlong input)",
+   "fix": "keep paths/inputs within limits"
+  },
+  "77165": {
+   "rule": "logging-level-type",
+   "category": "logging",
+   "cp_surface": "TypeError",
+   "summary": "level argument of the wrong type",
+   "fix": "pass an int level or a level name"
+  },
+  "77166": {
+   "rule": "logging-format-key",
+   "category": "logging",
+   "cp_surface": "KeyError",
+   "summary": "a format key is missing from the record",
+   "fix": "match format keys to the supplied values"
+  },
+  "77167": {
+   "rule": "csv-arg-type",
+   "category": "csv",
+   "cp_surface": "TypeError",
+   "summary": "argument of the wrong type (incl. dialect validation)",
+   "fix": "pass strings / documented dialect values"
+  },
+  "77168": {
+   "rule": "csv-parse-error",
+   "category": "csv",
+   "cp_surface": null,
+   "summary": "the CSV input could not be parsed",
+   "fix": "check quoting and field counts"
+  },
+  "77169": {
+   "rule": "argparse-definition",
+   "category": "argparse",
+   "cp_surface": null,
+   "summary": "invalid parser definition at add_argument time",
+   "fix": "fix the argument definition"
+  },
+  "77170": {
+   "rule": "re-arg-type",
+   "category": "re",
+   "cp_surface": "TypeError",
+   "summary": "argument of the wrong type",
+   "fix": "pass string pattern/subject"
+  },
+  "77171": {
+   "rule": "re-bad-pattern",
+   "category": "re",
+   "cp_surface": null,
+   "summary": "the pattern has invalid syntax",
+   "fix": "fix the pattern"
+  },
+  "77172": {
+   "rule": "re-unsupported",
+   "category": "re",
+   "cp_surface": null,
+   "summary": "the pattern or replacement uses an unsupported construct",
+   "fix": "use a supported construct (see README-re)"
+  },
+  "77173": {
+   "rule": "re-backtrack-limit",
+   "category": "re",
+   "cp_surface": null,
+   "summary": "the backtracking step limit was exceeded",
+   "fix": "simplify the pattern"
+  },
+  "77174": {
+   "rule": "re-bad-escape",
+   "category": "re",
+   "cp_surface": null,
+   "summary": "bad escape in the replacement string",
+   "fix": "escape backslashes in the replacement"
+  },
+  "77175": {
+   "rule": "re-bad-flags",
+   "category": "re",
+   "cp_surface": null,
+   "summary": "invalid flags value",
+   "fix": "combine flags from the re module constants"
+  },
+  "77176": {
+   "rule": "re-bad-group-ref",
+   "category": "re",
+   "cp_surface": null,
+   "summary": "bad group reference in the replacement string",
+   "fix": "reference an existing group number/name"
+  },
+  "77180": {
+   "rule": "socket-arg",
+   "category": "socket",
+   "cp_surface": "TypeError",
+   "summary": "argument of the wrong type or value",
+   "fix": "pass values of the documented types"
+  },
+  "77181": {
+   "rule": "socket-dns",
+   "category": "socket",
+   "cp_surface": "OSError",
+   "summary": "name resolution failed",
+   "fix": "check the host name"
+  },
+  "77182": {
+   "rule": "socket-os-error",
+   "category": "socket",
+   "cp_surface": "OSError",
+   "summary": "the operating system reported an error",
+   "fix": "check address/port and that the peer is listening"
+  },
+  "77183": {
+   "rule": "socket-timeout",
+   "category": "socket",
+   "cp_surface": "TimeoutError",
+   "summary": "the operation timed out",
+   "fix": "retry or raise the timeout"
+  },
+  "77184": {
+   "rule": "socket-would-block",
+   "category": "socket",
+   "cp_surface": "BlockingIOError",
+   "summary": "the operation would block",
+   "fix": "retry when the socket is ready"
+  },
+  "77185": {
+   "rule": "socket-unsupported",
+   "category": "socket",
+   "cp_surface": null,
+   "summary": "the operation is not supported by the base",
+   "fix": "use a supported operation (see GAP-net)"
+  },
+  "77186": {
+   "rule": "urllib-url-error",
+   "category": "urllib",
+   "cp_surface": null,
+   "summary": "bad/unsupported URL or transport failure in urlopen",
+   "fix": "check the URL and connectivity"
+  },
+  "77187": {
+   "rule": "urllib-http-error",
+   "category": "urllib",
+   "cp_surface": null,
+   "summary": "the server answered with an error status (or redirect limit)",
+   "fix": "check the status handling / URL"
+  },
+  "77188": {
+   "rule": "urllib-arg",
+   "category": "urllib",
+   "cp_surface": null,
+   "summary": "wrong type/value, closed response used, or unsupported surface",
+   "fix": "do not use a response after close"
+  },
+  "77189": {
+   "rule": "urllib-bad-component",
+   "category": "urllib",
+   "cp_surface": "ValueError",
+   "summary": "a URL component is malformed",
+   "fix": "check port/host components"
+  },
+  "77137": {
+   "rule": "reserved",
+   "category": "reserved",
+   "cp_surface": null,
+   "summary": "unassigned in the psa-std segment (77137-77139)",
+   "fix": null,
+   "reserved": true
+  },
+  "77138": {
+   "rule": "reserved",
+   "category": "reserved",
+   "cp_surface": null,
+   "summary": "unassigned in the psa-std segment (77137-77139)",
+   "fix": null,
+   "reserved": true
+  },
+  "77139": {
+   "rule": "reserved",
+   "category": "reserved",
+   "cp_surface": null,
+   "summary": "unassigned in the psa-std segment (77137-77139)",
+   "fix": null,
+   "reserved": true
+  },
+  "77145": {
+   "rule": "reserved",
+   "category": "reserved",
+   "cp_surface": null,
+   "summary": "explicitly reserved by the psa_std module authors",
+   "fix": null,
+   "reserved": true
+  },
+  "77147": {
+   "rule": "reserved",
+   "category": "reserved",
+   "cp_surface": null,
+   "summary": "explicitly reserved by the psa_std module authors",
+   "fix": null,
+   "reserved": true
+  },
+  "77159": {
+   "rule": "reserved",
+   "category": "reserved",
+   "cp_surface": null,
+   "summary": "unassigned in the psa-std segment",
+   "fix": null,
+   "reserved": true
+  },
+  "77177": {
+   "rule": "reserved",
+   "category": "reserved",
+   "cp_surface": null,
+   "summary": "unassigned in the psa-std segment (77177-77179)",
+   "fix": null,
+   "reserved": true
+  },
+  "77178": {
+   "rule": "reserved",
+   "category": "reserved",
+   "cp_surface": null,
+   "summary": "unassigned in the psa-std segment (77177-77179)",
+   "fix": null,
+   "reserved": true
+  },
+  "77179": {
+   "rule": "reserved",
+   "category": "reserved",
+   "cp_surface": null,
+   "summary": "unassigned in the psa-std segment (77177-77179)",
+   "fix": null,
+   "reserved": true
+  },
+  "77190": {
+   "rule": "reserved",
+   "category": "reserved",
+   "cp_surface": null,
+   "summary": "the whole 77190+ segment is reserved for a future struct surface (reserved-unconfirmed: noted in project notes, never registered or emitted in source)",
+   "fix": null,
+   "reserved": true
+  },
+  "77310": {
+   "rule": "pickle-arg-type",
+   "category": "pickle",
+   "cp_surface": "TypeError",
+   "summary": "a pickle argument of the wrong type (loads input not a byte buffer; dump/load file argument not an open file)",
+   "fix": "pass bytes to loads and an open file to dump/load"
+  },
+  "77311": {
+   "rule": "pickle-unsupported-value",
+   "category": "pickle",
+   "cp_surface": null,
+   "summary": "a value outside the pure-data subset (write: function/object/set/file/closure; read: an unhashable dict key)",
+   "fix": "pickle only None/bool/int/float/str/bytes/list/tuple/dict values"
+  },
+  "77312": {
+   "rule": "pickle-executable-opcode",
+   "category": "pickle",
+   "cp_surface": null,
+   "summary": "an executable pickle opcode (GLOBAL/REDUCE/BUILD/NEWOBJ/EXT/PERSID family) appeared in the input stream and was refused on sight",
+   "fix": "only unpickle data produced by psa pickle or CPython's pure-data subset"
+  },
+  "77313": {
+   "rule": "pickle-int-out-of-range",
+   "category": "pickle",
+   "cp_surface": "OverflowError",
+   "summary": "a pickled integer outside the i64 range (awaiting bigint support in the pickle reader)",
+   "fix": "keep pickled integers inside the i64 range"
+  },
+  "77314": {
+   "rule": "pickle-malformed",
+   "category": "pickle",
+   "cp_surface": null,
+   "summary": "a truncated or corrupt pickle stream (unknown opcode, stack underflow, dangling MARK, unwritten memo slot, declared length past the end, stack height not 1 at STOP, bad text argument)",
+   "fix": "check the input is a complete pickle stream"
+  },
+  "77315": {
+   "rule": "pickle-bad-protocol",
+   "category": "pickle",
+   "cp_surface": "ValueError",
+   "summary": "pickle protocol version above 5",
+   "fix": "re-pickle with protocol 0-5"
+  },
+  "77316": {
+   "rule": "pickle-unsupported-opcode",
+   "category": "pickle",
+   "cp_surface": null,
+   "summary": "a recognized data opcode outside the subset (EMPTY_SET/ADDITEMS/FROZENSET, BYTEARRAY8, NEXT_BUFFER/READONLY_BUFFER)",
+   "fix": "avoid sets, bytearrays and out-of-band buffers in pickled data"
+  },
+  "77317": {
+   "rule": "pickle-bad-utf8",
+   "category": "pickle",
+   "cp_surface": "ValueError",
+   "summary": "a BINUNICODE payload is not strict UTF-8 (overlong form, surrogate range, above U+10FFFF)",
+   "fix": "check the string payload encoding"
+  },
+  "77318": {
+   "rule": "pickle-limit",
+   "category": "pickle",
+   "cp_surface": null,
+   "summary": "a pickle safety limit was hit (write nesting depth above 500; read stack or memo entries at 1,000,000)",
+   "fix": "reduce the nesting depth or the number of shared references"
+  },
+  "77319": {
+   "rule": "reserved",
+   "category": "pickle",
+   "cp_surface": null,
+   "summary": "reserved for the pickle module",
+   "fix": null,
+   "reserved": true
+  }
+ }
+}

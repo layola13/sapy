@@ -1,0 +1,1447 @@
+// psa_std pickle (clean-room rewrite, 2026-11-27): a thin
+// wrapper over CPython's pickle byte format, restricted
+// to the pure-data opcode subset. Charter (user ruling
+// 2026-11-26 14:57): dump / dumps / load / loads over
+// None / bool / int / float / str / bytes / list / tuple /
+// dict plus memo shared references -- nothing else. The
+// executable opcodes are not an unimplemented corner,
+// they are the security boundary: GLOBAL / REDUCE /
+// BUILD / NEWOBJ / EXT / PERSID and their kin are
+// refused loudly on sight, before any argument bytes are
+// consumed.
+//
+// Write side: protocol 4, unframed (FRAME is a reader
+// hint only; CPython's unpickler accepts unframed
+// protocol-4 streams). Read side: protocols 0-5.
+//
+// Panic codes 77310-77319 (this segment was free: the
+// psa_std registry tops out at 77189 in panic_codes.rs
+// and the wave-2 staging modules occupy 77190-77303;
+// 77304-77309 are untouched in psa_std but 77309 appears
+// in the unrelated SLA corpus numbering, so this module
+// starts at 77310):
+//   77310 pickle-arg-type        an argument of the
+//                                wrong type (loads input
+//                                not a byte buffer; the
+//                                dump/load file argument
+//                                not an open file)
+//   77311 pickle-unsupported-    a value outside the
+//         value                  pure-data subset
+//                                (write: function /
+//                                object / set / file /
+//                                closure ...; read: an
+//                                unhashable dict key)
+//   77312 pickle-executable-     an executable opcode
+//         opcode                 in the input stream
+//                                (the security boundary)
+//   77313 pickle-int-out-of-     an integer outside
+//         range                  the i64 range. The
+//                                message is "awaiting
+//                                bigint": S4 bigint has
+//                                since landed, but this
+//                                batch still refuses per
+//                                the charter; the two
+//                                open-up points are
+//                                __psa_pkl_parse_i64 and
+//                                __psa_pkl_decode_long.
+//   77314 pickle-malformed       truncated or corrupt
+//                                stream (unknown opcode,
+//                                stack underflow, a
+//                                dangling MARK, a bad
+//                                memo index, a declared
+//                                length past the end of
+//                                the input, STOP with a
+//                                stack height other
+//                                than one)
+//   77315 pickle-bad-protocol    PROTO version above 5
+//   77316 pickle-unsupported-    a recognized pickle
+//         opcode                 opcode outside the
+//                                data subset (sets,
+//                                bytearray, protocol-5
+//                                out-of-band buffers)
+//   77317 pickle-bad-utf8        a BINUNICODE-family
+//                                payload that is not
+//                                valid UTF-8
+//   77318 pickle-limit           a safety cap exceeded
+//                                (write nesting depth
+//                                500; read stack / memo
+//                                1000000 entries)
+//   77319 (reserved for this segment)
+//
+// Representation rulings (following the base64 module's
+// registered convention): a psa str (tag 6) is a byte
+// buffer and a psa bytes value (tag 15) is the same
+// Box<Vec<u8>> payload under another tag. dumps returns
+// a tag-15 bytes value; loads accepts either tag as its
+// input buffer. A tag-15 value inside the data is
+// written with the BINBYTES family and read back as
+// tag 15; a tag-6 value uses the BINUNICODE family and
+// its buffer is treated as UTF-8, exactly the file
+// surface's convention (__psa_file_read_all returns raw
+// file bytes in a tag-6 buffer).
+//
+// Bounds-guarded byte reads never ride on && (eager in
+// SLA): every read is preceded by a plain branch on the
+// position, in the json module's discipline.
+
+// ---- byte output helpers ----
+// The output accumulator is a tag-15 bytes value built
+// with __psa_str_push, which rebuilds the payload and
+// preserves the tag (see emit_bytes_temp in the psa
+// emitter). Every helper returns the accumulator.
+
+fn __psa_pkl_put(out: PsaVal, b: i64) -> PsaVal {
+    return __psa_str_push(out, b as u8);
+}
+
+fn __psa_pkl_put_bytes(out: PsaVal, src: PsaVal) -> PsaVal {
+    let o = out;
+    let n = __psa_bytes_len_h(src.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        o = __psa_str_push(o, __psa_bytes_get_h(src.ipay as ptr, i));
+        i = i + 1;
+    }
+    return o;
+}
+
+fn __psa_pkl_put_u16le(out: PsaVal, v: i64) -> PsaVal {
+    let o = __psa_pkl_put(out, v & 255);
+    o = __psa_pkl_put(o, (v >> 8) & 255);
+    return o;
+}
+
+fn __psa_pkl_put_u32le(out: PsaVal, v: i64) -> PsaVal {
+    let o = __psa_pkl_put(out, v & 255);
+    o = __psa_pkl_put(o, (v >> 8) & 255);
+    o = __psa_pkl_put(o, (v >> 16) & 255);
+    o = __psa_pkl_put(o, (v >> 24) & 255);
+    return o;
+}
+
+fn __psa_pkl_put_u64le(out: PsaVal, v: i64) -> PsaVal {
+    let o = out;
+    let s: i64 = 0;
+    while s < 64 {
+        o = __psa_pkl_put(o, (v >> s) & 255);
+        s = s + 8;
+    }
+    return o;
+}
+
+// ---- f64 <-> bits ----
+// BINFLOAT carries the raw IEEE-754 bit pattern, so the
+// module needs exact bit access. There is no bitcast
+// surface at this layer; the conversion is the pure
+// arithmetic decomposition the array / struct modules
+// already use (scaling by powers of two is exact in
+// binary floating point, so no bit is ever rounded).
+
+fn __psa_pkl_inf() -> f64 {
+    // Build +inf by repeated squaring from 10.0: after
+    // nine squarings the value overflows to +inf under
+    // IEEE rules. (Exponent-form literals — 1e308, and
+    // the array module's 1.7976931348623157e308 — are
+    // rejected by the SLA parser on the text route, as
+    // the plistlib probe reported; plain decimal
+    // literals and arithmetic are the safe surface.
+    // Compile-batch verification 2026-11-27 confirmed
+    // `return 1e308 * 10.0;` fails the SLA parse.)
+    let x = 10.0;
+    let i = 0;
+    while i < 9 {
+        x = x * x;
+        i = i + 1;
+    }
+    return x;
+}
+
+fn __psa_pkl_nan() -> f64 {
+    let i = __psa_pkl_inf();
+    return i - i;
+}
+
+fn __psa_pkl_norm_exp(a0: f64) -> (f64, i64) {
+    // Normalize a finite positive a0 to a in [1, 2)
+    // with a0 = a * 2^e.
+    let a = a0;
+    let e: i64 = 0;
+    while a >= 18446744073709551616.0 {
+        a = a / 18446744073709551616.0;
+        e = e + 64;
+    }
+    while a < 0.0000000000000000000542101086242752217003726400434970855712890625 {
+        a = a * 18446744073709551616.0;
+        e = e - 64;
+    }
+    while a >= 2.0 {
+        a = a / 2.0;
+        e = e + 1;
+    }
+    while a < 1.0 {
+        a = a * 2.0;
+        e = e - 1;
+    }
+    return (a, e);
+}
+
+fn __psa_pkl_f64_bits(f: f64) -> i64 {
+    let sign: i64 = 0;
+    if f < 0.0 { sign = 1; };
+    if f == 0.0 {
+        if 1.0 / f < 0.0 { sign = 1; };
+        return sign << 63;
+    };
+    if f != f { return 9219994337134247936; };
+    let a0 = f;
+    if a0 < 0.0 { a0 = -a0; };
+    if a0 == __psa_pkl_inf() {
+        return (sign << 63) | 9218868437227405312;
+    };
+    let (a, e) = __psa_pkl_norm_exp(a0);
+    if e >= -1022 {
+        let m = (a - 1.0) * 4503599627370496.0;
+        let mm = m as i64;
+        return (sign << 63) | ((e + 1023) << 52) | mm;
+    };
+    let m2 = a;
+    let steps = e + 1074;
+    let j: i64 = 0;
+    while j < steps {
+        m2 = m2 * 2.0;
+        j = j + 1;
+    }
+    let mm2 = m2 as i64;
+    return (sign << 63) | mm2;
+}
+
+fn __psa_pkl_bits_f64(bits: i64) -> f64 {
+    let sign = (bits >> 63) & 1;
+    let be = (bits >> 52) & 2047;
+    let m = bits & 4503599627370495;
+    if be == 2047 {
+        if m != 0 { return __psa_pkl_nan(); };
+        if sign == 1 { return -__psa_pkl_inf(); };
+        return __psa_pkl_inf();
+    };
+    let v: f64 = 0.0;
+    if be == 0 {
+        v = m as f64;
+        let k: i64 = 0;
+        while k < 16 {
+            v = v / 18446744073709551616.0;
+            k = k + 1;
+        }
+        let k2: i64 = 0;
+        while k2 < 50 {
+            v = v / 2.0;
+            k2 = k2 + 1;
+        }
+    } else {
+        v = 1.0 + (m as f64) / 4503599627370496.0;
+        let e = be - 1023;
+        while e >= 64 {
+            v = v * 18446744073709551616.0;
+            e = e - 64;
+        }
+        while e <= -64 {
+            v = v / 18446744073709551616.0;
+            e = e + 64;
+        }
+        while e > 0 {
+            v = v * 2.0;
+            e = e - 1;
+        }
+        while e < 0 {
+            v = v / 2.0;
+            e = e + 1;
+        }
+    };
+    if sign == 1 { return -v; };
+    return v;
+}
+
+// ---- write side (protocol 4) ----
+// The memo is a list of boxed ipay values, one per
+// memoized object, in memo-index order. Only heap
+// values (str / bytes / list / tuple / dict) are
+// memoized, matching CPython: ints, floats, bools and
+// None are written out in full every time. Containers
+// are memoized BEFORE their children are written (the
+// empty-container opcode comes first), so a list or
+// dict that (transitively) contains itself terminates:
+// the inner occurrence finds the memo entry and is
+// written as a BINGET. Tuples are memoized after their
+// items (a tuple only exists once its items do); a
+// reference cycle that passes through a tuple node is
+// a registered limitation and ends at the depth cap
+// (77318), loudly, never in a hang.
+
+fn __psa_pkl_memo_find(memo: PsaVal, ipay: i64) -> i64 {
+    let n = __psa_vec_len_h(memo.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        if __psa_vec_get_h(memo.ipay as ptr, i).ipay == ipay { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn __psa_pkl_memo_add(memo: PsaVal, ipay: i64) -> void {
+    __psa_vec_push_h(memo.ipay as ptr, __psa_box_int(ipay));
+    return;
+}
+
+fn __psa_pkl_write_get(out: PsaVal, idx: i64) -> PsaVal {
+    // BINGET (104) for idx <= 255, LONG_BINGET (106)
+    // with a u32le index above that.
+    if idx <= 255 {
+        let o = __psa_pkl_put(out, 104);
+        o = __psa_pkl_put(o, idx);
+        return o;
+    };
+    let o = __psa_pkl_put(out, 106);
+    o = __psa_pkl_put_u32le(o, idx);
+    return o;
+}
+
+fn __psa_pkl_long_len(v: i64) -> i64 {
+    // Smallest n in 1..8 whose signed two's-complement
+    // range holds v (LONG1 payload length).
+    let n: i64 = 1;
+    while n < 8 {
+        let shift = 8 * n - 1;
+        let lo = 0 - (1 << shift);
+        let hi = (1 << shift) - 1;
+        if v >= lo {
+            if v <= hi { return n; };
+        };
+        n = n + 1;
+    }
+    return 8;
+}
+
+fn __psa_pkl_write_int(out: PsaVal, v: i64) -> PsaVal {
+    // CPython's protocol-4 int encodings: BININT1 (75)
+    // for 0..255, BININT2 (77) for 0..65535, BININT
+    // (74, i32le) inside the i32 range, LONG1 (138)
+    // beyond it. A psa int is an i64 by construction,
+    // so the write side can never leave the i64 range;
+    // 77313 is a read-side refusal.
+    if v >= 0 {
+        if v <= 255 {
+            let o = __psa_pkl_put(out, 75);
+            o = __psa_pkl_put(o, v);
+            return o;
+        };
+        if v <= 65535 {
+            let o = __psa_pkl_put(out, 77);
+            o = __psa_pkl_put_u16le(o, v);
+            return o;
+        };
+        if v <= 2147483647 {
+            let o = __psa_pkl_put(out, 74);
+            o = __psa_pkl_put_u32le(o, v);
+            return o;
+        };
+    };
+    if v >= -2147483648 {
+        if v < 0 {
+            let o = __psa_pkl_put(out, 74);
+            o = __psa_pkl_put_u32le(o, v);
+            return o;
+        };
+    };
+    let n = __psa_pkl_long_len(v);
+    let o = __psa_pkl_put(out, 138);
+    o = __psa_pkl_put(o, n);
+    let s: i64 = 0;
+    while s < 8 * n {
+        o = __psa_pkl_put(o, (v >> s) & 255);
+        s = s + 8;
+    }
+    return o;
+}
+
+fn __psa_pkl_write(out: PsaVal, memo: PsaVal, v: PsaVal, depth: i64) -> PsaVal {
+    if depth > 500 { panic(77318); };
+    if v.tag == 3 {
+        return __psa_pkl_put(out, 78);
+    };
+    if v.tag == 2 {
+        if v.ipay != 0 { return __psa_pkl_put(out, 136); };
+        return __psa_pkl_put(out, 137);
+    };
+    if v.tag == 0 {
+        return __psa_pkl_write_int(out, v.ipay);
+    };
+    if v.tag == 1 {
+        // BINFLOAT (71) + 8 big-endian bit bytes.
+        let o = __psa_pkl_put(out, 71);
+        let bits = __psa_pkl_f64_bits(v.fpay);
+        let s: i64 = 56;
+        let oo = o;
+        while s >= 0 {
+            oo = __psa_pkl_put(oo, (bits >> s) & 255);
+            s = s - 8;
+        }
+        return oo;
+    };
+    if v.tag == 6 || v.tag == 15 || v.tag == 4 || v.tag == 10 || v.tag == 5 {
+        let idx = __psa_pkl_memo_find(memo, v.ipay);
+        if idx >= 0 { return __psa_pkl_write_get(out, idx); };
+        if v.tag == 6 {
+            // SHORT_BINUNICODE (140) up to 255 bytes,
+            // BINUNICODE (88) with a u32le length above.
+            let n = __psa_bytes_len_h(v.ipay as ptr);
+            let o = out;
+            if n <= 255 {
+                o = __psa_pkl_put(o, 140);
+                o = __psa_pkl_put(o, n);
+            } else {
+                o = __psa_pkl_put(o, 88);
+                o = __psa_pkl_put_u32le(o, n);
+            };
+            o = __psa_pkl_put_bytes(o, v);
+            o = __psa_pkl_put(o, 148);
+            __psa_pkl_memo_add(memo, v.ipay);
+            return o;
+        };
+        if v.tag == 15 {
+            // SHORT_BINBYTES (67) / BINBYTES (66) /
+            // BINBYTES8 (142), same length ladder.
+            let n = __psa_bytes_len_h(v.ipay as ptr);
+            let o = out;
+            if n <= 255 {
+                o = __psa_pkl_put(o, 67);
+                o = __psa_pkl_put(o, n);
+            } else {
+                if n <= 4294967295 {
+                    o = __psa_pkl_put(o, 66);
+                    o = __psa_pkl_put_u32le(o, n);
+                } else {
+                    o = __psa_pkl_put(o, 142);
+                    o = __psa_pkl_put_u64le(o, n);
+                };
+            };
+            o = __psa_pkl_put_bytes(o, v);
+            o = __psa_pkl_put(o, 148);
+            __psa_pkl_memo_add(memo, v.ipay);
+            return o;
+        };
+        if v.tag == 4 {
+            // EMPTY_LIST (93) + MEMOIZE first (cycle
+            // safety, see the section header), then a
+            // MARK (40) / items / APPENDS (101) batch.
+            let o = __psa_pkl_put(out, 93);
+            o = __psa_pkl_put(o, 148);
+            __psa_pkl_memo_add(memo, v.ipay);
+            let n = __psa_vec_len_h(v.ipay as ptr);
+            if n == 0 { return o; };
+            o = __psa_pkl_put(o, 40);
+            let i: i64 = 0;
+            while i < n {
+                o = __psa_pkl_write(o, memo, __psa_vec_get_h(v.ipay as ptr, i), depth + 1);
+                i = i + 1;
+            }
+            o = __psa_pkl_put(o, 101);
+            return o;
+        };
+        if v.tag == 10 {
+            let n = __psa_vec_len_h(v.ipay as ptr);
+            if n == 0 {
+                let o = __psa_pkl_put(out, 41);
+                o = __psa_pkl_put(o, 148);
+                __psa_pkl_memo_add(memo, v.ipay);
+                return o;
+            };
+            let o = out;
+            if n <= 3 {
+                let i: i64 = 0;
+                while i < n {
+                    o = __psa_pkl_write(o, memo, __psa_vec_get_h(v.ipay as ptr, i), depth + 1);
+                    i = i + 1;
+                }
+                // TUPLE1 / TUPLE2 / TUPLE3 = 133 / 134 / 135.
+                o = __psa_pkl_put(o, 132 + n);
+            } else {
+                o = __psa_pkl_put(o, 40);
+                let i: i64 = 0;
+                while i < n {
+                    o = __psa_pkl_write(o, memo, __psa_vec_get_h(v.ipay as ptr, i), depth + 1);
+                    i = i + 1;
+                }
+                o = __psa_pkl_put(o, 116);
+            };
+            o = __psa_pkl_put(o, 148);
+            __psa_pkl_memo_add(memo, v.ipay);
+            return o;
+        };
+        // tag 5, dict: EMPTY_DICT (125) + MEMOIZE
+        // first, then MARK / key,value pairs /
+        // SETITEMS (117). Dict storage alternates
+        // key, value in one vec (the json module's
+        // layout).
+        let o = __psa_pkl_put(out, 125);
+        o = __psa_pkl_put(o, 148);
+        __psa_pkl_memo_add(memo, v.ipay);
+        let n = __psa_vec_len_h(v.ipay as ptr);
+        if n == 0 { return o; };
+        o = __psa_pkl_put(o, 40);
+        let i: i64 = 0;
+        while i < n {
+            o = __psa_pkl_write(o, memo, __psa_vec_get_h(v.ipay as ptr, i), depth + 1);
+            o = __psa_pkl_write(o, memo, __psa_vec_get_h(v.ipay as ptr, i + 1), depth + 1);
+            i = i + 2;
+        }
+        o = __psa_pkl_put(o, 117);
+        return o;
+    };
+    panic(77311);
+}
+
+fn psa_pickle_dumps(v: PsaVal) -> PsaVal {
+    // PROTO (128) version 4, the value, STOP (46).
+    // Unframed on purpose (see the header).
+    let out = __psa_bytes_new();
+    out = __psa_pkl_put(out, 128);
+    out = __psa_pkl_put(out, 4);
+    let memo = __psa_list_new();
+    out = __psa_pkl_write(out, memo, v, 0);
+    out = __psa_pkl_put(out, 46);
+    return out;
+}
+
+fn psa_pickle_dump(v: PsaVal, f: PsaVal) -> PsaVal {
+    // CPython's dump(obj, file): the file argument is
+    // an open file value (tag 12), written through the
+    // runtime file surface; returns None.
+    if f.tag != 12 { panic(77310); };
+    let data = psa_pickle_dumps(v);
+    __psa_file_write(f, data);
+    return PsaVal { tag: 3, ipay: 0, fpay: 0.0 };
+}
+
+// ---- read side (protocols 0-5) ----
+// An iterative stack machine, in the hashlib modules'
+// idiom: the state is a 4-element dyn list
+//   [0] data   the input byte buffer (tag 6 or 15)
+//   [1] pos    boxed int, next unread byte index
+//   [2] stack  a list used as the value stack; MARK is
+//              pushed as a PsaVal of tag 99, a tag no
+//              real value carries, so it can never be
+//              mistaken for data (and never escapes:
+//              STOP requires a stack height of one and
+//              every builder consumes its MARK)
+//   [3] memo   a list indexed by memo id; slots not
+//              yet stored hold the tag-99 sentinel and
+//              reading one is malformed (77314)
+
+fn __psa_pkl_none() -> PsaVal {
+    return PsaVal { tag: 3, ipay: 0, fpay: 0.0 };
+}
+
+fn __psa_pkl_mark_val() -> PsaVal {
+    return PsaVal { tag: 99, ipay: 0, fpay: 0.0 };
+}
+
+fn __psa_pkl_st_data(st: PsaVal) -> PsaVal {
+    return __psa_vec_get_h(st.ipay as ptr, 0);
+}
+
+fn __psa_pkl_st_pos(st: PsaVal) -> i64 {
+    return __psa_vec_get_h(st.ipay as ptr, 1).ipay;
+}
+
+fn __psa_pkl_st_set_pos(st: PsaVal, p: i64) -> void {
+    __psa_vec_set_h(st.ipay as ptr, 1, __psa_box_int(p));
+    return;
+}
+
+fn __psa_pkl_st_stack(st: PsaVal) -> PsaVal {
+    return __psa_vec_get_h(st.ipay as ptr, 2);
+}
+
+fn __psa_pkl_st_memo(st: PsaVal) -> PsaVal {
+    return __psa_vec_get_h(st.ipay as ptr, 3);
+}
+
+fn __psa_pkl_getb(st: PsaVal) -> i64 {
+    let data = __psa_pkl_st_data(st);
+    let pos = __psa_pkl_st_pos(st);
+    if pos >= __psa_bytes_len_h(data.ipay as ptr) { panic(77314); };
+    let b = __psa_bytes_get_h(data.ipay as ptr, pos) as i64;
+    __psa_pkl_st_set_pos(st, pos + 1);
+    return b;
+}
+
+fn __psa_pkl_readn(st: PsaVal, n: i64, as_bytes: bool) -> PsaVal {
+    // Read exactly n payload bytes into a fresh buffer
+    // (tag 15 when as_bytes, tag 6 otherwise). The
+    // length is checked against the remaining input
+    // before any byte moves.
+    if n < 0 { panic(77314); };
+    let data = __psa_pkl_st_data(st);
+    let pos = __psa_pkl_st_pos(st);
+    if n > __psa_bytes_len_h(data.ipay as ptr) - pos { panic(77314); };
+    let out = __psa_str_new();
+    if as_bytes { out = __psa_bytes_new(); };
+    let i: i64 = 0;
+    while i < n {
+        out = __psa_str_push(out, __psa_bytes_get_h(data.ipay as ptr, pos + i));
+        i = i + 1;
+    }
+    __psa_pkl_st_set_pos(st, pos + n);
+    return out;
+}
+
+fn __psa_pkl_line(st: PsaVal) -> PsaVal {
+    // Protocol-0 text argument: the bytes up to the
+    // next newline (10), or to the end of the input.
+    // Returns them as a tag-6 buffer, newline consumed.
+    let data = __psa_pkl_st_data(st);
+    let n = __psa_bytes_len_h(data.ipay as ptr);
+    let pos = __psa_pkl_st_pos(st);
+    let end = pos;
+    while end < n {
+        if (__psa_bytes_get_h(data.ipay as ptr, end) as i64) == 10 { break; };
+        end = end + 1;
+    }
+    let out = __psa_str_new();
+    let i = pos;
+    while i < end {
+        out = __psa_str_push(out, __psa_bytes_get_h(data.ipay as ptr, i));
+        i = i + 1;
+    }
+    if end < n {
+        __psa_pkl_st_set_pos(st, end + 1);
+    } else {
+        __psa_pkl_st_set_pos(st, end);
+    };
+    return out;
+}
+
+fn __psa_pkl_u32le(st: PsaVal) -> i64 {
+    let b0 = __psa_pkl_getb(st);
+    let b1 = __psa_pkl_getb(st);
+    let b2 = __psa_pkl_getb(st);
+    let b3 = __psa_pkl_getb(st);
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+fn __psa_pkl_i32le(st: PsaVal) -> i64 {
+    let u = __psa_pkl_u32le(st);
+    if u >= 2147483648 { return u - 4294967296; };
+    return u;
+}
+
+fn __psa_pkl_len64(st: PsaVal) -> i64 {
+    // An 8-byte little-endian length (FRAME header,
+    // BINBYTES8, BINUNICODE8). Any byte above the low
+    // four set means a length no in-memory buffer can
+    // satisfy: malformed (77314).
+    let lo = __psa_pkl_u32le(st);
+    let b4 = __psa_pkl_getb(st);
+    let b5 = __psa_pkl_getb(st);
+    let b6 = __psa_pkl_getb(st);
+    let b7 = __psa_pkl_getb(st);
+    if b4 != 0 { panic(77314); };
+    if b5 != 0 { panic(77314); };
+    if b6 != 0 { panic(77314); };
+    if b7 != 0 { panic(77314); };
+    return lo;
+}
+
+fn __psa_pkl_parse_i64(line: PsaVal) -> i64 {
+    // Decimal text (the INT and LONG opcodes) with an
+    // explicit range check: a magnitude past the i64
+    // range is 77313, never a wrapped value. The
+    // accumulator runs negative (acc = -magnitude) so
+    // -9223372036854775808 itself stays representable
+    // on the way in. OPEN-UP POINT for bigint: return
+    // a bigint value here instead of panicking.
+    let n = __psa_bytes_len_h(line.ipay as ptr);
+    if n == 0 { panic(77314); };
+    let i: i64 = 0;
+    let neg = false;
+    if (__psa_bytes_get_h(line.ipay as ptr, 0) as i64) == 45 {
+        neg = true;
+        i = 1;
+    };
+    if i >= n { panic(77314); };
+    let acc: i64 = 0;
+    while i < n {
+        let d = (__psa_bytes_get_h(line.ipay as ptr, i) as i64) - 48;
+        if d < 0 { panic(77314); };
+        if d > 9 { panic(77314); };
+        if acc < -922337203685477580 { panic(77313); };
+        if acc == -922337203685477580 {
+            if d > 8 { panic(77313); };
+        };
+        acc = acc * 10 - d;
+        i = i + 1;
+    }
+    if neg { return acc; };
+    if acc == 0 - 9223372036854775807 - 1 { panic(77313); };
+    return -acc;
+}
+
+fn __psa_pkl_parse_index(line: PsaVal) -> i64 {
+    // A memo index in text form (GET / PUT): decimal
+    // digits only, bounded by the memo cap.
+    let n = __psa_bytes_len_h(line.ipay as ptr);
+    if n == 0 { panic(77314); };
+    let acc: i64 = 0;
+    let i: i64 = 0;
+    while i < n {
+        let d = (__psa_bytes_get_h(line.ipay as ptr, i) as i64) - 48;
+        if d < 0 { panic(77314); };
+        if d > 9 { panic(77314); };
+        acc = acc * 10 + d;
+        if acc >= 1000000 { panic(77314); };
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn __psa_pkl_decode_long(st: PsaVal, n: i64) -> i64 {
+    // LONG1 / LONG4 payload: n bytes of little-endian
+    // two's complement. The value must fit the i64
+    // range; with n > 8 every byte past the eighth
+    // must be the sign extension of the eighth, and
+    // the eighth's top bit must agree with the sign
+    // taken from the last byte. OPEN-UP POINT for
+    // bigint: widen the result here.
+    if n == 0 { return 0; };
+    let buf = __psa_pkl_readn(st, n, true);
+    let top = __psa_bytes_get_h(buf.ipay as ptr, n - 1) as i64;
+    let sign = (top >> 7) & 1;
+    if n > 8 {
+        let ext = 0;
+        if sign == 1 { ext = 255; };
+        let b7 = __psa_bytes_get_h(buf.ipay as ptr, 7) as i64;
+        if ((b7 >> 7) & 1) != sign { panic(77313); };
+        let k: i64 = 8;
+        while k < n {
+            if (__psa_bytes_get_h(buf.ipay as ptr, k) as i64) != ext { panic(77313); };
+            k = k + 1;
+        }
+    };
+    let m = n;
+    if m > 8 { m = 8; };
+    let u: i64 = 0;
+    let k = m - 1;
+    while k >= 0 {
+        u = (u << 8) | (__psa_bytes_get_h(buf.ipay as ptr, k) as i64);
+        k = k - 1;
+    }
+    if n < 8 {
+        if sign == 1 { u = u - (1 << (8 * n)); };
+    };
+    return u;
+}
+
+fn __psa_pkl_utf8_check(buf: PsaVal) -> void {
+    // Strict UTF-8 validation for the BINUNICODE
+    // family (77317): CPython decodes those payloads
+    // as UTF-8 and raises on anything invalid, so a
+    // malformed payload is refused, never carried
+    // through as bytes. Overlong forms, surrogates
+    // and code points past U+10FFFF are invalid.
+    let n = __psa_bytes_len_h(buf.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        let b = __psa_bytes_get_h(buf.ipay as ptr, i) as i64;
+        if b < 128 {
+            i = i + 1;
+        } else {
+            let need = 0;
+            let lo2 = 128;
+            let hi2 = 191;
+            if b >= 194 {
+                if b <= 223 { need = 1; };
+            };
+            if b == 224 { need = 2; lo2 = 160; };
+            if b >= 225 {
+                if b <= 236 { need = 2; };
+            };
+            if b == 237 { need = 2; hi2 = 159; };
+            if b >= 238 {
+                if b <= 239 { need = 2; };
+            };
+            if b == 240 { need = 3; lo2 = 144; };
+            if b >= 241 {
+                if b <= 243 { need = 3; };
+            };
+            if b == 244 { need = 3; hi2 = 143; };
+            if need == 0 { panic(77317); };
+            if i + need >= n { panic(77317); };
+            let b2 = __psa_bytes_get_h(buf.ipay as ptr, i + 1) as i64;
+            if b2 < lo2 { panic(77317); };
+            if b2 > hi2 { panic(77317); };
+            let j = i + 2;
+            let last = i + need;
+            while j <= last {
+                let bj = __psa_bytes_get_h(buf.ipay as ptr, j) as i64;
+                if bj < 128 { panic(77317); };
+                if bj > 191 { panic(77317); };
+                j = j + 1;
+            }
+            i = i + need + 1;
+        };
+    }
+    return;
+}
+
+// ---- stack / memo operations ----
+
+fn __psa_pkl_push(st: PsaVal, v: PsaVal) -> void {
+    let stack = __psa_pkl_st_stack(st);
+    if __psa_vec_len_h(stack.ipay as ptr) >= 1000000 { panic(77318); };
+    __psa_vec_push_h(stack.ipay as ptr, v);
+    return;
+}
+
+fn __psa_pkl_pop(st: PsaVal) -> PsaVal {
+    let stack = __psa_pkl_st_stack(st);
+    let n = __psa_vec_len_h(stack.ipay as ptr);
+    if n == 0 { panic(77314); };
+    let v = __psa_vec_get_h(stack.ipay as ptr, n - 1);
+    __psa_vec_truncate_h(stack.ipay as ptr, n - 1);
+    return v;
+}
+
+fn __psa_pkl_top(st: PsaVal) -> PsaVal {
+    let stack = __psa_pkl_st_stack(st);
+    let n = __psa_vec_len_h(stack.ipay as ptr);
+    if n == 0 { panic(77314); };
+    return __psa_vec_get_h(stack.ipay as ptr, n - 1);
+}
+
+fn __psa_pkl_mark_pos(st: PsaVal) -> i64 {
+    // Index of the topmost MARK on the stack, or -1.
+    let stack = __psa_pkl_st_stack(st);
+    let i = __psa_vec_len_h(stack.ipay as ptr) - 1;
+    while i >= 0 {
+        if __psa_vec_get_h(stack.ipay as ptr, i).tag == 99 { return i; };
+        i = i - 1;
+    }
+    return -1;
+}
+
+fn __psa_pkl_memo_set(st: PsaVal, idx: i64, v: PsaVal) -> void {
+    if idx < 0 { panic(77314); };
+    if idx >= 1000000 { panic(77318); };
+    let memo = __psa_pkl_st_memo(st);
+    while __psa_vec_len_h(memo.ipay as ptr) <= idx {
+        __psa_vec_push_h(memo.ipay as ptr, __psa_pkl_mark_val());
+    }
+    __psa_vec_set_h(memo.ipay as ptr, idx, v);
+    return;
+}
+
+fn __psa_pkl_memo_get(st: PsaVal, idx: i64) -> PsaVal {
+    let memo = __psa_pkl_st_memo(st);
+    if idx < 0 { panic(77314); };
+    if idx >= __psa_vec_len_h(memo.ipay as ptr) { panic(77314); };
+    let v = __psa_vec_get_h(memo.ipay as ptr, idx);
+    if v.tag == 99 { panic(77314); };
+    return v;
+}
+
+fn __psa_pkl_check_key(k: PsaVal) -> void {
+    // Dict keys on the read side must be hashable
+    // data values (int / float / bool / None / str /
+    // bytes / tuple pass through); anything else is
+    // outside the subset (77311) rather than the
+    // runtime's generic unhashable panic.
+    if k.tag == 4 { panic(77311); };
+    if k.tag == 5 { panic(77311); };
+    if k.tag == 7 { panic(77311); };
+    if k.tag == 8 { panic(77311); };
+    if k.tag == 9 { panic(77311); };
+    if k.tag == 11 { panic(77311); };
+    if k.tag == 12 { panic(77311); };
+    if k.tag == 16 { panic(77311); };
+    return;
+}
+
+// ---- protocol-0 text payload decoders ----
+
+fn __psa_pkl_hexval(b: i64) -> i64 {
+    if b >= 48 {
+        if b <= 57 { return b - 48; };
+    };
+    if b >= 97 {
+        if b <= 102 { return b - 87; };
+    };
+    if b >= 65 {
+        if b <= 70 { return b - 55; };
+    };
+    return -1;
+}
+
+fn __psa_pkl_put_utf8(out: PsaVal, cp: i64) -> PsaVal {
+    // Append one code point encoded as UTF-8.
+    if cp < 128 { return __psa_str_push(out, cp as u8); };
+    if cp < 2048 {
+        let o = __psa_str_push(out, (192 + (cp >> 6)) as u8);
+        o = __psa_str_push(o, (128 + (cp & 63)) as u8);
+        return o;
+    };
+    if cp < 65536 {
+        let o = __psa_str_push(out, (224 + (cp >> 12)) as u8);
+        o = __psa_str_push(o, (128 + ((cp >> 6) & 63)) as u8);
+        o = __psa_str_push(o, (128 + (cp & 63)) as u8);
+        return o;
+    };
+    let o = __psa_str_push(out, (240 + (cp >> 18)) as u8);
+    o = __psa_str_push(o, (128 + ((cp >> 12) & 63)) as u8);
+    o = __psa_str_push(o, (128 + ((cp >> 6) & 63)) as u8);
+    o = __psa_str_push(o, (128 + (cp & 63)) as u8);
+    return o;
+}
+
+fn __psa_pkl_decode_string(line: PsaVal) -> PsaVal {
+    // The STRING opcode (protocol 0): a quoted,
+    // repr-style byte string. The surrounding quotes
+    // must match; the body is escape-processed (the
+    // standard repr escapes, \xXX hex, and up to
+    // three octal digits). The result is a tag-6
+    // buffer holding the raw bytes -- protocol-0
+    // strings are byte-era values, and psa's str is
+    // a byte buffer by convention. An unrecognized
+    // escape keeps both bytes (backslash + char),
+    // the py2-era rule CPython's writer never
+    // contradicts (it only emits recognized escapes).
+    let n = __psa_bytes_len_h(line.ipay as ptr);
+    if n < 2 { panic(77314); };
+    let q = __psa_bytes_get_h(line.ipay as ptr, 0) as i64;
+    if q != 34 {
+        if q != 39 { panic(77314); };
+    };
+    if (__psa_bytes_get_h(line.ipay as ptr, n - 1) as i64) != q { panic(77314); };
+    let out = __psa_str_new();
+    let i: i64 = 1;
+    while i < n - 1 {
+        let b = __psa_bytes_get_h(line.ipay as ptr, i) as i64;
+        if b != 92 {
+            out = __psa_str_push(out, b as u8);
+            i = i + 1;
+        } else {
+            if i + 1 > n - 1 { panic(77314); };
+            let e = __psa_bytes_get_h(line.ipay as ptr, i + 1) as i64;
+            if e == 110 { out = __psa_str_push(out, 10u8); i = i + 2; };
+            if e == 114 { out = __psa_str_push(out, 13u8); i = i + 2; };
+            if e == 116 { out = __psa_str_push(out, 9u8); i = i + 2; };
+            if e == 92 { out = __psa_str_push(out, 92u8); i = i + 2; };
+            if e == 39 { out = __psa_str_push(out, 39u8); i = i + 2; };
+            if e == 34 { out = __psa_str_push(out, 34u8); i = i + 2; };
+            if e == 97 { out = __psa_str_push(out, 7u8); i = i + 2; };
+            if e == 98 { out = __psa_str_push(out, 8u8); i = i + 2; };
+            if e == 102 { out = __psa_str_push(out, 12u8); i = i + 2; };
+            if e == 118 { out = __psa_str_push(out, 11u8); i = i + 2; };
+            if e == 120 {
+                if i + 3 > n - 1 { panic(77314); };
+                let h1 = __psa_pkl_hexval(__psa_bytes_get_h(line.ipay as ptr, i + 2) as i64);
+                let h2 = __psa_pkl_hexval(__psa_bytes_get_h(line.ipay as ptr, i + 3) as i64);
+                if h1 < 0 { panic(77314); };
+                if h2 < 0 { panic(77314); };
+                out = __psa_str_push(out, (h1 * 16 + h2) as u8);
+                i = i + 4;
+            };
+            if e >= 48 {
+                if e <= 55 {
+                    let val = e - 48;
+                    let cnt: i64 = 1;
+                    let more = true;
+                    while more {
+                        if cnt >= 3 { more = false; };
+                        if i + 1 + cnt > n - 1 { more = false; };
+                        if more {
+                            let d = __psa_bytes_get_h(line.ipay as ptr, i + 1 + cnt) as i64;
+                            if d >= 48 {
+                                if d <= 55 {
+                                    val = val * 8 + (d - 48);
+                                    cnt = cnt + 1;
+                                } else { more = false; };
+                            } else { more = false; };
+                        };
+                    }
+                    out = __psa_str_push(out, (val & 255) as u8);
+                    i = i + 1 + cnt;
+                };
+            };
+            if !(e == 110 || e == 114 || e == 116 || e == 92 || e == 39 || e == 34 || e == 97 || e == 98 || e == 102 || e == 118 || e == 120 || (e >= 48 && e <= 55)) {
+                out = __psa_str_push(out, 92u8);
+                out = __psa_str_push(out, e as u8);
+                i = i + 2;
+            };
+        };
+    }
+    return out;
+}
+
+fn __psa_pkl_decode_unicode(line: PsaVal) -> PsaVal {
+    // The UNICODE opcode (protocol 0): text in the
+    // raw-unicode-escape encoding -- plain bytes are
+    // code points of the same value, and the escapes
+    // are \\, \n, \r, \t, \xXX and \uXXXX (a high
+    // surrogate directly followed by a \uDC00-DFFF
+    // escape combines, as in the json module).
+    // Code points are re-encoded as UTF-8 into a
+    // tag-6 buffer. An unrecognized escape yields
+    // the escaped character itself.
+    let n = __psa_bytes_len_h(line.ipay as ptr);
+    let out = __psa_str_new();
+    let i: i64 = 0;
+    while i < n {
+        let b = __psa_bytes_get_h(line.ipay as ptr, i) as i64;
+        if b != 92 {
+            out = __psa_pkl_put_utf8(out, b);
+            i = i + 1;
+        } else {
+            if i + 1 >= n { panic(77314); };
+            let e = __psa_bytes_get_h(line.ipay as ptr, i + 1) as i64;
+            if e == 117 {
+                if i + 6 > n { panic(77314); };
+                let cp: i64 = 0;
+                let k: i64 = 0;
+                while k < 4 {
+                    let h = __psa_pkl_hexval(__psa_bytes_get_h(line.ipay as ptr, i + 2 + k) as i64);
+                    if h < 0 { panic(77314); };
+                    cp = cp * 16 + h;
+                    k = k + 1;
+                }
+                i = i + 6;
+                if cp >= 55296 {
+                    if cp <= 56319 {
+                        if i + 6 <= n {
+                            if (__psa_bytes_get_h(line.ipay as ptr, i) as i64) == 92 {
+                                if (__psa_bytes_get_h(line.ipay as ptr, i + 1) as i64) == 117 {
+                                    let cp2: i64 = 0;
+                                    let ok = true;
+                                    let k2: i64 = 0;
+                                    while k2 < 4 {
+                                        let h = __psa_pkl_hexval(__psa_bytes_get_h(line.ipay as ptr, i + 2 + k2) as i64);
+                                        if h < 0 { ok = false; };
+                                        if ok { cp2 = cp2 * 16 + h; };
+                                        k2 = k2 + 1;
+                                    }
+                                    if ok {
+                                        if cp2 >= 56320 {
+                                            if cp2 <= 57343 {
+                                                cp = 65536 + (cp - 55296) * 1024 + (cp2 - 56320);
+                                                i = i + 6;
+                                            };
+                                        };
+                                    };
+                                };
+                            };
+                        };
+                    };
+                };
+                out = __psa_pkl_put_utf8(out, cp);
+            };
+            if e == 120 {
+                if i + 4 > n { panic(77314); };
+                let h1 = __psa_pkl_hexval(__psa_bytes_get_h(line.ipay as ptr, i + 2) as i64);
+                let h2 = __psa_pkl_hexval(__psa_bytes_get_h(line.ipay as ptr, i + 3) as i64);
+                if h1 < 0 { panic(77314); };
+                if h2 < 0 { panic(77314); };
+                out = __psa_pkl_put_utf8(out, h1 * 16 + h2);
+                i = i + 4;
+            };
+            if e == 110 { out = __psa_str_push(out, 10u8); i = i + 2; };
+            if e == 114 { out = __psa_str_push(out, 13u8); i = i + 2; };
+            if e == 116 { out = __psa_str_push(out, 9u8); i = i + 2; };
+            if e == 92 { out = __psa_str_push(out, 92u8); i = i + 2; };
+            if !(e == 117 || e == 120 || e == 110 || e == 114 || e == 116 || e == 92) {
+                out = __psa_pkl_put_utf8(out, e);
+                i = i + 2;
+            };
+        };
+    }
+    return out;
+}
+
+// ---- MARK builders ----
+
+fn __psa_pkl_build_list(st: PsaVal) -> void {
+    let mp = __psa_pkl_mark_pos(st);
+    if mp < 0 { panic(77314); };
+    let stack = __psa_pkl_st_stack(st);
+    let n = __psa_vec_len_h(stack.ipay as ptr);
+    let lst = __psa_list_new();
+    let i = mp + 1;
+    while i < n {
+        __psa_list_push(lst, __psa_vec_get_h(stack.ipay as ptr, i));
+        i = i + 1;
+    }
+    __psa_vec_truncate_h(stack.ipay as ptr, mp);
+    __psa_pkl_push(st, lst);
+    return;
+}
+
+fn __psa_pkl_build_tuple(st: PsaVal) -> void {
+    let mp = __psa_pkl_mark_pos(st);
+    if mp < 0 { panic(77314); };
+    let stack = __psa_pkl_st_stack(st);
+    let n = __psa_vec_len_h(stack.ipay as ptr);
+    let tup = __psa_tuple_new();
+    let i = mp + 1;
+    while i < n {
+        __psa_tuple_push(tup, __psa_vec_get_h(stack.ipay as ptr, i));
+        i = i + 1;
+    }
+    __psa_vec_truncate_h(stack.ipay as ptr, mp);
+    __psa_pkl_push(st, tup);
+    return;
+}
+
+fn __psa_pkl_build_dict(st: PsaVal) -> void {
+    let mp = __psa_pkl_mark_pos(st);
+    if mp < 0 { panic(77314); };
+    let stack = __psa_pkl_st_stack(st);
+    let n = __psa_vec_len_h(stack.ipay as ptr);
+    if (n - (mp + 1)) % 2 != 0 { panic(77314); };
+    let d = __psa_dict_new();
+    let i = mp + 1;
+    while i < n {
+        let k = __psa_vec_get_h(stack.ipay as ptr, i);
+        __psa_pkl_check_key(k);
+        __psa_dict_set(d, k, __psa_vec_get_h(stack.ipay as ptr, i + 1));
+        i = i + 2;
+    }
+    __psa_vec_truncate_h(stack.ipay as ptr, mp);
+    __psa_pkl_push(st, d);
+    return;
+}
+
+fn __psa_pkl_appends(st: PsaVal) -> void {
+    let mp = __psa_pkl_mark_pos(st);
+    if mp < 1 { panic(77314); };
+    let stack = __psa_pkl_st_stack(st);
+    let target = __psa_vec_get_h(stack.ipay as ptr, mp - 1);
+    if target.tag != 4 { panic(77314); };
+    let n = __psa_vec_len_h(stack.ipay as ptr);
+    let i = mp + 1;
+    while i < n {
+        __psa_list_push(target, __psa_vec_get_h(stack.ipay as ptr, i));
+        i = i + 1;
+    }
+    __psa_vec_truncate_h(stack.ipay as ptr, mp);
+    return;
+}
+
+fn __psa_pkl_setitems(st: PsaVal) -> void {
+    let mp = __psa_pkl_mark_pos(st);
+    if mp < 1 { panic(77314); };
+    let stack = __psa_pkl_st_stack(st);
+    let target = __psa_vec_get_h(stack.ipay as ptr, mp - 1);
+    if target.tag != 5 { panic(77314); };
+    let n = __psa_vec_len_h(stack.ipay as ptr);
+    if (n - (mp + 1)) % 2 != 0 { panic(77314); };
+    let i = mp + 1;
+    while i < n {
+        let k = __psa_vec_get_h(stack.ipay as ptr, i);
+        __psa_pkl_check_key(k);
+        __psa_dict_set(target, k, __psa_vec_get_h(stack.ipay as ptr, i + 1));
+        i = i + 2;
+    }
+    __psa_vec_truncate_h(stack.ipay as ptr, mp);
+    return;
+}
+
+fn __psa_pkl_tuple_n(st: PsaVal, cnt: i64) -> void {
+    let stack = __psa_pkl_st_stack(st);
+    let n = __psa_vec_len_h(stack.ipay as ptr);
+    if n < cnt { panic(77314); };
+    let tup = __psa_tuple_new();
+    let i = n - cnt;
+    while i < n {
+        __psa_tuple_push(tup, __psa_vec_get_h(stack.ipay as ptr, i));
+        i = i + 1;
+    }
+    __psa_vec_truncate_h(stack.ipay as ptr, n - cnt);
+    __psa_pkl_push(st, tup);
+    return;
+}
+
+// ---- the dispatch loop ----
+// One pass over the opcode stream. The executable
+// opcodes are refused the moment their byte is seen
+// (77312), before a single argument byte is read:
+// there is no stream in which seeing one is safe.
+// Recognized-but-out-of-subset opcodes get 77316;
+// anything else unknown gets 77314.
+
+fn __psa_pkl_run(st: PsaVal) -> PsaVal {
+    let result = __psa_pkl_none();
+    let done = false;
+    while !(done) {
+        let op = __psa_pkl_getb(st);
+        let handled = false;
+        if op == 46 {
+            // STOP: exactly one value may remain.
+            let stack = __psa_pkl_st_stack(st);
+            if __psa_vec_len_h(stack.ipay as ptr) != 1 { panic(77314); };
+            result = __psa_pkl_pop(st);
+            done = true;
+            handled = true;
+        };
+        if op == 128 {
+            // PROTO + one version byte.
+            let ver = __psa_pkl_getb(st);
+            if ver > 5 { panic(77315); };
+            handled = true;
+        };
+        if op == 149 {
+            // FRAME + 8-byte length: a reader hint,
+            // skipped; the frame body's own reads
+            // stay bounds-checked as usual.
+            let flen = __psa_pkl_len64(st);
+            handled = true;
+        };
+        if op == 78 { __psa_pkl_push(st, __psa_pkl_none()); handled = true; };
+        if op == 136 { __psa_pkl_push(st, __psa_box_bool(true)); handled = true; };
+        if op == 137 { __psa_pkl_push(st, __psa_box_bool(false)); handled = true; };
+        if op == 73 {
+            // INT: decimal text; the protocol-0 bool
+            // spellings are exactly "00" and "01".
+            let line = __psa_pkl_line(st);
+            let ln = __psa_bytes_len_h(line.ipay as ptr);
+            let is_bool = false;
+            if ln == 2 {
+                if (__psa_bytes_get_h(line.ipay as ptr, 0) as i64) == 48 {
+                    if (__psa_bytes_get_h(line.ipay as ptr, 1) as i64) == 48 {
+                        __psa_pkl_push(st, __psa_box_bool(false));
+                        is_bool = true;
+                    };
+                    if (__psa_bytes_get_h(line.ipay as ptr, 1) as i64) == 49 {
+                        __psa_pkl_push(st, __psa_box_bool(true));
+                        is_bool = true;
+                    };
+                };
+            };
+            if !(is_bool) {
+                __psa_pkl_push(st, __psa_box_int(__psa_pkl_parse_i64(line)));
+            };
+            handled = true;
+        };
+        if op == 76 {
+            // LONG: decimal text with a trailing L.
+            let line = __psa_pkl_line(st);
+            let ln = __psa_bytes_len_h(line.ipay as ptr);
+            if ln > 0 {
+                if (__psa_bytes_get_h(line.ipay as ptr, ln - 1) as i64) == 76 {
+                    line = __psa_str_sub_bytes(line, 0, ln - 1);
+                };
+            };
+            __psa_pkl_push(st, __psa_box_int(__psa_pkl_parse_i64(line)));
+            handled = true;
+        };
+        if op == 74 { __psa_pkl_push(st, __psa_box_int(__psa_pkl_i32le(st))); handled = true; };
+        if op == 75 { __psa_pkl_push(st, __psa_box_int(__psa_pkl_getb(st))); handled = true; };
+        if op == 77 {
+            let b0 = __psa_pkl_getb(st);
+            let b1 = __psa_pkl_getb(st);
+            __psa_pkl_push(st, __psa_box_int(b0 | (b1 << 8)));
+            handled = true;
+        };
+        if op == 138 {
+            let n = __psa_pkl_getb(st);
+            __psa_pkl_push(st, __psa_box_int(__psa_pkl_decode_long(st, n)));
+            handled = true;
+        };
+        if op == 139 {
+            let n = __psa_pkl_u32le(st);
+            __psa_pkl_push(st, __psa_box_int(__psa_pkl_decode_long(st, n)));
+            handled = true;
+        };
+        if op == 70 {
+            // FLOAT: decimal text.
+            let line = __psa_pkl_line(st);
+            __psa_pkl_push(st, __psa_box_float(__psa_str_to_float(line)));
+            handled = true;
+        };
+        if op == 71 {
+            // BINFLOAT: 8 big-endian bit bytes.
+            let bits: i64 = 0;
+            let k: i64 = 0;
+            while k < 8 {
+                bits = (bits << 8) | __psa_pkl_getb(st);
+                k = k + 1;
+            }
+            __psa_pkl_push(st, __psa_box_float(__psa_pkl_bits_f64(bits)));
+            handled = true;
+        };
+        if op == 83 {
+            let line = __psa_pkl_line(st);
+            __psa_pkl_push(st, __psa_pkl_decode_string(line));
+            handled = true;
+        };
+        if op == 86 {
+            let line = __psa_pkl_line(st);
+            __psa_pkl_push(st, __psa_pkl_decode_unicode(line));
+            handled = true;
+        };
+        if op == 84 {
+            let n = __psa_pkl_i32le(st);
+            __psa_pkl_push(st, __psa_pkl_readn(st, n, false));
+            handled = true;
+        };
+        if op == 85 {
+            let n = __psa_pkl_getb(st);
+            __psa_pkl_push(st, __psa_pkl_readn(st, n, false));
+            handled = true;
+        };
+        if op == 88 {
+            let n = __psa_pkl_u32le(st);
+            let buf = __psa_pkl_readn(st, n, false);
+            __psa_pkl_utf8_check(buf);
+            __psa_pkl_push(st, buf);
+            handled = true;
+        };
+        if op == 140 {
+            let n = __psa_pkl_getb(st);
+            let buf = __psa_pkl_readn(st, n, false);
+            __psa_pkl_utf8_check(buf);
+            __psa_pkl_push(st, buf);
+            handled = true;
+        };
+        if op == 141 {
+            let n = __psa_pkl_len64(st);
+            let buf = __psa_pkl_readn(st, n, false);
+            __psa_pkl_utf8_check(buf);
+            __psa_pkl_push(st, buf);
+            handled = true;
+        };
+        if op == 67 {
+            let n = __psa_pkl_getb(st);
+            __psa_pkl_push(st, __psa_pkl_readn(st, n, true));
+            handled = true;
+        };
+        if op == 66 {
+            let n = __psa_pkl_u32le(st);
+            __psa_pkl_push(st, __psa_pkl_readn(st, n, true));
+            handled = true;
+        };
+        if op == 142 {
+            let n = __psa_pkl_len64(st);
+            __psa_pkl_push(st, __psa_pkl_readn(st, n, true));
+            handled = true;
+        };
+        if op == 93 { __psa_pkl_push(st, __psa_list_new()); handled = true; };
+        if op == 41 { __psa_pkl_push(st, __psa_tuple_new()); handled = true; };
+        if op == 125 { __psa_pkl_push(st, __psa_dict_new()); handled = true; };
+        if op == 40 { __psa_pkl_push(st, __psa_pkl_mark_val()); handled = true; };
+        if op == 108 { __psa_pkl_build_list(st); handled = true; };
+        if op == 116 { __psa_pkl_build_tuple(st); handled = true; };
+        if op == 100 { __psa_pkl_build_dict(st); handled = true; };
+        if op == 97 {
+            let item = __psa_pkl_pop(st);
+            let t = __psa_pkl_top(st);
+            if t.tag != 4 { panic(77314); };
+            __psa_list_push(t, item);
+            handled = true;
+        };
+        if op == 101 { __psa_pkl_appends(st); handled = true; };
+        if op == 115 {
+            let val = __psa_pkl_pop(st);
+            let key = __psa_pkl_pop(st);
+            let d = __psa_pkl_top(st);
+            if d.tag != 5 { panic(77314); };
+            __psa_pkl_check_key(key);
+            __psa_dict_set(d, key, val);
+            handled = true;
+        };
+        if op == 117 { __psa_pkl_setitems(st); handled = true; };
+        if op == 48 {
+            let dropped = __psa_pkl_pop(st);
+            handled = true;
+        };
+        if op == 49 {
+            let mp = __psa_pkl_mark_pos(st);
+            if mp < 0 { panic(77314); };
+            let stack = __psa_pkl_st_stack(st);
+            __psa_vec_truncate_h(stack.ipay as ptr, mp);
+            handled = true;
+        };
+        if op == 50 { __psa_pkl_push(st, __psa_pkl_top(st)); handled = true; };
+        if op == 112 {
+            let idx = __psa_pkl_parse_index(__psa_pkl_line(st));
+            __psa_pkl_memo_set(st, idx, __psa_pkl_top(st));
+            handled = true;
+        };
+        if op == 113 {
+            let idx = __psa_pkl_getb(st);
+            __psa_pkl_memo_set(st, idx, __psa_pkl_top(st));
+            handled = true;
+        };
+        if op == 114 {
+            let idx = __psa_pkl_u32le(st);
+            __psa_pkl_memo_set(st, idx, __psa_pkl_top(st));
+            handled = true;
+        };
+        if op == 148 {
+            let memo = __psa_pkl_st_memo(st);
+            let idx = __psa_vec_len_h(memo.ipay as ptr);
+            __psa_pkl_memo_set(st, idx, __psa_pkl_top(st));
+            handled = true;
+        };
+        if op == 103 {
+            let idx = __psa_pkl_parse_index(__psa_pkl_line(st));
+            __psa_pkl_push(st, __psa_pkl_memo_get(st, idx));
+            handled = true;
+        };
+        if op == 104 {
+            let idx = __psa_pkl_getb(st);
+            __psa_pkl_push(st, __psa_pkl_memo_get(st, idx));
+            handled = true;
+        };
+        if op == 106 {
+            let idx = __psa_pkl_u32le(st);
+            __psa_pkl_push(st, __psa_pkl_memo_get(st, idx));
+            handled = true;
+        };
+        if op == 133 { __psa_pkl_tuple_n(st, 1); handled = true; };
+        if op == 134 { __psa_pkl_tuple_n(st, 2); handled = true; };
+        if op == 135 { __psa_pkl_tuple_n(st, 3); handled = true; };
+        // The security boundary: GLOBAL (99),
+        // STACK_GLOBAL (147), REDUCE (82), BUILD
+        // (98), OBJ (111), INST (105), NEWOBJ (129),
+        // NEWOBJ_EX (146), EXT1 (130), EXT2 (131),
+        // EXT4 (132), PERSID (80), BINPERSID (81).
+        if op == 99 || op == 147 || op == 82 || op == 98 || op == 111 || op == 105 || op == 129 || op == 146 || op == 130 || op == 131 || op == 132 || op == 80 || op == 81 { panic(77312); };
+        // Recognized but outside the data subset:
+        // EMPTY_SET (143), ADDITEMS (144), FROZENSET
+        // (145), BYTEARRAY8 (150), NEXT_BUFFER (151),
+        // READONLY_BUFFER (152).
+        if op == 143 || op == 144 || op == 145 || op == 150 || op == 151 || op == 152 { panic(77316); };
+        if !(handled) { panic(77314); };
+    }
+    return result;
+}
+
+fn psa_pickle_loads(data: PsaVal) -> PsaVal {
+    // The input is a byte buffer: a tag-15 bytes
+    // value, or a tag-6 str holding raw bytes (the
+    // file surface's return shape).
+    if data.tag != 6 {
+        if data.tag != 15 { panic(77310); };
+    };
+    let st = __psa_list_new();
+    __psa_vec_push_h(st.ipay as ptr, data);
+    __psa_vec_push_h(st.ipay as ptr, __psa_box_int(0));
+    __psa_vec_push_h(st.ipay as ptr, __psa_list_new());
+    __psa_vec_push_h(st.ipay as ptr, __psa_list_new());
+    return __psa_pkl_run(st);
+}
+
+fn psa_pickle_load(f: PsaVal) -> PsaVal {
+    // CPython's load(file): read the whole file
+    // through the runtime file surface, then parse.
+    if f.tag != 12 { panic(77310); };
+    return psa_pickle_loads(__psa_file_read_all(f));
+}
