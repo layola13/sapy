@@ -4871,9 +4871,10 @@ impl Emitter {
             "repr" => {
                 // repr() of a dynamic value (D5/D6 surface):
                 // strings quote, objects ride __repr__, scalars
-                // format exactly; containers and floats stay
-                // blocked (77030) with the missing repr-to-string
-                // builders, exactly like str().
+                // format exactly; containers render through
+                // the S7 recursive repr builders in
+                // __psa_repr_of; floats stay blocked (77030),
+                // exactly like str().
                 if args.len() != 1 {
                     return Err(eerr(line, "repr() takes exactly one argument"));
                 }
@@ -14379,6 +14380,41 @@ fn __psa_dyn_is(a: PsaVal, b: PsaVal) -> bool {
     return a.fpay != a.fpay && b.fpay != b.fpay;
 }
 
+// id() analogue and identity map (S7, gap #11). __psa_dyn_is
+// above is the identity predicate; __psa_id_of exposes the
+// identity word it compares. For every heap kind the ipay
+// payload IS the storage pointer, so the id is exact; for
+// immediates it degrades exactly as __psa_dyn_is does: an
+// int/bool id is its payload word, None's id is 0, and a
+// float's id is 0 (an f64 payload carries no identity word;
+// a bit-exact float id waits on the f64<->bits surface,
+// gap #13). The identity map is a plain dict keyed by
+// box_int(id) -- the deepcopy memo's proven shape
+// (staging-std-struct2/copy.sla) -- so lookups are exact
+// for heap values and value-keyed for immediates, never
+// the reverse. __psa_idmap_get requires a prior
+// __psa_idmap_has, exactly like the deepcopy memo.
+fn __psa_id_of(v: PsaVal) -> i64 {
+    if v.tag == 1 { return 0; };
+    return v.ipay;
+}
+
+fn __psa_idmap_new() -> PsaVal {
+    return __psa_dict_new();
+}
+
+fn __psa_idmap_has(m: PsaVal, v: PsaVal) -> bool {
+    return __psa_dict_contains(m, __psa_box_int(__psa_id_of(v)));
+}
+
+fn __psa_idmap_get(m: PsaVal, v: PsaVal) -> PsaVal {
+    return __psa_dict_get(m, __psa_box_int(__psa_id_of(v)));
+}
+
+fn __psa_idmap_put(m: PsaVal, v: PsaVal, x: PsaVal) {
+    __psa_dict_set(m, __psa_box_int(__psa_id_of(v)), x);
+}
+
 
 
 
@@ -17314,6 +17350,240 @@ fn __psa_dyn_int(v: PsaVal) -> PsaVal {
     };
     return __psa_box_int(__psa_to_int(v));
 }
+
+// ---------------------------------------------------------------------
+// S7 runtime dyn-helper pack (gaps #17, #28, #12). New helpers
+// only; nothing above changes. Panic codes 77087/77088 are new
+// runtime-core registrations (see staging NOTES for the
+// panic_codes.rs entries).
+// ---------------------------------------------------------------------
+
+// __psa_dyn_abs / __psa_dyn_pos (gap #17): the unary numeric
+// dyn ops, completing the __psa_dyn_* family next to
+// __psa_dyn_neg. CPython semantics: abs(True) == 1 (an int),
+// +True == 1 (an int); abs of the i64 minimum promotes to
+// tag 17 exactly as __psa_dyn_neg does; float abs is fabs
+// (abs(-0.0) == 0.0, abs(nan) is nan, abs(-inf) == inf).
+// Non-numbers panic 77087.
+fn __psa_dyn_abs(v: PsaVal) -> PsaVal {
+    if v.tag == 17 {
+        if __psa_big_sign(v) < 0 {
+            let x = __psa_big_unbox(v);
+            return __psa_big_norm(big_neg(&x));
+        };
+        return v;
+    };
+    if v.tag == 2 { return __psa_box_int(v.ipay); };
+    if v.tag == 0 {
+        if v.ipay == -9223372036854775807 - 1 { return __psa_big_neg_of(v); };
+        if v.ipay < 0 { return __psa_box_int(0 - v.ipay); };
+        return v;
+    };
+    if v.tag == 1 {
+        if v.fpay < 0.0 { return __psa_box_float(0.0 - v.fpay); };
+        return v;
+    };
+    panic(77087);
+}
+
+fn __psa_dyn_pos(v: PsaVal) -> PsaVal {
+    if v.tag == 2 { return __psa_box_int(v.ipay); };
+    if v.tag == 0 || v.tag == 1 || v.tag == 17 { return v; };
+    panic(77087);
+}
+
+// __psa_dyn_matmul (gap #17): the family now covers `@` by
+// name, but no psa type defines __matmul__ yet (syslite
+// REPORT section 4), and CPython raises TypeError for every
+// operand pair psa can represent (int @ int, list @ list,
+// ...). The helper therefore refuses every shape loudly
+// with 77088 instead of approximating with mul; when a
+// matrix/array type lands, its dispatch grows here.
+fn __psa_dyn_matmul(a: PsaVal, b: PsaVal) -> PsaVal {
+    panic(77088);
+}
+
+// __psa_print_err (gap #28): print a dynamic value to
+// stderr, newline-terminated like __psa_print_dyn. Retires
+// the sa_io_stderr() chunk-writer copies in psa_std
+// (argparse's, tomllib's): the value is rendered with
+// __psa_str_of (a tag-6 value passes through untouched)
+// and written in 256-byte chunks, the __psa_print_str
+// shape with sa_io_write_all in place of sla_print_bytes.
+// sa_std/io.sai arrives through the generated import
+// block's sla_std/wrap/io.sla, as for the assert label.
+fn __psa_print_err(v: PsaVal) {
+    let s = v;
+    if v.tag != 6 { s = __psa_str_of(v); };
+    let h = sa_io_stderr();
+    let n = __psa_str_bytes_len(s);
+    let buf = [0u8; 256];
+    let base: i64 = 0;
+    while base < n {
+        let chunk = n - base;
+        if chunk > 256 { chunk = 256; };
+        let k: i64 = 0;
+        while k < chunk { buf[k] = __psa_bytes_get_h(s.ipay as ptr, base + k); k = k + 1; }
+        let rc: i32 = sa_io_write_all(h, PTR_BYTE_ADD(&buf, 0), chunk as u64);
+        base = base + chunk;
+    }
+    buf[0] = 10u8;
+    let rc2: i32 = sa_io_write_all(h, PTR_BYTE_ADD(&buf, 0), 1);
+}
+
+// Fallible str->number parsers (gap #12). The panic variants
+// __psa_str_to_int / __psa_str_to_float keep their 77079
+// contract for int()/float(); these twins share the exact
+// same grammar (surrounding spaces, optional sign, digits
+// with optional fraction/exponent for float -- the grammar
+// accepts no inf/nan spellings in either variant) but
+// return a (ok, value) tuple instead of panicking, because
+// a panic cannot be caught across the splice: psa_std
+// callers such as configparser's getint/getfloat test ok
+// and raise their own codes. The int twin promotes on
+// overflow exactly like __psa_dyn_int; the value slot is
+// box_int(0) / box_float(0.0) when ok is false. Caller
+// contract: v is tag 6, as for the panic variants.
+fn __psa_try_str_to_int(v: PsaVal) -> PsaVal {
+    let n = __psa_bytes_len_h(v.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        if !(__psa_str_is_space(__psa_str_byte(v, i))) { break; };
+        i = i + 1;
+    }
+    let neg = false;
+    if i < n {
+        if __psa_str_byte(v, i) == 43 || __psa_str_byte(v, i) == 45 {
+            neg = __psa_str_byte(v, i) == 45;
+            i = i + 1;
+        };
+    };
+    let dstart = i;
+    let any = false;
+    let acc: i64 = 0;
+    let big = false;
+    while i < n {
+        let b = __psa_str_byte(v, i);
+        if b < 48 || b > 57 { break; };
+        if !(big) {
+            if acc > (9223372036854775807 - (b - 48)) / 10 {
+                big = true;
+            } else {
+                acc = acc * 10 + (b - 48);
+            };
+        };
+        any = true;
+        i = i + 1;
+    }
+    let dend = i;
+    while i < n {
+        if !(__psa_str_is_space(__psa_str_byte(v, i))) { break; };
+        i = i + 1;
+    }
+    let out = __psa_tuple_new();
+    if !(any) || i != n {
+        __psa_tuple_push(out, __psa_box_bool(false));
+        __psa_tuple_push(out, __psa_box_int(0));
+        return out;
+    };
+    __psa_tuple_push(out, __psa_box_bool(true));
+    if big {
+        let digits = __psa_str_new();
+        if neg { digits = __psa_str_push(digits, 45u8); };
+        let j = dstart;
+        while j < dend {
+            digits = __psa_str_push(digits, __psa_str_byte(v, j));
+            j = j + 1;
+        }
+        __psa_tuple_push(out, __psa_big_from_psastr(digits));
+        return out;
+    };
+    if neg { __psa_tuple_push(out, __psa_box_int(0 - acc)); return out; };
+    __psa_tuple_push(out, __psa_box_int(acc));
+    return out;
+}
+
+fn __psa_try_str_to_float(v: PsaVal) -> PsaVal {
+    let n = __psa_bytes_len_h(v.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        if !(__psa_str_is_space(__psa_str_byte(v, i))) { break; };
+        i = i + 1;
+    }
+    let neg = false;
+    if i < n {
+        if __psa_str_byte(v, i) == 43 || __psa_str_byte(v, i) == 45 {
+            neg = __psa_str_byte(v, i) == 45;
+            i = i + 1;
+        };
+    };
+    let any = false;
+    let acc: f64 = 0.0;
+    while i < n {
+        let b = __psa_str_byte(v, i);
+        if b < 48 || b > 57 { break; };
+        acc = acc * 10.0 + ((b - 48) as f64);
+        any = true;
+        i = i + 1;
+    }
+    if i < n {
+        if __psa_str_byte(v, i) == 46 {
+        i = i + 1;
+        let scale: f64 = 0.1;
+        while i < n {
+            let b = __psa_str_byte(v, i);
+            if b < 48 || b > 57 { break; };
+            acc = acc + ((b - 48) as f64) * scale;
+            scale = scale * 0.1;
+            any = true;
+            i = i + 1;
+        }
+        };
+    };
+    let badexp = false;
+    if i < n {
+        if __psa_str_byte(v, i) == 101 || __psa_str_byte(v, i) == 69 {
+        i = i + 1;
+        let eneg = false;
+        if i < n {
+            if __psa_str_byte(v, i) == 43 || __psa_str_byte(v, i) == 45 {
+                eneg = __psa_str_byte(v, i) == 45;
+                i = i + 1;
+            };
+        };
+        let eany = false;
+        let e: i64 = 0;
+        while i < n {
+            let b = __psa_str_byte(v, i);
+            if b < 48 || b > 57 { break; };
+            e = e * 10 + (b - 48);
+            eany = true;
+            i = i + 1;
+        }
+        if !(eany) { badexp = true; };
+        let k: i64 = 0;
+        if eneg {
+            while k < e { acc = acc * 0.1; k = k + 1; }
+        } else {
+            while k < e { acc = acc * 10.0; k = k + 1; }
+        };
+    };
+    };
+    while i < n {
+        if !(__psa_str_is_space(__psa_str_byte(v, i))) { break; };
+        i = i + 1;
+    }
+    let out = __psa_tuple_new();
+    if badexp || !(any) || i != n {
+        __psa_tuple_push(out, __psa_box_bool(false));
+        __psa_tuple_push(out, __psa_box_float(0.0));
+        return out;
+    };
+    __psa_tuple_push(out, __psa_box_bool(true));
+    if neg { __psa_tuple_push(out, __psa_box_float(0.0 - acc)); return out; };
+    __psa_tuple_push(out, __psa_box_float(acc));
+    return out;
+}
 "#;
 
 /// D6 runtime, part 1 (emitted with every dynamic program):
@@ -17359,11 +17629,136 @@ fn __psa_exc_store(v: PsaVal) {
 // their __repr__ machinery, scalars format exactly;
 // containers and floats stay blocked (77030) with the
 // missing repr-to-string builders, exactly like str().
-fn __psa_repr_of(v: PsaVal) -> PsaVal {
+// Container repr (S7, gap #18): __psa_repr_of used to panic
+// 77030 for list/tuple/dict/set and for function values, so
+// pprint and reprlib grew their own renderers. The recursive
+// worker below renders containers with CPython's spellings
+// ([1, 2], (1,), {'k': 1}, {1, 2}, set()) and CPython's
+// recursion markers ([...], {...}, (...)) when a container
+// is its own ancestor; the ancestor set is an identity map
+// (gap #11) keyed by storage pointer and removed on exit,
+// so a shared but non-recursive subcontainer renders in
+// full at every occurrence, as in CPython. Function values
+// (tag 7), closures (tag 16) and bound methods (tag 9)
+// render in CPython's shape without the name/address
+// payload -- <function>, <bound method> -- the stable
+// rendering the gap asks for (compare __psa_str_of's
+// <generator object>). Tag 17 joins the table: its absence
+// was an oversight, as __psa_print_repr and __psa_str_of
+// both render bigints. Tag 1 still panics 77030: float
+// text is gap #4, untouched here.
+fn __psa_repr_ellipsis(open: u8, close: u8) -> PsaVal {
+    let out = __psa_str_new();
+    out = __psa_str_push(out, open);
+    out = __psa_str_push(out, 46u8);
+    out = __psa_str_push(out, 46u8);
+    out = __psa_str_push(out, 46u8);
+    out = __psa_str_push(out, close);
+    return out;
+}
+
+fn __psa_repr_function() -> PsaVal {
+    let out = __psa_str_new();
+    out = __psa_str_push(out, 60u8);
+    out = __psa_str_push(out, 102u8); out = __psa_str_push(out, 117u8); out = __psa_str_push(out, 110u8); out = __psa_str_push(out, 99u8); out = __psa_str_push(out, 116u8); out = __psa_str_push(out, 105u8); out = __psa_str_push(out, 111u8); out = __psa_str_push(out, 110u8);
+    out = __psa_str_push(out, 62u8);
+    return out;
+}
+
+fn __psa_repr_bound_method() -> PsaVal {
+    let out = __psa_str_new();
+    out = __psa_str_push(out, 60u8);
+    out = __psa_str_push(out, 98u8); out = __psa_str_push(out, 111u8); out = __psa_str_push(out, 117u8); out = __psa_str_push(out, 110u8); out = __psa_str_push(out, 100u8);
+    out = __psa_str_push(out, 32u8);
+    out = __psa_str_push(out, 109u8); out = __psa_str_push(out, 101u8); out = __psa_str_push(out, 116u8); out = __psa_str_push(out, 104u8); out = __psa_str_push(out, 111u8); out = __psa_str_push(out, 100u8);
+    out = __psa_str_push(out, 62u8);
+    return out;
+}
+
+fn __psa_repr_list(v: PsaVal, seen: PsaVal) -> PsaVal {
+    if __psa_idmap_has(seen, v) { return __psa_repr_ellipsis(91u8, 93u8); };
+    __psa_idmap_put(seen, v, __psa_box_bool(true));
+    let out = __psa_str_new();
+    out = __psa_str_push(out, 91u8);
+    let n = __psa_list_len(v);
+    let i: i64 = 0;
+    while i < n {
+        if i > 0 { out = __psa_str_push(out, 44u8); out = __psa_str_push(out, 32u8); };
+        out = __psa_str_append_str(out, __psa_repr_rec(__psa_list_get(v, i), seen));
+        i = i + 1;
+    }
+    out = __psa_str_push(out, 93u8);
+    __psa_dict_del(seen, __psa_box_int(v.ipay));
+    return out;
+}
+
+fn __psa_repr_dict(v: PsaVal, seen: PsaVal) -> PsaVal {
+    if __psa_idmap_has(seen, v) { return __psa_repr_ellipsis(123u8, 125u8); };
+    __psa_idmap_put(seen, v, __psa_box_bool(true));
+    let out = __psa_str_new();
+    out = __psa_str_push(out, 123u8);
+    let n = __psa_dict_len(v);
+    let i: i64 = 0;
+    while i < n {
+        if i > 0 { out = __psa_str_push(out, 44u8); out = __psa_str_push(out, 32u8); };
+        out = __psa_str_append_str(out, __psa_repr_rec(__psa_dict_key_at(v, i), seen));
+        out = __psa_str_push(out, 58u8); out = __psa_str_push(out, 32u8);
+        out = __psa_str_append_str(out, __psa_repr_rec(__psa_dict_val_at(v, i), seen));
+        i = i + 1;
+    }
+    out = __psa_str_push(out, 125u8);
+    __psa_dict_del(seen, __psa_box_int(v.ipay));
+    return out;
+}
+
+fn __psa_repr_tuple(v: PsaVal, seen: PsaVal) -> PsaVal {
+    if __psa_idmap_has(seen, v) { return __psa_repr_ellipsis(40u8, 41u8); };
+    __psa_idmap_put(seen, v, __psa_box_bool(true));
+    let out = __psa_str_new();
+    out = __psa_str_push(out, 40u8);
+    let n = __psa_vec_len_h(v.ipay as ptr);
+    let i: i64 = 0;
+    while i < n {
+        if i > 0 { out = __psa_str_push(out, 44u8); out = __psa_str_push(out, 32u8); };
+        out = __psa_str_append_str(out, __psa_repr_rec(__psa_vec_get_h(v.ipay as ptr, i), seen));
+        i = i + 1;
+    }
+    if n == 1 { out = __psa_str_push(out, 44u8); };
+    out = __psa_str_push(out, 41u8);
+    __psa_dict_del(seen, __psa_box_int(v.ipay));
+    return out;
+}
+
+fn __psa_repr_set(v: PsaVal, seen: PsaVal) -> PsaVal {
+    let n = __psa_vec_len_h(v.ipay as ptr);
+    if n == 0 {
+        let out = __psa_str_new();
+        out = __psa_str_push(out, 115u8); out = __psa_str_push(out, 101u8); out = __psa_str_push(out, 116u8);
+        out = __psa_str_push(out, 40u8);
+        out = __psa_str_push(out, 41u8);
+        return out;
+    };
+    if __psa_idmap_has(seen, v) { return __psa_repr_ellipsis(123u8, 125u8); };
+    __psa_idmap_put(seen, v, __psa_box_bool(true));
+    let out = __psa_str_new();
+    out = __psa_str_push(out, 123u8);
+    let i: i64 = 0;
+    while i < n {
+        if i > 0 { out = __psa_str_push(out, 44u8); out = __psa_str_push(out, 32u8); };
+        out = __psa_str_append_str(out, __psa_repr_rec(__psa_vec_get_h(v.ipay as ptr, i), seen));
+        i = i + 1;
+    }
+    out = __psa_str_push(out, 125u8);
+    __psa_dict_del(seen, __psa_box_int(v.ipay));
+    return out;
+}
+
+fn __psa_repr_rec(v: PsaVal, seen: PsaVal) -> PsaVal {
     if v.tag == 6 { return __psa_str_repr(v); };
     if v.tag == 15 { return __psa_bytes_repr(v); };
     if v.tag == 8 { return __psa_obj_repr(v); };
     if v.tag == 0 { return __psa_str_from_i64(v.ipay); };
+    if v.tag == 17 { return __psa_big_to_psastr(v); };
     if v.tag == 2 { return __psa_str_from_bool(v.ipay != 0); };
     if v.tag == 3 {
         let out = __psa_str_new();
@@ -17376,7 +17771,22 @@ fn __psa_repr_of(v: PsaVal) -> PsaVal {
     if v.tag == 12 { return __psa_file_str(v); };
     if v.tag == 13 { return __psa_str_of(v); };
     if v.tag == 14 { return __psa_str_of(v); };
+    if v.tag == 7 { return __psa_repr_function(); };
+    if v.tag == 16 { return __psa_repr_function(); };
+    if v.tag == 9 { return __psa_repr_bound_method(); };
+    if v.tag == 4 { return __psa_repr_list(v, seen); };
+    if v.tag == 5 { return __psa_repr_dict(v, seen); };
+    if v.tag == 10 { return __psa_repr_tuple(v, seen); };
+    if v.tag == 11 { return __psa_repr_set(v, seen); };
     panic(77030);
+}
+
+// REPLACES __psa_repr_of (S7, gap #18): the public entry
+// delegates to the recursive worker with a fresh ancestor
+// set; every non-container branch is the master body
+// unchanged (plus tag 17, see the block comment above).
+fn __psa_repr_of(v: PsaVal) -> PsaVal {
+    return __psa_repr_rec(v, __psa_idmap_new());
 }
 
 fn __psa_exc_msg_key() -> PsaVal {

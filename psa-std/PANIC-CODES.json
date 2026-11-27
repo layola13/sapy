@@ -246,6 +246,20 @@
    "summary": "f-string format spec given for a value that takes no spec (None, containers, objects)",
    "fix": "remove the format spec, or format a scalar value"
   },
+  "77087": {
+   "rule": "dyn-abs-pos-type",
+   "category": "runtime-core",
+   "cp_surface": "TypeError",
+   "summary": "abs() or unary + on a non-number dynamic value",
+   "fix": "check the value is a number first"
+  },
+  "77088": {
+   "rule": "dyn-matmul-type",
+   "category": "runtime-core",
+   "cp_surface": "TypeError",
+   "summary": "matrix multiplication (@) on dynamic values; no psa type defines __matmul__ yet",
+   "fix": "do not use @ until an array/matrix type lands"
+  },
   "77100": {
    "rule": "uncaught-exception",
    "category": "runtime-core",
