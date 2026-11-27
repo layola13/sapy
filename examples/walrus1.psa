@@ -1,0 +1,17 @@
+# Assignment expressions (:=) in while / if conditions.
+# In v1 a walrus inside a while condition is supported
+# as the whole condition (a nested walrus is refused
+# loudly, PSA-E9000).
+s = "abc"
+while t := s:
+    print(t)
+    s = s[1:]
+print("end")
+data = [10, 20, 30]
+if (n := len(data)) == 3:
+    print(n)
+n = 3
+while (ok := n > 0):
+    print(n)
+    n = n - 1
+print(n)

@@ -1,0 +1,19 @@
+# Arbitrary-precision integers: values past the i64
+# boundary promote instead of overflowing; results that
+# fit back into i64 demote again. The heterogeneous list
+# is the dynamic route across the boundary.
+xs = [9223372036854775807, "dyn"]
+a = xs[0]
+print(a + 1)
+print(a + a)
+print(a * 3)
+print(0 - a - 2)
+ys = [2, "dyn"]
+b = ys[0]
+print(b ** 100)
+print(b ** 63)
+m = a + 1
+print(m - 1)
+print(m - 1 + 1)
+print(m > a)
+print(m == a + 1)

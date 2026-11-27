@@ -1,0 +1,16 @@
+# bytes literals and raw strings.
+b = b"hello"
+print(len(b))
+print(b[0])
+print(b[-1])
+print(b)
+print(b"ab" + b"cd")
+print(b"ab" * 3)
+print(b"x" == b"x")
+print(b"x" != b"y")
+r = rb"a\nb"
+print(len(r))
+print(r)
+s = r"\d+"
+print(len(s))
+print(s)

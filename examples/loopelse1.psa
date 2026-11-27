@@ -1,0 +1,26 @@
+# Loop else: the else block runs when the loop finishes
+# without break, and is skipped after a break.
+for i in range(3):
+    print(i)
+else:
+    print("for-else: no break")
+for i in range(5):
+    if i == 2:
+        break
+    print(i)
+else:
+    print("for-else: no break")
+print("after break loop")
+n = 0
+while n < 2:
+    n = n + 1
+else:
+    print("while-else: exhausted")
+m = 0
+while True:
+    m = m + 1
+    if m == 2:
+        break
+else:
+    print("while-else: no break")
+print(m)

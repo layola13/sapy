@@ -1,0 +1,12 @@
+5
+104
+111
+b'hello'
+b'abcd'
+b'ababab'
+True
+True
+4
+b'a\\nb'
+3
+\d+

@@ -1,0 +1,15 @@
+# is / is not: singleton identity (None / True / False)
+# and object identity for heap (dynamic) values.
+x = None
+print(x is None)
+print(x is not None)
+print(None is None)
+print(True is True)
+print(False is not True)
+a = [1, "x"]
+b = a
+c = [1, "x"]
+print(a is b)
+print(a is c)
+print(a == c)
+print(a is not c)
