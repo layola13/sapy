@@ -1,0 +1,2 @@
+f = lambda y: y + 1
+print(f(1))

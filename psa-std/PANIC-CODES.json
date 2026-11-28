@@ -232,6 +232,13 @@
    "summary": "await on a value that is not a coroutine",
    "fix": "await the result of calling an async def"
   },
+  "77083": {
+   "rule": "modenv-not-published",
+   "category": "runtime-core",
+   "cp_surface": null,
+   "summary": "the module environment was read before it was published (closure runtime invariant; unreachable in a correctly emitted program)",
+   "fix": "this is a psa internal invariant, not a problem in your code; please report it with the source file"
+  },
   "77085": {
    "rule": "fstring-bad-spec",
    "category": "runtime-core",

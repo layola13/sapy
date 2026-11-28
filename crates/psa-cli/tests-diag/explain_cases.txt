@@ -1,0 +1,7 @@
+# exp|<arg>|<rule for JSON>|<summary for text>
+exp|77069|attribute-not-found|attribute not found on a dynamic value
+exp|77040|assert-failed|an assert condition was false
+exp|77100|uncaught-exception|an exception propagated out of the program
+exp|77083|modenv-not-published|the module environment was read before it was published
+exp|PSA-E1001|use-after-move|use of a name after it was moved
+exp|99999|LOUDFAIL|

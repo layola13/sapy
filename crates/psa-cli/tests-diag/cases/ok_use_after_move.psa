@@ -1,0 +1,5 @@
+xs = [1, 2, 3]
+ys = xs
+xs = [4, 5]
+print(xs)
+print(ys)

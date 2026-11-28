@@ -1,0 +1,10 @@
+# neg case name        expected code  expected kind
+neg use_after_move     PSA-E1001      emit
+neg use_after_del      PSA-E1002      emit
+neg bare_bang          PSA-L012       lex
+neg expected_colon     PSA-P001       parse
+neg missing_arg        PSA-E3018      emit
+neg unknown_kwarg      PSA-E3016      emit
+neg multi_value        PSA-E3017      emit
+neg nonliteral_default PSA-E2053      emit
+neg undefined_var      PSA-E1021      emit
