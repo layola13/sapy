@@ -1,0 +1,21 @@
+# pickle: pure-data round trip through dumps / loads
+# (None / bool / int / float / str / list / tuple / dict).
+# Executable opcodes (GLOBAL / REDUCE / ...) are the
+# security boundary and are refused loudly on sight
+# (panic 77312) -- they are not part of this demo.
+import pickle
+
+data = {"name": "psa", "nums": [1, 2, 3], "pi": 3.5, "ok": True, "nil": None}
+blob = pickle.dumps(data)
+back = pickle.loads(blob)
+print(back["name"])
+print(back["nums"])
+print(back["pi"])
+print(back["ok"])
+print(back["nil"])
+print(back == data)
+pair = (7, "x")
+print(pickle.loads(pickle.dumps(pair)) == pair)
+want = [1, "a", 2.5]
+raw = pickle.dumps(want)
+print(pickle.loads(raw) == want)

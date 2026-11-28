@@ -1,3 +1,0 @@
-# Negative example: must FAIL to compile in v0.1 (float print is blocked
-# by the upstream f64 println defect; see crates/psa-cli/README.md).
-print(7 / 2)

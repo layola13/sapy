@@ -1,0 +1,5 @@
+# Float printing: a static float division result prints
+# via the shortest-round-trip formatter. (This was the
+# reject_float_print negative example until the 77030
+# wiring landed; float print is unblocked.)
+print(7 / 2)

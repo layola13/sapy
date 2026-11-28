@@ -5087,10 +5087,10 @@ impl Emitter {
                         self.used_dyn = true;
                         Ok(Some((format!("__psa_str_from_bool({})", c), Ty::Dyn)))
                     }
-                    Ty::Float => Err(eerr(
-                        line,
-                        "str() of a float is blocked: f64 text is unavailable until the shortest-roundtrip formatter lands (upstream defect (xxiii) family)",
-                    )),
+                    Ty::Float => {
+                        self.used_dyn = true;
+                        Ok(Some((format!("__psa_fmt_float_text({})", c), Ty::Dyn)))
+                    }
                     _ => Err(eerr(
                         line,
                         &format!("str() of a {} value is not supported in v1", t.py_name()),
@@ -8692,10 +8692,10 @@ impl Emitter {
                 return Ok(());
             }
             if ty == Ty::Float {
-                return Err(eerr(
-                    line,
-                    "printing a float is blocked in v0.1: the Rust sla build-exe route truncates f64 in println (3.5 prints as 3.0000000000) while the value itself computes correctly; psa refuses to print a wrong value (upstream defect, see README)",
-                ));
+                self.used_dyn = true;
+                ctx.line(&format!("__psa_print_str(__psa_fmt_float_text({}));", code));
+                ctx.line("println(\"\");");
+                return Ok(());
             }
             if ty.is_list() {
                 // Static list repr, byte-printed elementwise through
@@ -8851,12 +8851,10 @@ impl Emitter {
                     "if {} {{ sla_print_bytes(STR_PTR(\"True\"), STR_LEN(\"True\")); }} else {{ sla_print_bytes(STR_PTR(\"False\"), STR_LEN(\"False\")); }};",
                     code
                 )),
-                Ty::Float => {
-                    return Err(eerr(
-                        line,
-                        "printing a float is blocked: f64 text is unavailable until the shortest-roundtrip formatter lands (upstream defect (xxiii) family)",
-                    ))
-                }
+                Ty::Float => ctx.line(&format!(
+                    "__psa_print_str(__psa_fmt_float_text({}));",
+                    code
+                )),
                 _ => {
                     return Err(eerr(
                         line,
@@ -8943,12 +8941,7 @@ impl Emitter {
                             Ty::Dyn => format!("__psa_str_of({})", code),
                             Ty::Int => format!("__psa_str_from_i64({})", code),
                             Ty::Bool => format!("__psa_str_from_bool({})", code),
-                            Ty::Float => {
-                                return Err(eerr(
-                                    line,
-                                    "interpolating a float in an f-string is blocked: f64 text is unavailable until the shortest-roundtrip formatter lands (upstream defect (xxiii) family)",
-                                ))
-                            }
+                            Ty::Float => format!("__psa_fmt_float_text({})", code),
                             _ => {
                                 return Err(eerr(
                                     line,
@@ -9058,6 +9051,73 @@ impl Emitter {
     /// interpolation is rendered by emitting both println variants under
     /// an if/else (there is no string temp to hold "True"/"False" —
     /// string bindings are blocked upstream, defect (xxv)).
+    /// Pure type probe for a plain f-string field in the D0
+    /// print path: decides whether the field is statically a
+    /// float (so the whole f-string must take the dynamic
+    /// route) without emitting anything. Returns None when the
+    /// type cannot be determined statically; the plain path
+    /// then decides as before (a float there still refuses
+    /// loudly at emit time, exactly as it did before).
+    fn fstr_field_ty(&self, ctx: &Ctx, e: &Expr) -> Option<Ty> {
+        match e {
+            Expr::Float(_) => Some(Ty::Float),
+            Expr::Int(_) => Some(Ty::Int),
+            Expr::Str(_) => Some(Ty::Str),
+            Expr::Bool(_) => Some(Ty::Bool),
+            Expr::Name(n, _) => ctx
+                .vars
+                .iter()
+                .rev()
+                .find(|(name, _, _)| name == n)
+                .map(|(_, t, _)| *t),
+            Expr::Unary(UnOp::Not, _) => Some(Ty::Bool),
+            Expr::Unary(_, inner) => self.fstr_field_ty(ctx, inner),
+            Expr::Bin(l, op, r) => match op {
+                BinOp::Eq
+                | BinOp::NotEq
+                | BinOp::In
+                | BinOp::NotIn
+                | BinOp::Is
+                | BinOp::IsNot
+                | BinOp::Lt
+                | BinOp::LtEq
+                | BinOp::Gt
+                | BinOp::GtEq
+                | BinOp::And
+                | BinOp::Or => Some(Ty::Bool),
+                _ => {
+                    let lt = self.fstr_field_ty(ctx, l);
+                    let rt = self.fstr_field_ty(ctx, r);
+                    if lt == Some(Ty::Float) || rt == Some(Ty::Float) {
+                        Some(Ty::Float)
+                    } else if lt == Some(Ty::Int) && rt == Some(Ty::Int) {
+                        if matches!(op, BinOp::Div) {
+                            // Python true division: int / int
+                            // is a float.
+                            Some(Ty::Float)
+                        } else {
+                            Some(Ty::Int)
+                        }
+                    } else {
+                        None
+                    }
+                }
+            },
+            Expr::Call(callee, _, _, _) => match &**callee {
+                Expr::Name(n, _) => match n.as_str() {
+                    "float" => Some(Ty::Float),
+                    "int" | "len" => Some(Ty::Int),
+                    "str" | "repr" => Some(Ty::Str),
+                    "bool" => Some(Ty::Bool),
+                    _ => self.sigs.get(n.as_str()).and_then(|s| s.ret),
+                },
+                _ => None,
+            },
+            Expr::Walrus { value, .. } => self.fstr_field_ty(ctx, value),
+            _ => None,
+        }
+    }
+
     fn emit_print_fstr(
         &mut self,
         ctx: &mut Ctx,
@@ -9070,7 +9130,15 @@ impl Emitter {
         // (This also lifts the plain-path limits for such
         // f-strings: float fields and literal braces work,
         // because the text never reaches SLA's println format.)
-        if parts.iter().any(|p| p.is_formatted()) {
+        if parts.iter().any(|p| p.is_formatted())
+            || parts.iter().any(|p| {
+                matches!(
+                    p,
+                    FStrPart::Field { value, .. }
+                        if self.fstr_field_ty(ctx, value) == Some(Ty::Float)
+                )
+            })
+        {
             let t = self.emit_fstr_value(ctx, parts, line)?;
             ctx.line(&format!("__psa_print_dyn({});", t));
             return Ok(());
@@ -15914,9 +15982,10 @@ fn __psa_type_name(v: PsaVal) -> PsaVal {
 }
 
 // str(x) for a dynamic value (D5): scalars format exactly,
-// objects ride their __str__ machinery; floats stay blocked
-// by (xxiii) and containers by the missing repr-to-string
-// builders -- both panic 77030 rather than print a wrong text.
+// objects ride their __str__ machinery; floats format via
+// the shortest-round-trip formatter (77030 fix); containers
+// stay blocked by the missing repr-to-string builders and
+// panic 77030 rather than print a wrong text.
 fn __psa_str_of(v: PsaVal) -> PsaVal {
     if v.tag == 6 { return v; };
     if v.tag == 15 { return __psa_bytes_repr(v); };
@@ -15943,6 +16012,7 @@ fn __psa_str_of(v: PsaVal) -> PsaVal {
         return out;
     };
     if v.tag == 17 { return __psa_big_to_psastr(v); };
+    if v.tag == 1 { return __psa_fmt_float_text(v.fpay); };
     panic(77030);
 }
 
@@ -17472,6 +17542,7 @@ fn __psa_print_repr(v: PsaVal) {
     if v.tag == 8 { __psa_print_str(__psa_obj_repr(v)); return; };
     if v.tag == 10 { __psa_print_tuple_repr(v); return; };
     if v.tag == 11 { __psa_print_set_repr(v); return; };
+    if v.tag == 1 { __psa_print_str(__psa_fmt_float_text(v.fpay)); return; };
     panic(77058);
 }
 
@@ -17494,6 +17565,7 @@ fn __psa_print_dyn_nl(v: PsaVal) {
         return;
     };
     if v.tag == 3 { sla_print_bytes(STR_PTR("None"), STR_LEN("None")); return; };
+    if v.tag == 1 { __psa_print_str(__psa_fmt_float_text(v.fpay)); return; };
     panic(77030);
 }
 
@@ -17516,6 +17588,7 @@ fn __psa_print_dyn(v: PsaVal) -> i32 {
         return 0;
     };
     if v.tag == 3 { println("None"); return 0; };
+    if v.tag == 1 { __psa_print_str(__psa_fmt_float_text(v.fpay)); sla_print_bytes(STR_PTR("\n"), STR_LEN("\n")); return 0; };
     panic(77030);
 }
 
@@ -17955,6 +18028,7 @@ fn __psa_repr_rec(v: PsaVal, seen: PsaVal) -> PsaVal {
     if v.tag == 5 { return __psa_repr_dict(v, seen); };
     if v.tag == 10 { return __psa_repr_tuple(v, seen); };
     if v.tag == 11 { return __psa_repr_set(v, seen); };
+    if v.tag == 1 { return __psa_fmt_float_text(v.fpay); };
     panic(77030);
 }
 
