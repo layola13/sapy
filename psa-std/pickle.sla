@@ -257,7 +257,7 @@ fn __psa_pkl_bits_f64(bits: i64) -> f64 {
             e = e + 1;
         }
     };
-    if sign == 1 { return -v; };
+    if sign == 1 { return (-1.0) * v; };
     return v;
 }
 

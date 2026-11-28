@@ -10941,8 +10941,16 @@ impl Emitter {
                 }
                 match op {
                     UnOp::Neg => {
-                        if ty == Ty::Int || ty == Ty::Float {
+                        if ty == Ty::Int {
                             Ok((format!("-({})", code), ty))
+                        } else if ty == Ty::Float {
+                            // True IEEE negation: SLA lowers `-(x)`
+                            // to fsub(0, x), which maps +0.0 to
+                            // +0.0 (upstream defect, ROUND5 SA-text
+                            // evidence); multiplication by -1.0 is
+                            // exact for every operand, constants
+                            // included (it stays an fmul temp).
+                            Ok((format!("((-1.0) * ({}))", code), ty))
                         } else {
                             Err(eerr(line, "unary - needs a number"))
                         }
@@ -14146,6 +14154,27 @@ fn int_literal(e: &Expr) -> Option<i64> {
 }
 
 fn fmt_f64(v: f64) -> String {
+    // Special values need expression forms whose SLA lowering is
+    // exact: a bare `inf` / `NaN` would lex as an identifier, and
+    // the text `-0.0` lowers through fsub(0, 0.0) = +0.0 (upstream
+    // sa_plugin_sla codegen defects: unary minus via fsub, named
+    // let copies via fadd(+0.0); SA-text evidence in
+    // RESULT-FIX-ROUND5). Division / multiplication forms evaluate
+    // exactly and reach argument, return and field-store positions
+    // without passing a named float binding.
+    if v.is_nan() {
+        return "(0.0 / 0.0)".to_string();
+    }
+    if v.is_infinite() {
+        return if v > 0.0 {
+            "(1.0 / 0.0)".to_string()
+        } else {
+            "((-1.0) / 0.0)".to_string()
+        };
+    }
+    if v == 0.0 && v.is_sign_negative() {
+        return "((-1.0) * 0.0)".to_string();
+    }
     if v == v.trunc() && v.abs() < 1e15 {
         format!("{:.1}", v)
     } else {
@@ -15497,9 +15526,34 @@ fn __psa_str_to_int(v: PsaVal) -> i64 {
     return acc;
 }
 
-fn __psa_str_to_float(v: PsaVal) -> f64 {
-    // Same eager-&& discipline as __psa_str_to_int: guarded
-    // byte reads sit inside plain bounds branches.
+// Exact float parsing (77030 ROUND5): the previous f64
+// accumulation parser drifted by ulps on hard 17-digit inputs
+// (its own header admitted the shortcut) and applied the sign
+// as 0.0 - acc, which maps -0.0 to +0.0. The scanner below
+// keeps the old grammar byte-for-byte (whitespace, sign, digits,
+// fraction, exponent) and adds the CPython word forms
+// inf / infinity / nan (case-insensitive). Conversion is exact:
+// the digit string becomes a BigInt ratio and is rounded to
+// nearest-even in the integer domain (the __psa_big_as_float
+// idiom generalized to a quotient), so every input round-trips.
+// Sign application is a true multiplication by -1.0 in return
+// position: fsub(0, x) and the fadd(+0.0) named-let copy both
+// destroy -0.0 upstream (ROUND5 SA-text evidence).
+
+fn __psa_byte_is(v: PsaVal, i: i64, ch: i64) -> bool {
+    // Bounds-safe case-insensitive byte test (ch is a lowercase
+    // ASCII letter code); a call, so it is safe under eager &&.
+    let n = __psa_bytes_len_h(v.ipay as ptr);
+    if i >= n { return false; };
+    let b = __psa_str_byte(v, i) | 32;
+    return b == ch;
+}
+
+fn __psa_scan_float(v: PsaVal) -> (i64, bool, Vec<i64>, i64, i64) {
+    // Returns (status, neg, digits, e10, kind): status 1 =
+    // malformed; kind 0 = numeric (value = digits * 10^e10),
+    // 1 = inf, 2 = nan. digits holds every mantissa digit
+    // (integer and fraction parts concatenated, MSD first).
     let n = __psa_bytes_len_h(v.ipay as ptr);
     let i: i64 = 0;
     while i < n {
@@ -15513,65 +15567,256 @@ fn __psa_str_to_float(v: PsaVal) -> f64 {
             i = i + 1;
         };
     };
+    if __psa_byte_is(v, i, 105) && __psa_byte_is(v, i + 1, 110) && __psa_byte_is(v, i + 2, 102) {
+        let j = i + 3;
+        if __psa_byte_is(v, j, 105) {
+            if !(__psa_byte_is(v, j + 1, 110) && __psa_byte_is(v, j + 2, 105) && __psa_byte_is(v, j + 3, 116) && __psa_byte_is(v, j + 4, 121)) {
+                return (1, neg, Vec::new(), 0, 0);
+            };
+            j = j + 5;
+        };
+        while j < n {
+            if !(__psa_str_is_space(__psa_str_byte(v, j))) { break; };
+            j = j + 1;
+        }
+        if j != n { return (1, neg, Vec::new(), 0, 0); };
+        return (0, neg, Vec::new(), 0, 1);
+    };
+    if __psa_byte_is(v, i, 110) && __psa_byte_is(v, i + 1, 97) && __psa_byte_is(v, i + 2, 110) {
+        let j = i + 3;
+        while j < n {
+            if !(__psa_str_is_space(__psa_str_byte(v, j))) { break; };
+            j = j + 1;
+        }
+        if j != n { return (1, neg, Vec::new(), 0, 0); };
+        return (0, neg, Vec::new(), 0, 2);
+    };
+    let digs: Vec<i64> = Vec::new();
     let any = false;
-    let acc: f64 = 0.0;
     while i < n {
         let b = __psa_str_byte(v, i);
         if b < 48 || b > 57 { break; };
-        acc = acc * 10.0 + ((b - 48) as f64);
+        digs.push(b - 48);
         any = true;
         i = i + 1;
     }
+    let frac: i64 = 0;
     if i < n {
         if __psa_str_byte(v, i) == 46 {
-        i = i + 1;
-        let scale: f64 = 0.1;
-        while i < n {
-            let b = __psa_str_byte(v, i);
-            if b < 48 || b > 57 { break; };
-            acc = acc + ((b - 48) as f64) * scale;
-            scale = scale * 0.1;
-            any = true;
             i = i + 1;
-        }
+            while i < n {
+                let b = __psa_str_byte(v, i);
+                if b < 48 || b > 57 { break; };
+                digs.push(b - 48);
+                frac = frac + 1;
+                any = true;
+                i = i + 1;
+            }
         };
     };
+    let e: i64 = 0;
+    let eneg = false;
     if i < n {
         if __psa_str_byte(v, i) == 101 || __psa_str_byte(v, i) == 69 {
-        i = i + 1;
-        let eneg = false;
-        if i < n {
-            if __psa_str_byte(v, i) == 43 || __psa_str_byte(v, i) == 45 {
-                eneg = __psa_str_byte(v, i) == 45;
-                i = i + 1;
-            };
-        };
-        let eany = false;
-        let e: i64 = 0;
-        while i < n {
-            let b = __psa_str_byte(v, i);
-            if b < 48 || b > 57 { break; };
-            e = e * 10 + (b - 48);
-            eany = true;
             i = i + 1;
-        }
-        if !(eany) { panic(77079); };
-        let k: i64 = 0;
-        if eneg {
-            while k < e { acc = acc * 0.1; k = k + 1; }
-        } else {
-            while k < e { acc = acc * 10.0; k = k + 1; }
+            if i < n {
+                if __psa_str_byte(v, i) == 43 || __psa_str_byte(v, i) == 45 {
+                    eneg = __psa_str_byte(v, i) == 45;
+                    i = i + 1;
+                };
+            };
+            let eany = false;
+            while i < n {
+                let b = __psa_str_byte(v, i);
+                if b < 48 || b > 57 { break; };
+                if e < 100000 {
+                    e = e * 10 + (b - 48);
+                    if e > 100000 { e = 100000; };
+                };
+                eany = true;
+                i = i + 1;
+            }
+            if !(eany) { return (1, neg, digs, 0, 0); };
         };
-    };
     };
     while i < n {
         if !(__psa_str_is_space(__psa_str_byte(v, i))) { break; };
         i = i + 1;
     }
-    if !(any) || i != n { panic(77079); };
-    if neg { return 0.0 - acc; };
-    return acc;
+    if !(any) || i != n { return (1, neg, digs, 0, 0); };
+    let e10: i64 = 0;
+    if eneg { e10 = 0 - e - frac; } else { e10 = e - frac; };
+    return (0, neg, digs, e10, 0);
 }
+
+fn __psa_pow10_big(k: i64) -> BigInt {
+    let d: Vec<i64> = Vec::new();
+    d.push(1);
+    let i: i64 = 0;
+    while i < k {
+        d.push(0);
+        i = i + 1;
+    }
+    return big_from_digits(&d, 1);
+}
+
+fn __psa_big_dec_digits(b: &BigInt) -> i64 {
+    let top = b.mag[len(b.mag) - 1];
+    let td = 0;
+    let t = top;
+    while t > 0 {
+        td = td + 1;
+        t = t / 10;
+    }
+    return (len(b.mag) - 1) * 9 + td;
+}
+
+fn __psa_ratio_cmp_pow2(num: &BigInt, den: &BigInt, e: i64) -> i64 {
+    // sign of (num/den - 2^e), computed in the integer domain.
+    if e >= 0 {
+        let p = __psa_big_pow2(e);
+        let d2 = big_mul(den, &p);
+        return big_cmp(num, &d2);
+    };
+    let p = __psa_big_pow2(0 - e);
+    let n2 = big_mul(num, &p);
+    return big_cmp(&n2, den);
+}
+
+fn __psa_big_ratio_to_f64(num: BigInt, den: BigInt) -> f64 {
+    // Exact round-to-nearest-even of num/den (both > 0) to f64:
+    // locate e with 2^e <= num/den < 2^(e+1), extract the top 53
+    // bits with big_divmod, round by comparing the remainder
+    // against divisor-minus-remainder (no aliased self-add),
+    // then scale by a power of two, which is exact in f64.
+    // Subnormals round directly on the 2^-1074 grid.
+    let dn = __psa_big_dec_digits(&num);
+    let dd = __psa_big_dec_digits(&den);
+    let e = (dn - dd) * 3321928 / 1000000;
+    while __psa_ratio_cmp_pow2(&num, &den, e) < 0 {
+        e = e - 1;
+    }
+    while __psa_ratio_cmp_pow2(&num, &den, e + 1) >= 0 {
+        e = e + 1;
+    }
+    if e > 1023 { return 1.0 / 0.0; };
+    if e >= -1022 {
+        let q: i64 = 0;
+        if e >= 52 {
+            let s = e - 52;
+            let p = __psa_big_pow2(s);
+            let d2 = big_mul(&den, &p);
+            let dm = big_divmod(&num, &d2);
+            let diff = big_sub(&d2, &dm.r);
+            let c = big_cmp(&dm.r, &diff);
+            q = __psa_big_extract(dm.q);
+            if c > 0 || (c == 0 && (q & 1) == 1) { q = q + 1; };
+        } else {
+            let p = __psa_big_pow2(52 - e);
+            let n2 = big_mul(&num, &p);
+            let dm = big_divmod(&n2, &den);
+            let diff = big_sub(&den, &dm.r);
+            let c = big_cmp(&dm.r, &diff);
+            q = __psa_big_extract(dm.q);
+            if c > 0 || (c == 0 && (q & 1) == 1) { q = q + 1; };
+        };
+        if q == 9007199254740992 {
+            q = q / 2;
+            e = e + 1;
+            if e > 1023 { return 1.0 / 0.0; };
+        };
+        let f = q as f64;
+        let sc = e - 52;
+        let i = 0;
+        if sc >= 0 {
+            while i < sc {
+                f = f * 2.0;
+                i = i + 1;
+            }
+        } else {
+            while i < (0 - sc) {
+                f = f / 2.0;
+                i = i + 1;
+            }
+        };
+        return f;
+    };
+    let p = __psa_big_pow2(1074);
+    let n2 = big_mul(&num, &p);
+    let dm = big_divmod(&n2, &den);
+    let diff = big_sub(&den, &dm.r);
+    let c = big_cmp(&dm.r, &diff);
+    let q = __psa_big_extract(dm.q);
+    if c > 0 || (c == 0 && (q & 1) == 1) { q = q + 1; };
+    let f = q as f64;
+    let i = 0;
+    while i < 1074 {
+        f = f / 2.0;
+        i = i + 1;
+    }
+    return f;
+}
+
+fn __psa_float_from_scan(neg: bool, digs: Vec<i64>, e10: i64, kind: i64) -> f64 {
+    if kind == 1 {
+        if neg { return (-1.0) / 0.0; };
+        return 1.0 / 0.0;
+    };
+    if kind == 2 { return 0.0 / 0.0; };
+    let start: i64 = 0;
+    while start < len(digs) {
+        if digs[start] != 0 { break; };
+        start = start + 1;
+    }
+    if start == len(digs) {
+        if neg { return (-1.0) * 0.0; };
+        return 0.0;
+    };
+    let end: i64 = len(digs);
+    while end > start {
+        if digs[end - 1] != 0 { break; };
+        end = end - 1;
+    }
+    let e10b = e10 + (len(digs) - end);
+    let nd = end - start;
+    // value lies in [10^(e10b+nd-1), 10^(e10b+nd)): outside the
+    // f64 range the answer is decided without big arithmetic
+    // (1e309 > f64::MAX; 1e-324 < 2^-1075 rounds to zero).
+    if e10b + nd - 1 >= 309 {
+        if neg { return (-1.0) / 0.0; };
+        return 1.0 / 0.0;
+    };
+    if e10b + nd <= -324 {
+        if neg { return (-1.0) * 0.0; };
+        return 0.0;
+    };
+    let dvec: Vec<i64> = Vec::new();
+    let j = start;
+    while j < end {
+        dvec.push(digs[j]);
+        j = j + 1;
+    }
+    let d = big_from_digits(&dvec, 1);
+    if e10b >= 0 {
+        let p = __psa_pow10_big(e10b);
+        let num = big_mul(&d, &p);
+        return __psa_sign_mag(neg, __psa_big_ratio_to_f64(num, big_one()));
+    };
+    let den = __psa_pow10_big(0 - e10b);
+    return __psa_sign_mag(neg, __psa_big_ratio_to_f64(d, den));
+}
+
+fn __psa_sign_mag(neg: bool, mag: f64) -> f64 {
+    if neg { return (-1.0) * mag; };
+    return mag;
+}
+
+fn __psa_str_to_float(v: PsaVal) -> f64 {
+    let (st, neg, digs, e10, kind) = __psa_scan_float(v);
+    if st == 1 { panic(77079); };
+    return __psa_float_from_scan(neg, digs, e10, kind);
+}
+
 
 // Type names (D5): type(x) yields the name string; class
 // instances defer to the generated __psa_class_name.
@@ -17077,7 +17322,7 @@ fn __psa_dyn_neg(v: PsaVal) -> PsaVal {
         if v.ipay == -9223372036854775807 - 1 { return __psa_big_neg_of(v); };
         return __psa_box_int(-(v.ipay));
     };
-    if v.tag == 1 { return __psa_box_float(-(v.fpay)); };
+    if v.tag == 1 { return __psa_box_float((-1.0) * v.fpay); };
     panic(77015);
 }
 
@@ -17504,86 +17749,18 @@ fn __psa_try_str_to_int(v: PsaVal) -> PsaVal {
 }
 
 fn __psa_try_str_to_float(v: PsaVal) -> PsaVal {
-    let n = __psa_bytes_len_h(v.ipay as ptr);
-    let i: i64 = 0;
-    while i < n {
-        if !(__psa_str_is_space(__psa_str_byte(v, i))) { break; };
-        i = i + 1;
-    }
-    let neg = false;
-    if i < n {
-        if __psa_str_byte(v, i) == 43 || __psa_str_byte(v, i) == 45 {
-            neg = __psa_str_byte(v, i) == 45;
-            i = i + 1;
-        };
-    };
-    let any = false;
-    let acc: f64 = 0.0;
-    while i < n {
-        let b = __psa_str_byte(v, i);
-        if b < 48 || b > 57 { break; };
-        acc = acc * 10.0 + ((b - 48) as f64);
-        any = true;
-        i = i + 1;
-    }
-    if i < n {
-        if __psa_str_byte(v, i) == 46 {
-        i = i + 1;
-        let scale: f64 = 0.1;
-        while i < n {
-            let b = __psa_str_byte(v, i);
-            if b < 48 || b > 57 { break; };
-            acc = acc + ((b - 48) as f64) * scale;
-            scale = scale * 0.1;
-            any = true;
-            i = i + 1;
-        }
-        };
-    };
-    let badexp = false;
-    if i < n {
-        if __psa_str_byte(v, i) == 101 || __psa_str_byte(v, i) == 69 {
-        i = i + 1;
-        let eneg = false;
-        if i < n {
-            if __psa_str_byte(v, i) == 43 || __psa_str_byte(v, i) == 45 {
-                eneg = __psa_str_byte(v, i) == 45;
-                i = i + 1;
-            };
-        };
-        let eany = false;
-        let e: i64 = 0;
-        while i < n {
-            let b = __psa_str_byte(v, i);
-            if b < 48 || b > 57 { break; };
-            e = e * 10 + (b - 48);
-            eany = true;
-            i = i + 1;
-        }
-        if !(eany) { badexp = true; };
-        let k: i64 = 0;
-        if eneg {
-            while k < e { acc = acc * 0.1; k = k + 1; }
-        } else {
-            while k < e { acc = acc * 10.0; k = k + 1; }
-        };
-    };
-    };
-    while i < n {
-        if !(__psa_str_is_space(__psa_str_byte(v, i))) { break; };
-        i = i + 1;
-    }
+    let (st, neg, digs, e10, kind) = __psa_scan_float(v);
     let out = __psa_tuple_new();
-    if badexp || !(any) || i != n {
+    if st == 1 {
         __psa_tuple_push(out, __psa_box_bool(false));
         __psa_tuple_push(out, __psa_box_float(0.0));
         return out;
     };
     __psa_tuple_push(out, __psa_box_bool(true));
-    if neg { __psa_tuple_push(out, __psa_box_float(0.0 - acc)); return out; };
-    __psa_tuple_push(out, __psa_box_float(acc));
+    __psa_tuple_push(out, __psa_box_float(__psa_float_from_scan(neg, digs, e10, kind)));
     return out;
 }
+
 "#;
 
 /// D6 runtime, part 1 (emitted with every dynamic program):
