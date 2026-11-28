@@ -1,0 +1,15 @@
+# f-strings: interpolation, expressions, format specs
+# (alignment / width / precision, nested precision).
+# Note: interpolating a string *variable* is refused
+# loudly (PSA-E5047: dynamic values cannot be
+# interpolated in D0) -- string literals with specs
+# work, as the last-but-one line shows.
+n = 42
+pi = 3.14159
+print(f"n = {n}, doubled = {n * 2}")
+print(f"pi ~ {pi:.2f}")
+print(f"{n:>6}|{n:<6}|{n:^6}")
+print(f"{pi:>10.2f}|{pi:<10.2f}|{-pi:^10.2f}")
+print(f"{'psa':>8}|{'psa':<8}|{'psa':^8}")
+p = 3
+print(f"{pi:.{p}f}")
